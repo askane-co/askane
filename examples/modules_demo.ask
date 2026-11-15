@@ -1,0 +1,11 @@
+import math as m;
+import sys;
+import mem;
+import "math_helper.ask" as helper;
+
+println("OS:", sys.os(), sys.arch());
+println("sqrt(81):", 81 |> m.sqrt);
+println("helper.scale(7):", helper.scale(7));
+
+let pid = mem.current_pid();
+println("Current PID:", pid);

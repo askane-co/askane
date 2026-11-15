@@ -1,0 +1,14 @@
+// Closures and loops
+
+fn make_counter(start) {
+    let count = start;
+    fn() {
+        count = count + 1;
+        count
+    }
+}
+
+let counter = make_counter(0);
+for i in range(5) {
+    println("tick:", counter());
+}

@@ -1,0 +1,5 @@
+let factor = 3;
+
+fn scale(x) {
+    x * factor
+}

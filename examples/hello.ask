@@ -1,0 +1,20 @@
+// Basic Askane example: expressions, match, and functions
+
+fn greet(name) {
+    "Hello, " + name + "!"
+}
+
+let status = match 200 {
+    200 => "OK",
+    404 => "Not Found",
+    code => "Status " + str(code),
+};
+
+let result = {
+    let base = 21;
+    base * 2
+};
+
+greet("Askane") |> println;
+println("Status:", status);
+println("Result:", result);

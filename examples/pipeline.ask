@@ -1,0 +1,13 @@
+// Pipeline operator |> with map, filter, reduce
+
+let total = range(1, 11)
+    |> filter(fn(n) { n % 2 == 0 })
+    |> map(fn(n) { n * n })
+    |> reduce(0, fn(acc, n) { acc + n });
+
+println("Sum of even squares (1..10):", total);
+
+fn double(x) { x * 2 }
+fn add(a, b) { a + b }
+
+10 |> double |> add(5) |> println;

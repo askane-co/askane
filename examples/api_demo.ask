@@ -1,0 +1,9 @@
+// HTTP + JSON API request example in Askane
+import http;
+import json;
+
+let res = http.get("https://httpbin.org/get");
+println("Status:", res.status);
+
+let data = json.parse(res.body);
+println("Origin IP:", data.origin);

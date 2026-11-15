@@ -1,0 +1,53 @@
+// Simple 2D Pong-style bouncing ball game in Askane (Windows)
+import gfx;
+import sys;
+
+let W = 640;
+let H = 400;
+gfx.window("Askane 2D Demo (WASD / Arrows, ESC to quit)", W, H);
+
+let px = 40;
+let py = 160;
+let pw = 14;
+let ph = 80;
+
+let bx = 320;
+let by = 200;
+let vx = 4;
+let vy = 3;
+
+while gfx.is_open() {
+    if gfx.key_down("ESC") {
+        break;
+    }
+    if gfx.key_down("W") || gfx.key_down("UP") {
+        py = py - 6;
+    }
+    if gfx.key_down("S") || gfx.key_down("DOWN") {
+        py = py + 6;
+    }
+    if py < 0 { py = 0; }
+    if py + ph > H { py = H - ph; }
+
+    bx = bx + vx;
+    by = by + vy;
+
+    if by <= 8 || by >= H - 8 { vy = -vy; }
+    if bx >= W - 8 { vx = -vx; }
+    if bx - 8 <= px + pw && bx >= px && by >= py && by <= py + ph {
+        vx = -vx;
+        bx = px + pw + 8;
+    }
+    if bx < 0 {
+        bx = 320;
+        by = 200;
+    }
+
+    gfx.clear(18, 20, 28);
+    gfx.rect(px, py, pw, ph, 80, 200, 255);
+    gfx.circle(bx, by, 8, 255, 190, 60);
+    gfx.present();
+    sys.sleep(16);
+}
+
+gfx.close();
