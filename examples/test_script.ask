@@ -1,0 +1,57 @@
+// Askane Test Script 2.0: pipelines, match, closures, dicts, math, and json
+
+import math;
+import json;
+import sys;
+
+let t_start = clock();
+
+// 1. Expression blocks + match
+fn rank(score) {
+    match score {
+        100 => "S",
+        0 => "F",
+        s => if s >= 80 { "A" } else if s >= 50 { "B" } else { "C" },
+    }
+}
+
+// 2. Closures + dictionaries
+fn make_hero(name, hp) {
+    let state = #{ name: name, hp: hp, hits: 0 };
+    fn(dmg) {
+        state["hp"] = math.max(0, state.hp - dmg);
+        state["hits"] = state.hits + 1;
+        state
+    }
+}
+
+let hit = make_hero("Askane", 100);
+hit(15);
+let hero = hit(20);
+
+// 3. Pipelines
+let scores = [35, 55, 82, 100, 48];
+let passed = scores
+    |> filter(fn(s) { s >= 50 })
+    |> map(fn(s) { #{ score: s, grade: rank(s) } });
+
+// 4. JSON serialization & parsing roundtrip
+let report = #{
+    os: sys.os(),
+    arch: sys.arch(),
+    hero: hero,
+    passed: passed,
+    elapsed_ms: math.round((clock() - t_start) * 1000.0),
+};
+
+let encoded = json.stringify(report);
+let decoded = json.parse(encoded);
+
+println("=== Askane Test Script 2.0 ===");
+println("Hero:", decoded.hero.name, "| HP:", decoded.hero.hp, "| Hits:", decoded.hero.hits);
+println("Passed count:", len(decoded.passed));
+for item in decoded.passed {
+    println("  score:", item.score, "-> grade:", item.grade);
+}
+println("JSON:", encoded);
+println("Done in", decoded.elapsed_ms, "ms");
