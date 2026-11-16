@@ -131,12 +131,18 @@ impl VM {
         self.sandboxed
     }
 
+    pub fn elapsed_ms(&self) -> i64 {
+        self.start_time.elapsed().as_millis() as i64
+    }
+
     pub fn check_net(&self, url: &str) -> Result<(), String> {
         if self.permissions.allow_all {
             return Ok(());
         }
         let Some(allowed) = &self.permissions.allow_net else {
-            return Err("Network is disabled in sandbox mode (pass --allow-net or --unsafe)".to_string());
+            return Err(
+                "Network is disabled in sandbox mode (pass --allow-net or --unsafe)".to_string(),
+            );
         };
         if allowed.is_empty() {
             return Ok(());
@@ -191,7 +197,10 @@ impl VM {
         if self.permissions.allow_all || self.permissions.allow_sys_args {
             Ok(())
         } else {
-            Err("sys.args() is disabled in sandbox mode (pass --allow-args or --unsafe)".to_string())
+            Err(
+                "sys.args() is disabled in sandbox mode (pass --allow-args or --unsafe)"
+                    .to_string(),
+            )
         }
     }
 
@@ -292,6 +301,12 @@ impl VM {
             ("float", native_float),
             ("type_of", native_type_of),
             ("keys", native_keys),
+            ("values", native_values),
+            ("entries", native_entries),
+            ("get", native_get),
+            ("remove", native_remove),
+            ("sort", native_sort),
+            ("reverse", native_reverse),
             ("has", native_has),
             ("read_line", native_read_line),
             ("clock", native_clock),
@@ -444,406 +459,432 @@ impl VM {
         };
 
         match op {
-                Op::Constant(idx) => {
-                    let val = self.read_constant(idx);
-                    self.stack.push(val);
+            Op::Constant(idx) => {
+                let val = self.read_constant(idx);
+                self.stack.push(val);
+            }
+            Op::Unit => self.stack.push(Value::Unit),
+            Op::True => self.stack.push(Value::Bool(true)),
+            Op::False => self.stack.push(Value::Bool(false)),
+            Op::Pop => {
+                self.stack.pop();
+            }
+            Op::GetLocal(slot) => {
+                let base = self.frames.last().unwrap().base;
+                let val = self.stack[base + slot as usize].clone();
+                self.stack.push(val);
+            }
+            Op::SetLocal(slot) => {
+                let base = self.frames.last().unwrap().base;
+                let val = self.stack.last().unwrap().clone();
+                self.stack[base + slot as usize] = val;
+            }
+            Op::GetUpvalue(slot) => {
+                let uv = self.frames.last().unwrap().closure.upvalues[slot as usize].clone();
+                let val = match &*uv.borrow() {
+                    UpvalueState::Open(idx) => self.stack[*idx].clone(),
+                    UpvalueState::Closed(v) => v.clone(),
+                };
+                self.stack.push(val);
+            }
+            Op::SetUpvalue(slot) => {
+                let uv = self.frames.last().unwrap().closure.upvalues[slot as usize].clone();
+                let val = self.stack.last().unwrap().clone();
+                let mut state = uv.borrow_mut();
+                match &mut *state {
+                    UpvalueState::Open(idx) => self.stack[*idx] = val,
+                    UpvalueState::Closed(v) => *v = val,
                 }
-                Op::Unit => self.stack.push(Value::Unit),
-                Op::True => self.stack.push(Value::Bool(true)),
-                Op::False => self.stack.push(Value::Bool(false)),
-                Op::Pop => {
-                    self.stack.pop();
-                }
-                Op::GetLocal(slot) => {
-                    let base = self.frames.last().unwrap().base;
-                    let val = self.stack[base + slot as usize].clone();
-                    self.stack.push(val);
-                }
-                Op::SetLocal(slot) => {
-                    let base = self.frames.last().unwrap().base;
-                    let val = self.stack.last().unwrap().clone();
-                    self.stack[base + slot as usize] = val;
-                }
-                Op::GetUpvalue(slot) => {
-                    let uv = self.frames.last().unwrap().closure.upvalues[slot as usize].clone();
-                    let val = match &*uv.borrow() {
-                        UpvalueState::Open(idx) => self.stack[*idx].clone(),
-                        UpvalueState::Closed(v) => v.clone(),
-                    };
-                    self.stack.push(val);
-                }
-                Op::SetUpvalue(slot) => {
-                    let uv = self.frames.last().unwrap().closure.upvalues[slot as usize].clone();
-                    let val = self.stack.last().unwrap().clone();
-                    let mut state = uv.borrow_mut();
-                    match &mut *state {
-                        UpvalueState::Open(idx) => self.stack[*idx] = val,
-                        UpvalueState::Closed(v) => *v = val,
+            }
+            Op::CloseUpvalue => {
+                let slot = self.stack.len() - 1;
+                self.close_upvalues_from(slot);
+                self.stack.pop();
+            }
+            Op::GetGlobal(idx) => {
+                let frame = self.frames.last().unwrap();
+                let name = match &frame.closure.proto.chunk.constants[idx as usize] {
+                    Constant::Str(s) => s.as_str(),
+                    _ => unreachable!(),
+                };
+                let val = self
+                    .globals
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("[line {}] Undefined variable '{}'", line, name))?;
+                self.stack.push(val);
+            }
+            Op::DefineGlobal(idx) => {
+                let name = self.read_string(idx);
+                let val = self.stack.pop().unwrap();
+                self.globals.insert(name, val);
+            }
+            Op::SetGlobal(idx) => {
+                let frame = self.frames.last().unwrap();
+                let name = match &frame.closure.proto.chunk.constants[idx as usize] {
+                    Constant::Str(s) => s.as_str(),
+                    _ => unreachable!(),
+                };
+                let val = self.stack.last().unwrap().clone();
+                match self.globals.get_mut(name) {
+                    Some(slot) => *slot = val,
+                    None => {
+                        return Err(format!("[line {}] Undefined variable '{}'", line, name));
                     }
                 }
-                Op::CloseUpvalue => {
-                    let slot = self.stack.len() - 1;
-                    self.close_upvalues_from(slot);
-                    self.stack.pop();
-                }
-                Op::GetGlobal(idx) => {
-                    let frame = self.frames.last().unwrap();
-                    let name = match &frame.closure.proto.chunk.constants[idx as usize] {
-                        Constant::Str(s) => s.as_str(),
-                        _ => unreachable!(),
-                    };
-                    let val =
-                        self.globals.get(name).cloned().ok_or_else(|| {
-                            format!("[line {}] Undefined variable '{}'", line, name)
-                        })?;
-                    self.stack.push(val);
-                }
-                Op::DefineGlobal(idx) => {
-                    let name = self.read_string(idx);
-                    let val = self.stack.pop().unwrap();
-                    self.globals.insert(name, val);
-                }
-                Op::SetGlobal(idx) => {
-                    let frame = self.frames.last().unwrap();
-                    let name = match &frame.closure.proto.chunk.constants[idx as usize] {
-                        Constant::Str(s) => s.as_str(),
-                        _ => unreachable!(),
-                    };
-                    let val = self.stack.last().unwrap().clone();
-                    match self.globals.get_mut(name) {
-                        Some(slot) => *slot = val,
-                        None => {
-                            return Err(format!("[line {}] Undefined variable '{}'", line, name));
-                        }
+            }
+            Op::Add => {
+                let b = self.stack.pop().unwrap();
+                let a = self.stack.pop().unwrap();
+                let res = match (a, b) {
+                    (Value::Int(x), Value::Int(y)) => Value::Int(x.wrapping_add(y)),
+                    (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
+                    (Value::Int(x), Value::Float(y)) => Value::Float((x as f64) + y),
+                    (Value::Float(x), Value::Int(y)) => Value::Float(x + (y as f64)),
+                    (Value::Str(x), Value::Str(y)) => Value::Str(format!("{}{}", x, y)),
+                    (Value::List(x), Value::List(y)) => {
+                        let mut combined = x.borrow().clone();
+                        combined.extend(y.borrow().iter().cloned());
+                        Value::List(Rc::new(RefCell::new(combined)))
                     }
-                }
-                Op::Add => {
-                    let b = self.stack.pop().unwrap();
-                    let a = self.stack.pop().unwrap();
-                    let res = match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => Value::Int(x.wrapping_add(y)),
-                        (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
-                        (Value::Int(x), Value::Float(y)) => Value::Float((x as f64) + y),
-                        (Value::Float(x), Value::Int(y)) => Value::Float(x + (y as f64)),
-                        (Value::Str(x), Value::Str(y)) => Value::Str(format!("{}{}", x, y)),
-                        (Value::List(x), Value::List(y)) => {
-                            let mut combined = x.borrow().clone();
-                            combined.extend(y.borrow().iter().cloned());
-                            Value::List(Rc::new(RefCell::new(combined)))
-                        }
-                        (l, r) => {
-                            return Err(format!(
-                                "[line {}] Cannot add '{}' and '{}'",
-                                line,
-                                l.type_name(),
-                                r.type_name()
-                            ));
-                        }
-                    };
-                    self.stack.push(res);
-                }
-                Op::Sub => self.numeric_op(line, i64::wrapping_sub, |a, b| a - b, "subtract")?,
-                Op::Mul => self.numeric_op(line, i64::wrapping_mul, |a, b| a * b, "multiply")?,
-                Op::Div => {
-                    let b = self.stack.pop().unwrap();
-                    let a = self.stack.pop().unwrap();
-                    let res = match (a, b) {
-                        (Value::Int(_), Value::Int(0)) => {
+                    (l, r) => {
+                        return Err(format!(
+                            "[line {}] Cannot add '{}' and '{}'",
+                            line,
+                            l.type_name(),
+                            r.type_name()
+                        ));
+                    }
+                };
+                self.stack.push(res);
+            }
+            Op::Sub => self.numeric_op(line, i64::wrapping_sub, |a, b| a - b, "subtract")?,
+            Op::Mul => self.numeric_op(line, i64::wrapping_mul, |a, b| a * b, "multiply")?,
+            Op::Div => {
+                let b = self.stack.pop().unwrap();
+                let a = self.stack.pop().unwrap();
+                let res = match (a, b) {
+                    (Value::Int(_), Value::Int(0)) => {
+                        return Err(format!("[line {}] Division by zero", line));
+                    }
+                    (Value::Int(x), Value::Int(y)) => {
+                        Value::Int(x.checked_div(y).unwrap_or(i64::MIN))
+                    }
+                    (Value::Float(x), Value::Float(y)) => {
+                        if y == 0.0 {
                             return Err(format!("[line {}] Division by zero", line));
                         }
-                        (Value::Int(x), Value::Int(y)) => {
-                            Value::Int(x.checked_div(y).unwrap_or(i64::MIN))
+                        Value::Float(x / y)
+                    }
+                    (Value::Int(x), Value::Float(y)) => {
+                        if y == 0.0 {
+                            return Err(format!("[line {}] Division by zero", line));
                         }
-                        (Value::Float(x), Value::Float(y)) => {
-                            if y == 0.0 {
-                                return Err(format!("[line {}] Division by zero", line));
-                            }
-                            Value::Float(x / y)
+                        Value::Float((x as f64) / y)
+                    }
+                    (Value::Float(x), Value::Int(y)) => {
+                        if y == 0 {
+                            return Err(format!("[line {}] Division by zero", line));
                         }
-                        (Value::Int(x), Value::Float(y)) => {
-                            if y == 0.0 {
-                                return Err(format!("[line {}] Division by zero", line));
-                            }
-                            Value::Float((x as f64) / y)
-                        }
-                        (Value::Float(x), Value::Int(y)) => {
-                            if y == 0 {
-                                return Err(format!("[line {}] Division by zero", line));
-                            }
-                            Value::Float(x / (y as f64))
-                        }
-                        (l, r) => {
-                            return Err(format!(
-                                "[line {}] Cannot divide '{}' and '{}'",
-                                line,
-                                l.type_name(),
-                                r.type_name()
-                            ));
-                        }
-                    };
-                    self.stack.push(res);
-                }
-                Op::Mod => {
-                    let b = self.stack.pop().unwrap();
-                    let a = self.stack.pop().unwrap();
-                    match (a, b) {
-                        (Value::Int(_), Value::Int(0)) => {
-                            return Err(format!("[line {}] Modulo by zero", line));
-                        }
-                        (Value::Int(x), Value::Int(y)) => {
-                            self.stack.push(Value::Int(x.checked_rem(y).unwrap_or(0)))
-                        }
-                        (Value::Float(x), Value::Float(y)) => self.stack.push(Value::Float(x % y)),
-                        (l, r) => {
-                            return Err(format!(
-                                "[line {}] Cannot modulo '{}' and '{}'",
-                                line,
-                                l.type_name(),
-                                r.type_name()
-                            ));
-                        }
+                        Value::Float(x / (y as f64))
+                    }
+                    (l, r) => {
+                        return Err(format!(
+                            "[line {}] Cannot divide '{}' and '{}'",
+                            line,
+                            l.type_name(),
+                            r.type_name()
+                        ));
+                    }
+                };
+                self.stack.push(res);
+            }
+            Op::Mod => {
+                let b = self.stack.pop().unwrap();
+                let a = self.stack.pop().unwrap();
+                match (a, b) {
+                    (Value::Int(_), Value::Int(0)) => {
+                        return Err(format!("[line {}] Modulo by zero", line));
+                    }
+                    (Value::Int(x), Value::Int(y)) => {
+                        self.stack.push(Value::Int(x.checked_rem(y).unwrap_or(0)))
+                    }
+                    (Value::Float(x), Value::Float(y)) => self.stack.push(Value::Float(x % y)),
+                    (l, r) => {
+                        return Err(format!(
+                            "[line {}] Cannot modulo '{}' and '{}'",
+                            line,
+                            l.type_name(),
+                            r.type_name()
+                        ));
                     }
                 }
-                Op::Neg => {
-                    let v = self.stack.pop().unwrap();
-                    match v {
-                        Value::Int(x) => self.stack.push(Value::Int(x.wrapping_neg())),
-                        Value::Float(x) => self.stack.push(Value::Float(-x)),
-                        other => {
-                            return Err(format!(
-                                "[line {}] Cannot negate '{}'",
-                                line,
-                                other.type_name()
-                            ));
-                        }
+            }
+            Op::Neg => {
+                let v = self.stack.pop().unwrap();
+                match v {
+                    Value::Int(x) => self.stack.push(Value::Int(x.wrapping_neg())),
+                    Value::Float(x) => self.stack.push(Value::Float(-x)),
+                    other => {
+                        return Err(format!(
+                            "[line {}] Cannot negate '{}'",
+                            line,
+                            other.type_name()
+                        ));
                     }
                 }
-                Op::Not => {
-                    let v = self.stack.pop().unwrap();
-                    self.stack.push(Value::Bool(!v.is_truthy()));
-                }
-                Op::Eq => {
-                    let b = self.stack.pop().unwrap();
-                    let a = self.stack.pop().unwrap();
-                    self.stack.push(Value::Bool(a.equals(&b)));
-                }
-                Op::Ne => {
-                    let b = self.stack.pop().unwrap();
-                    let a = self.stack.pop().unwrap();
-                    self.stack.push(Value::Bool(!a.equals(&b)));
-                }
-                Op::Lt => self.cmp_op(line, |a, b| a < b, |a, b| a < b, |a, b| a < b)?,
-                Op::Le => self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?,
-                Op::Gt => self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?,
-                Op::Ge => self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?,
-                Op::Jump(target) => {
+            }
+            Op::Not => {
+                let v = self.stack.pop().unwrap();
+                self.stack.push(Value::Bool(!v.is_truthy()));
+            }
+            Op::Eq => {
+                let b = self.stack.pop().unwrap();
+                let a = self.stack.pop().unwrap();
+                self.stack.push(Value::Bool(a.equals(&b)));
+            }
+            Op::Ne => {
+                let b = self.stack.pop().unwrap();
+                let a = self.stack.pop().unwrap();
+                self.stack.push(Value::Bool(!a.equals(&b)));
+            }
+            Op::Lt => self.cmp_op(line, |a, b| a < b, |a, b| a < b, |a, b| a < b)?,
+            Op::Le => self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?,
+            Op::Gt => self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?,
+            Op::Ge => self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?,
+            Op::Jump(target) => {
+                self.frames.last_mut().unwrap().ip = target;
+            }
+            Op::JumpIfFalsePop(target) => {
+                let cond = self.stack.pop().unwrap();
+                if !cond.is_truthy() {
                     self.frames.last_mut().unwrap().ip = target;
                 }
-                Op::JumpIfFalsePop(target) => {
-                    let cond = self.stack.pop().unwrap();
-                    if !cond.is_truthy() {
-                        self.frames.last_mut().unwrap().ip = target;
-                    }
+            }
+            Op::JumpIfFalsePeek(target) => {
+                if !self.stack.last().unwrap().is_truthy() {
+                    self.frames.last_mut().unwrap().ip = target;
                 }
-                Op::JumpIfFalsePeek(target) => {
-                    if !self.stack.last().unwrap().is_truthy() {
-                        self.frames.last_mut().unwrap().ip = target;
-                    }
+            }
+            Op::JumpIfTruePeek(target) => {
+                if self.stack.last().unwrap().is_truthy() {
+                    self.frames.last_mut().unwrap().ip = target;
                 }
-                Op::JumpIfTruePeek(target) => {
-                    if self.stack.last().unwrap().is_truthy() {
-                        self.frames.last_mut().unwrap().ip = target;
-                    }
+            }
+            Op::JumpIfNotUnitPeek(target) => {
+                if !matches!(self.stack.last().unwrap(), Value::Unit) {
+                    self.frames.last_mut().unwrap().ip = target;
                 }
-                Op::JumpIfNotUnitPeek(target) => {
-                    if !matches!(self.stack.last().unwrap(), Value::Unit) {
-                        self.frames.last_mut().unwrap().ip = target;
-                    }
-                }
-                Op::Call(argc) => {
-                    let argc = argc as usize;
-                    let callee_idx = self.stack.len() - 1 - argc;
-                    let callee = self.stack[callee_idx].clone();
-                    match callee {
-                        Value::Closure(closure) => {
-                            if self.frames.len() >= MAX_CALL_DEPTH {
-                                return Err(format!(
-                                    "[line {}] Stack overflow (maximum call depth {} exceeded)",
-                                    line, MAX_CALL_DEPTH
-                                ));
-                            }
-                            if closure.proto.arity as usize != argc {
-                                return Err(format!(
-                                    "[line {}] Expected {} arguments to '{}', got {}",
-                                    line, closure.proto.arity, closure.proto.name, argc
-                                ));
-                            }
-                            self.frames.push(CallFrame {
-                                closure,
-                                ip: 0,
-                                base: callee_idx,
-                            });
+            }
+            Op::Call(argc) => {
+                let argc = argc as usize;
+                let callee_idx = self.stack.len() - 1 - argc;
+                let callee = self.stack[callee_idx].clone();
+                match callee {
+                    Value::Closure(closure) => {
+                        if self.frames.len() >= MAX_CALL_DEPTH {
+                            return Err(format!(
+                                "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                line, MAX_CALL_DEPTH
+                            ));
                         }
-                        Value::NativeFn(native) => {
-                            let args = self.stack[callee_idx + 1..].to_vec();
-                            self.stack.truncate(callee_idx);
-                            let res = (native.func)(self, &args)
-                                .map_err(|e| format!("[line {}] {}", line, e))?;
-                            self.stack.push(res);
+                        if closure.proto.arity as usize != argc {
+                            return Err(format!(
+                                "[line {}] Expected {} arguments to '{}', got {}",
+                                line, closure.proto.arity, closure.proto.name, argc
+                            ));
                         }
+                        self.frames.push(CallFrame {
+                            closure,
+                            ip: 0,
+                            base: callee_idx,
+                        });
+                    }
+                    Value::NativeFn(native) => {
+                        let args = self.stack[callee_idx + 1..].to_vec();
+                        self.stack.truncate(callee_idx);
+                        let res = (native.func)(self, &args)
+                            .map_err(|e| format!("[line {}] {}", line, e))?;
+                        self.stack.push(res);
+                    }
+                    other => {
+                        return Err(format!(
+                            "[line {}] Cannot call value of type '{}'",
+                            line,
+                            other.type_name()
+                        ));
+                    }
+                }
+            }
+            Op::Closure(idx, uv_idx) => {
+                let (proto, upvalue_descs) = {
+                    let frame = self.frames.last().unwrap();
+                    let proto = match &frame.closure.proto.chunk.constants[idx as usize] {
+                        Constant::Function(p) => p.clone(),
+                        _ => unreachable!(),
+                    };
+                    let descs = frame.closure.proto.chunk.upvalue_lists[uv_idx as usize].clone();
+                    (proto, descs)
+                };
+                let mut upvalues = Vec::with_capacity(upvalue_descs.len());
+                for desc in upvalue_descs {
+                    if desc.is_local {
+                        let base = self.frames.last().unwrap().base;
+                        let slot = base + desc.index as usize;
+                        upvalues.push(self.capture_upvalue(slot));
+                    } else {
+                        let uv = self.frames.last().unwrap().closure.upvalues[desc.index as usize]
+                            .clone();
+                        upvalues.push(uv);
+                    }
+                }
+                self.stack
+                    .push(Value::Closure(Rc::new(Closure { proto, upvalues })));
+            }
+            Op::MakeList(count) => {
+                let count = count as usize;
+                let start = self.stack.len() - count;
+                let items = self.stack.drain(start..).collect::<Vec<_>>();
+                self.stack.push(Value::List(Rc::new(RefCell::new(items))));
+            }
+            Op::MakeDict(count) => {
+                let count = count as usize;
+                let start = self.stack.len() - count * 2;
+                let drained: Vec<Value> = self.stack.drain(start..).collect();
+                let mut map = HashMap::with_capacity(count);
+                for pair in drained.chunks_exact(2) {
+                    let key = match &pair[0] {
+                        Value::Str(s) => s.clone(),
                         other => {
                             return Err(format!(
-                                "[line {}] Cannot call value of type '{}'",
+                                "[line {}] Dictionary keys must be strings, got '{}'",
                                 line,
                                 other.type_name()
                             ));
                         }
-                    }
-                }
-                Op::Closure(idx, uv_idx) => {
-                    let (proto, upvalue_descs) = {
-                        let frame = self.frames.last().unwrap();
-                        let proto = match &frame.closure.proto.chunk.constants[idx as usize] {
-                            Constant::Function(p) => p.clone(),
-                            _ => unreachable!(),
-                        };
-                        let descs =
-                            frame.closure.proto.chunk.upvalue_lists[uv_idx as usize].clone();
-                        (proto, descs)
                     };
-                    let mut upvalues = Vec::with_capacity(upvalue_descs.len());
-                    for desc in upvalue_descs {
-                        if desc.is_local {
-                            let base = self.frames.last().unwrap().base;
-                            let slot = base + desc.index as usize;
-                            upvalues.push(self.capture_upvalue(slot));
+                    map.insert(key, pair[1].clone());
+                }
+                self.stack.push(Value::Dict(Rc::new(RefCell::new(map))));
+            }
+            Op::GetIndex => {
+                let idx_val = self.stack.pop().unwrap();
+                let obj_val = self.stack.pop().unwrap();
+                let res = match (obj_val, idx_val) {
+                    (Value::List(list), Value::Int(i)) => {
+                        let borrowed = list.borrow();
+                        let len = borrowed.len() as i64;
+                        let actual = if i < 0 { len + i } else { i };
+                        if actual < 0 || actual >= len {
+                            return Err(format!(
+                                "[line {}] Index {} out of bounds for list of length {}",
+                                line, i, len
+                            ));
+                        }
+                        borrowed[actual as usize].clone()
+                    }
+                    (Value::Str(s), Value::Int(i)) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let len = chars.len() as i64;
+                        let actual = if i < 0 { len + i } else { i };
+                        if actual < 0 || actual >= len {
+                            return Err(format!(
+                                "[line {}] Index {} out of bounds for string of length {}",
+                                line, i, len
+                            ));
+                        }
+                        Value::Str(chars[actual as usize].to_string())
+                    }
+                    (Value::Dict(dict), Value::Str(key)) => {
+                        dict.borrow().get(&key).cloned().unwrap_or(Value::Unit)
+                    }
+                    (Value::Range { start, end }, Value::Int(i)) => {
+                        let len = if end > start {
+                            (end as i128) - (start as i128)
                         } else {
-                            let uv = self.frames.last().unwrap().closure.upvalues
-                                [desc.index as usize]
-                                .clone();
-                            upvalues.push(uv);
-                        }
-                    }
-                    self.stack
-                        .push(Value::Closure(Rc::new(Closure { proto, upvalues })));
-                }
-                Op::MakeList(count) => {
-                    let count = count as usize;
-                    let start = self.stack.len() - count;
-                    let items = self.stack.drain(start..).collect::<Vec<_>>();
-                    self.stack.push(Value::List(Rc::new(RefCell::new(items))));
-                }
-                Op::MakeDict(count) => {
-                    let count = count as usize;
-                    let start = self.stack.len() - count * 2;
-                    let drained: Vec<Value> = self.stack.drain(start..).collect();
-                    let mut map = HashMap::with_capacity(count);
-                    for pair in drained.chunks_exact(2) {
-                        let key = match &pair[0] {
-                            Value::Str(s) => s.clone(),
-                            other => {
-                                return Err(format!(
-                                    "[line {}] Dictionary keys must be strings, got '{}'",
-                                    line,
-                                    other.type_name()
-                                ));
-                            }
+                            0
                         };
-                        map.insert(key, pair[1].clone());
-                    }
-                    self.stack.push(Value::Dict(Rc::new(RefCell::new(map))));
-                }
-                Op::GetIndex => {
-                    let idx_val = self.stack.pop().unwrap();
-                    let obj_val = self.stack.pop().unwrap();
-                    let res = match (obj_val, idx_val) {
-                        (Value::List(list), Value::Int(i)) => {
-                            let borrowed = list.borrow();
-                            let len = borrowed.len() as i64;
-                            let actual = if i < 0 { len + i } else { i };
-                            if actual < 0 || actual >= len {
-                                return Err(format!(
-                                    "[line {}] Index {} out of bounds for list of length {}",
-                                    line, i, len
-                                ));
-                            }
-                            borrowed[actual as usize].clone()
-                        }
-                        (Value::Str(s), Value::Int(i)) => {
-                            let chars: Vec<char> = s.chars().collect();
-                            let len = chars.len() as i64;
-                            let actual = if i < 0 { len + i } else { i };
-                            if actual < 0 || actual >= len {
-                                return Err(format!(
-                                    "[line {}] Index {} out of bounds for string of length {}",
-                                    line, i, len
-                                ));
-                            }
-                            Value::Str(chars[actual as usize].to_string())
-                        }
-                        (Value::Dict(dict), Value::Str(key)) => {
-                            dict.borrow().get(&key).cloned().unwrap_or(Value::Unit)
-                        }
-                        (Value::Range { start, end }, Value::Int(i)) => {
-                            let len = if end > start {
-                                (end as i128) - (start as i128)
-                            } else {
-                                0
-                            };
-                            let actual = if i < 0 { len + i as i128 } else { i as i128 };
-                            if actual < 0 || actual >= len {
-                                return Err(format!(
-                                    "[line {}] Index {} out of bounds for range of length {}",
-                                    line, i, len
-                                ));
-                            }
-                            Value::Int((start as i128 + actual) as i64)
-                        }
-                        (o, i) => {
+                        let actual = if i < 0 { len + i as i128 } else { i as i128 };
+                        if actual < 0 || actual >= len {
                             return Err(format!(
-                                "[line {}] Cannot index '{}' with '{}'",
-                                line,
-                                o.type_name(),
-                                i.type_name()
+                                "[line {}] Index {} out of bounds for range of length {}",
+                                line, i, len
                             ));
                         }
-                    };
-                    self.stack.push(res);
-                }
-                Op::SetIndex => {
-                    let val = self.stack.pop().unwrap();
-                    let idx_val = self.stack.pop().unwrap();
-                    let obj_val = self.stack.pop().unwrap();
-                    match (obj_val, idx_val) {
-                        (Value::List(list), Value::Int(i)) => {
-                            let mut borrowed = list.borrow_mut();
-                            let len = borrowed.len() as i64;
-                            let actual = if i < 0 { len + i } else { i };
-                            if actual < 0 || actual >= len {
-                                return Err(format!(
-                                    "[line {}] Index {} out of bounds for list of length {}",
-                                    line, i, len
-                                ));
-                            }
-                            borrowed[actual as usize] = val.clone();
-                        }
-                        (Value::Dict(dict), Value::Str(key)) => {
-                            dict.borrow_mut().insert(key, val.clone());
-                        }
-                        (o, i) => {
+                        Value::Int((start as i128 + actual) as i64)
+                    }
+                    (o, i) => {
+                        return Err(format!(
+                            "[line {}] Cannot index '{}' with '{}'",
+                            line,
+                            o.type_name(),
+                            i.type_name()
+                        ));
+                    }
+                };
+                self.stack.push(res);
+            }
+            Op::SetIndex => {
+                let val = self.stack.pop().unwrap();
+                let idx_val = self.stack.pop().unwrap();
+                let obj_val = self.stack.pop().unwrap();
+                match (obj_val, idx_val) {
+                    (Value::List(list), Value::Int(i)) => {
+                        let mut borrowed = list.borrow_mut();
+                        let len = borrowed.len() as i64;
+                        let actual = if i < 0 { len + i } else { i };
+                        if actual < 0 || actual >= len {
                             return Err(format!(
-                                "[line {}] Cannot index-assign '{}' with '{}'",
-                                line,
-                                o.type_name(),
-                                i.type_name()
+                                "[line {}] Index {} out of bounds for list of length {}",
+                                line, i, len
                             ));
                         }
+                        borrowed[actual as usize] = val.clone();
                     }
-                    self.stack.push(val);
+                    (Value::Dict(dict), Value::Str(key)) => {
+                        dict.borrow_mut().insert(key, val.clone());
+                    }
+                    (o, i) => {
+                        return Err(format!(
+                            "[line {}] Cannot index-assign '{}' with '{}'",
+                            line,
+                            o.type_name(),
+                            i.type_name()
+                        ));
+                    }
                 }
-                Op::GetAttr(idx) => {
+                self.stack.push(val);
+            }
+            Op::GetAttr(idx) => {
+                let attr = self.read_string(idx);
+                let obj = self.stack.pop().unwrap();
+                match obj {
+                    Value::Module { name, exports } => {
+                        let val = exports.borrow().get(&attr).cloned().ok_or_else(|| {
+                            format!("[line {}] Module '{}' has no export '{}'", line, name, attr)
+                        })?;
+                        self.stack.push(val);
+                    }
+                    Value::Dict(dict) => {
+                        let val = dict.borrow().get(&attr).cloned().unwrap_or(Value::Unit);
+                        self.stack.push(val);
+                    }
+                    other => {
+                        return Err(format!(
+                            "[line {}] Cannot access '.{}' on '{}'",
+                            line,
+                            attr,
+                            other.type_name()
+                        ));
+                    }
+                }
+            }
+            Op::OptGetAttr(idx) => {
+                let obj = self.stack.pop().unwrap();
+                if matches!(obj, Value::Unit) {
+                    self.stack.push(Value::Unit);
+                } else {
                     let attr = self.read_string(idx);
-                    let obj = self.stack.pop().unwrap();
                     match obj {
                         Value::Module { name, exports } => {
                             let val = exports.borrow().get(&attr).cloned().ok_or_else(|| {
@@ -860,120 +901,89 @@ impl VM {
                         }
                         other => {
                             return Err(format!(
-                                "[line {}] Cannot access '.{}' on '{}'",
+                                "[line {}] Cannot access '?.{}' on '{}'",
                                 line,
                                 attr,
                                 other.type_name()
                             ));
                         }
                     }
-                }
-                Op::OptGetAttr(idx) => {
-                    let obj = self.stack.pop().unwrap();
-                    if matches!(obj, Value::Unit) {
-                        self.stack.push(Value::Unit);
-                    } else {
-                        let attr = self.read_string(idx);
-                        match obj {
-                            Value::Module { name, exports } => {
-                                let val =
-                                    exports.borrow().get(&attr).cloned().ok_or_else(|| {
-                                        format!(
-                                            "[line {}] Module '{}' has no export '{}'",
-                                            line, name, attr
-                                        )
-                                    })?;
-                                self.stack.push(val);
-                            }
-                            Value::Dict(dict) => {
-                                let val = dict.borrow().get(&attr).cloned().unwrap_or(Value::Unit);
-                                self.stack.push(val);
-                            }
-                            other => {
-                                return Err(format!(
-                                    "[line {}] Cannot access '?.{}' on '{}'",
-                                    line,
-                                    attr,
-                                    other.type_name()
-                                ));
-                            }
-                        }
-                    }
-                }
-                Op::SetAttr(idx) => {
-                    let attr = self.read_string(idx);
-                    let val = self.stack.pop().unwrap();
-                    let obj = self.stack.pop().unwrap();
-                    match obj {
-                        Value::Dict(dict) => {
-                            dict.borrow_mut().insert(attr, val.clone());
-                            self.stack.push(val);
-                        }
-                        other => {
-                            return Err(format!(
-                                "[line {}] Cannot assign '.{}' on '{}'",
-                                line,
-                                attr,
-                                other.type_name()
-                            ));
-                        }
-                    }
-                }
-                Op::Import(idx, is_path) => {
-                    let source = self.read_string(idx);
-                    let module = self
-                        .load_module(&source, is_path)
-                        .map_err(|e| format!("[line {}] {}", line, e))?;
-                    self.stack.push(module);
-                }
-                Op::MakeModule(name_idx, count) => {
-                    let mod_name = self.read_string(name_idx);
-                    let count = count as usize;
-                    let start = self.stack.len() - count * 2;
-                    let mut exports = HashMap::with_capacity(count);
-                    let drained: Vec<Value> = self.stack.drain(start..).collect();
-                    for pair in drained.chunks_exact(2) {
-                        if let Value::Str(k) = &pair[0] {
-                            exports.insert(k.clone(), pair[1].clone());
-                        }
-                    }
-                    self.stack.push(Value::Module {
-                        name: mod_name,
-                        exports: Rc::new(RefCell::new(exports)),
-                    });
-                }
-                Op::SetupTry(catch_ip) => {
-                    self.try_handlers.push(TryHandler {
-                        frame_depth: self.frames.len(),
-                        stack_len: self.stack.len(),
-                        catch_ip,
-                    });
-                }
-                Op::PopTry => {
-                    self.try_handlers.pop();
-                }
-                Op::Throw => {
-                    let val = self.stack.pop().unwrap();
-                    return Err(val.to_string());
-                }
-                Op::Return => {
-                    let result = self.stack.pop().unwrap();
-                    let frame = self.frames.pop().unwrap();
-                    while self
-                        .try_handlers
-                        .last()
-                        .is_some_and(|h| h.frame_depth > self.frames.len())
-                    {
-                        self.try_handlers.pop();
-                    }
-                    self.close_upvalues_from(frame.base);
-                    self.stack.truncate(frame.base);
-                    if self.frames.len() == target_depth {
-                        return Ok(Some(result));
-                    }
-                    self.stack.push(result);
                 }
             }
+            Op::SetAttr(idx) => {
+                let attr = self.read_string(idx);
+                let val = self.stack.pop().unwrap();
+                let obj = self.stack.pop().unwrap();
+                match obj {
+                    Value::Dict(dict) => {
+                        dict.borrow_mut().insert(attr, val.clone());
+                        self.stack.push(val);
+                    }
+                    other => {
+                        return Err(format!(
+                            "[line {}] Cannot assign '.{}' on '{}'",
+                            line,
+                            attr,
+                            other.type_name()
+                        ));
+                    }
+                }
+            }
+            Op::Import(idx, is_path) => {
+                let source = self.read_string(idx);
+                let module = self
+                    .load_module(&source, is_path)
+                    .map_err(|e| format!("[line {}] {}", line, e))?;
+                self.stack.push(module);
+            }
+            Op::MakeModule(name_idx, count) => {
+                let mod_name = self.read_string(name_idx);
+                let count = count as usize;
+                let start = self.stack.len() - count * 2;
+                let mut exports = HashMap::with_capacity(count);
+                let drained: Vec<Value> = self.stack.drain(start..).collect();
+                for pair in drained.chunks_exact(2) {
+                    if let Value::Str(k) = &pair[0] {
+                        exports.insert(k.clone(), pair[1].clone());
+                    }
+                }
+                self.stack.push(Value::Module {
+                    name: mod_name,
+                    exports: Rc::new(RefCell::new(exports)),
+                });
+            }
+            Op::SetupTry(catch_ip) => {
+                self.try_handlers.push(TryHandler {
+                    frame_depth: self.frames.len(),
+                    stack_len: self.stack.len(),
+                    catch_ip,
+                });
+            }
+            Op::PopTry => {
+                self.try_handlers.pop();
+            }
+            Op::Throw => {
+                let val = self.stack.pop().unwrap();
+                return Err(val.to_string());
+            }
+            Op::Return => {
+                let result = self.stack.pop().unwrap();
+                let frame = self.frames.pop().unwrap();
+                while self
+                    .try_handlers
+                    .last()
+                    .is_some_and(|h| h.frame_depth > self.frames.len())
+                {
+                    self.try_handlers.pop();
+                }
+                self.close_upvalues_from(frame.base);
+                self.stack.truncate(frame.base);
+                if self.frames.len() == target_depth {
+                    return Ok(Some(result));
+                }
+                self.stack.push(result);
+            }
+        }
         Ok(None)
     }
 
@@ -1357,11 +1367,155 @@ fn native_keys(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Dict(d) => {
-            let list: Vec<Value> = d.borrow().keys().cloned().map(Value::Str).collect();
+            let mut keys: Vec<String> = d.borrow().keys().cloned().collect();
+            keys.sort();
+            let list: Vec<Value> = keys.into_iter().map(Value::Str).collect();
             Ok(Value::List(Rc::new(RefCell::new(list))))
         }
         other => Err(format!(
             "keys() expects a dict, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn native_values(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("values() expects 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::Dict(d) => {
+            let map = d.borrow();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let list: Vec<Value> = keys.into_iter().map(|k| map[k].clone()).collect();
+            Ok(Value::List(Rc::new(RefCell::new(list))))
+        }
+        other => Err(format!(
+            "values() expects a dict, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn native_entries(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("entries() expects 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::Dict(d) => {
+            let map = d.borrow();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let list: Vec<Value> = keys
+                .into_iter()
+                .map(|k| {
+                    Value::List(Rc::new(RefCell::new(vec![
+                        Value::Str(k.clone()),
+                        map[k].clone(),
+                    ])))
+                })
+                .collect();
+            Ok(Value::List(Rc::new(RefCell::new(list))))
+        }
+        other => Err(format!(
+            "entries() expects a dict, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn native_get(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err("get() expects (dict, key, [default])".to_string());
+    }
+    let default = args.get(2).cloned().unwrap_or(Value::Unit);
+    match (&args[0], &args[1]) {
+        (Value::Dict(d), Value::Str(k)) => Ok(d.borrow().get(k).cloned().unwrap_or(default)),
+        _ => Err("get() expects (dict, string_key, [default])".to_string()),
+    }
+}
+
+fn native_remove(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("remove() expects 2 arguments, got {}", args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Dict(d), Value::Str(k)) => Ok(d.borrow_mut().remove(k).unwrap_or(Value::Unit)),
+        (Value::List(l), Value::Int(i)) => {
+            let mut list = l.borrow_mut();
+            let len = list.len() as i64;
+            let idx = if *i < 0 { len + *i } else { *i };
+            if idx < 0 || idx >= len {
+                return Err(format!("remove() index {} out of bounds", i));
+            }
+            Ok(list.remove(idx as usize))
+        }
+        _ => Err("remove() expects (dict, key) or (list, index)".to_string()),
+    }
+}
+
+fn native_sort(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("sort() expects 1 argument, got {}", args.len()));
+    }
+    let list = match &args[0] {
+        Value::List(l) => l,
+        other => {
+            return Err(format!(
+                "sort() expects a list, got '{}'",
+                other.type_name()
+            ));
+        }
+    };
+    let mut items = list.borrow().clone();
+    let mut err: Option<String> = None;
+    items.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            (Value::Float(x), Value::Float(y)) => {
+                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (Value::Int(x), Value::Float(y)) => (*x as f64)
+                .partial_cmp(y)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Float(x), Value::Int(y)) => x
+                .partial_cmp(&(*y as f64))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Str(x), Value::Str(y)) => x.cmp(y),
+            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+            _ => {
+                err = Some(format!(
+                    "sort() cannot compare '{}' and '{}'",
+                    a.type_name(),
+                    b.type_name()
+                ));
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(Value::List(Rc::new(RefCell::new(items))))
+}
+
+fn native_reverse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("reverse() expects 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::List(l) => {
+            let mut items = l.borrow().clone();
+            items.reverse();
+            Ok(Value::List(Rc::new(RefCell::new(items))))
+        }
+        Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
+        other => Err(format!(
+            "reverse() expects a list or string, got '{}'",
             other.type_name()
         )),
     }

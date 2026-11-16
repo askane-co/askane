@@ -86,18 +86,32 @@ let parsed = try {
 
 Global functions:
 - I/O: `print(...)`, `println(...)`, `read_line()`
-- Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `has(dict, key)`
+- Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `has(dict, key)`
 - Higher-order: `map(list, fn)`, `filter(list, fn)`, `reduce(list, init, fn)`
 - Conversions & Utils: `str(x)`, `int(x)`, `float(x)`, `type_of(x)`, `clock()`
 
 Built-in standard modules (`import <name>;`):
 - `math`: `pi`, `e`, `sqrt`, `abs`, `pow`, `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`
+- `strings`: `split`, `trim`, `trim_start`, `trim_end`, `replace`, `contains`, `starts_with`, `ends_with`, `upper`, `lower`, `find`, `repeat`, `lines`, `pad_start`, `pad_end`, `slice`, `join`
+- `path`: `join`, `parent`, `name`, `stem`, `extension`, `is_absolute`, `normalize`
+- `time`: `now_ms`, `now_sec`, `elapsed_ms`, `sleep_ms`
+- `random`: `seed`, `int`, `float`, `bool`, `choice`, `shuffle`, `crypto_int`, `crypto_bytes`
+- `base64`: `encode`, `decode`, `encode_url`, `decode_url`
+- `csv`: `parse`, `parse_dicts`, `stringify`
+- `log`: `set_level`, `debug`, `info`, `warn`, `error`
+- `test`: `assert`, `assert_eq`, `assert_ne`, `assert_err`
 - `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`
-- `sys`: `args`, `env` (requires `--unsafe`), `exit`, `os`, `arch`, `sleep`
+- `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`
 - `json`: `parse`, `stringify`
 - `http` (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
 - `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `circle`, `line`, `pixel`, `text`, `present`, `key_down`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
 - `mem` (Windows): `current_pid`, `find_pid` (returns `unit` if not found), `open`, `close`, `module_base` (returns `unit` if not found), `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
+
+CLI tools:
+- `askane` — multiline REPL (supports `:help`, `:exit`, `:reset`, `:modules`, `:bc`)
+- `askane --gui [file.ask]` — Askane Studio GUI editor & runner (Windows)
+- `askane check [--json] <file.ask>` — syntax/compile check without execution
+- `askane test <file_or_dir>` — run `.ask` test files in isolated VMs
 
 ## Security model
 

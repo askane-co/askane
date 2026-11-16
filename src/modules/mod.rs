@@ -1,10 +1,18 @@
+mod base64;
+mod csv;
 mod fs;
 mod gfx;
 mod http;
 mod json;
+mod log;
 mod math;
 mod mem;
+mod path;
+mod random;
+mod strings;
 mod sys;
+mod test;
+mod time;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -48,6 +56,14 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "json" => Some(json::module()),
         "http" => Some(http::module()),
         "gfx" => Some(gfx::module()),
+        "strings" => Some(strings::module()),
+        "path" => Some(path::module()),
+        "time" => Some(time::module()),
+        "random" => Some(random::module()),
+        "base64" => Some(base64::module()),
+        "csv" => Some(csv::module()),
+        "log" => Some(log::module()),
+        "test" => Some(test::module()),
         _ => None,
     }
 }

@@ -1,6 +1,7 @@
 mod ast;
 mod bytecode;
 mod compiler;
+mod gui;
 mod lexer;
 mod modules;
 mod parser;
@@ -18,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.11.0";
+const VERSION: &str = "0.12.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -48,10 +49,40 @@ fn compile_source(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, 
     Compiler::compile(&program)
 }
 
+fn format_error_with_source(source: &str, err: &str) -> String {
+    let mut line_num: Option<usize> = None;
+    let mut col_num: Option<usize> = None;
+
+    if let Some(start) = err.find('[') {
+        if let Some(end) = err[start + 1..].find(']') {
+            let tag = &err[start + 1..start + 1 + end];
+            if let Some(rest) = tag.strip_prefix("line ") {
+                line_num = rest.trim().parse::<usize>().ok();
+            } else if let Some((l, c)) = tag.split_once(':') {
+                line_num = l.trim().parse::<usize>().ok();
+                col_num = c.trim().parse::<usize>().ok();
+            }
+        }
+    }
+
+    let Some(ln) = line_num else {
+        return err.to_string();
+    };
+    let Some(src_line) = source.lines().nth(ln.saturating_sub(1)) else {
+        return err.to_string();
+    };
+    let mut out = format!("{}\n  {:>4} | {}", err, ln, src_line);
+    if let Some(col) = col_num {
+        let pad = " ".repeat(col.saturating_sub(1));
+        out.push_str(&format!("\n       | {}^", pad));
+    }
+    out
+}
+
 fn run_file(path: &str, dump_bytecode: bool, permissions: Permissions) -> Result<(), String> {
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
-    let proto = compile_source(&source)?;
+    let proto = compile_source(&source).map_err(|e| format_error_with_source(&source, &e))?;
     if dump_bytecode {
         print!("{}", proto.chunk.disassemble(&proto.name));
         return Ok(());
@@ -65,24 +96,206 @@ fn run_file(path: &str, dump_bytecode: bool, permissions: Permissions) -> Result
             vm.set_sandbox_root(parent);
         }
     }
-    vm.run(proto)?;
+    vm.run(proto)
+        .map_err(|e| format_error_with_source(&source, &e))?;
     Ok(())
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn run_check(path: &str, json_out: bool) -> Result<(), String> {
+    let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
+        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
+    match compile_source(&source) {
+        Ok(_) => {
+            if json_out {
+                println!("{{\"ok\":true,\"file\":{}}}", json_escape(path));
+            } else {
+                println!("OK: {}", path);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if json_out {
+                println!(
+                    "{{\"ok\":false,\"file\":{},\"error\":{}}}",
+                    json_escape(path),
+                    json_escape(&err)
+                );
+                Err(String::new())
+            } else {
+                Err(format_error_with_source(&source, &err))
+            }
+        }
+    }
+}
+
+fn collect_ask_files(
+    path: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
+    if path.is_file() {
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    if !path.is_dir() {
+        return Err(format!("Path '{}' not found", path.display()));
+    }
+    let mut entries: Vec<_> = fs::read_dir(path)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        if entry.is_dir() {
+            collect_ask_files(&entry, out)?;
+        } else if entry.extension().and_then(|s| s.to_str()) == Some("ask") {
+            out.push(entry);
+        }
+    }
+    Ok(())
+}
+
+fn run_tests_cmd(path: &str, perms: Permissions) -> Result<(), String> {
+    let mut files = Vec::new();
+    collect_ask_files(std::path::Path::new(path), &mut files)?;
+    if files.is_empty() {
+        return Err(format!("No .ask test files found in '{}'", path));
+    }
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for file in &files {
+        let label = file.display().to_string();
+        match run_file(&label, false, perms.clone()) {
+            Ok(()) => {
+                println!("PASS {}", label);
+                passed += 1;
+            }
+            Err(e) => {
+                eprintln!("FAIL {}\n{}", label, e);
+                failed += 1;
+            }
+        }
+    }
+    println!();
+    println!("Results: {} passed, {} failed", passed, failed);
+    if failed > 0 {
+        Err(format!("{} test file(s) failed", failed))
+    } else {
+        Ok(())
+    }
+}
+
+fn needs_more_input(buf: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut escape = false;
+    let chars: Vec<char> = buf.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && next == Some('/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == '/' && next == Some('/') {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        match ch {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    in_string || in_block_comment || depth > 0
 }
 
 fn run_repl() {
     println!("Askane v{} (open beta)", VERSION);
-    println!("Type :help for commands, :exit to quit.");
+    println!("Type :help for commands, :exit to quit. Supports multiline input.");
 
     let mut vm = VM::new();
     let stdin = io::stdin();
+    let mut buffer = String::new();
 
     loop {
-        print!("askane> ");
+        if buffer.is_empty() {
+            print!("askane> ");
+        } else {
+            print!("......> ");
+        }
         let _ = io::stdout().flush();
 
         let mut line = String::new();
         match stdin.read_line(&mut line) {
-            Ok(0) => break,
+            Ok(0) => {
+                if !buffer.trim().is_empty() {
+                    eprintln!("Input ended before the multiline expression was closed.");
+                } else {
+                    // normal EOF
+                }
+                break;
+            }
             Ok(_) => {}
             Err(e) => {
                 eprintln!("Read error: {}", e);
@@ -90,26 +303,52 @@ fn run_repl() {
             }
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match trimmed {
-            ":exit" | ":quit" => break,
-            ":help" => {
-                println!("Commands:");
-                println!("  :help   Show this message");
-                println!("  :exit   Exit the REPL");
-                println!("  :bc     Prefix any code with ':bc ' to inspect its bytecode");
+        if buffer.is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            _ => {}
+            match trimmed {
+                ":exit" | ":quit" | "exit" | "quit" => break,
+                ":help" | "help" => {
+                    println!("Commands:");
+                    println!("  :help     Show this message");
+                    println!("  :exit     Exit the REPL");
+                    println!("  :reset    Reset VM state and globals");
+                    println!("  :modules  List built-in standard modules");
+                    println!("  :bc       Prefix any code with ':bc ' to inspect its bytecode");
+                    continue;
+                }
+                ":reset" => {
+                    vm = VM::new();
+                    println!("VM state reset.");
+                    continue;
+                }
+                ":modules" => {
+                    println!(
+                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, csv, log, test, http, gfx, mem"
+                    );
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        buffer.push_str(&line);
+        if needs_more_input(&buffer) && !line.is_empty() {
+            continue;
+        }
+
+        let code_owned = std::mem::take(&mut buffer);
+        let trimmed = code_owned.trim();
+        if trimmed.is_empty() {
+            continue;
         }
 
         let (show_bc, code) = if let Some(rest) = trimmed.strip_prefix(":bc ") {
             (true, rest)
         } else {
-            (false, trimmed)
+            (false, code_owned.as_str())
         };
 
         match compile_source(code) {
@@ -120,10 +359,10 @@ fn run_repl() {
                 match vm.run(proto) {
                     Ok(Value::Unit) => {}
                     Ok(val) => println!("{}", val),
-                    Err(e) => eprintln!("Runtime error: {}", e),
+                    Err(e) => eprintln!("Runtime error: {}", format_error_with_source(code, &e)),
                 }
             }
-            Err(e) => eprintln!("Compile error: {}", e),
+            Err(e) => eprintln!("Compile error: {}", format_error_with_source(code, &e)),
         }
     }
 }
@@ -132,20 +371,33 @@ fn print_help() {
     println!("Askane v{}", VERSION);
     println!();
     println!("Usage:");
-    println!("  askane                  Start interactive REPL");
-    println!("  askane <file.ask>       Run an Askane script");
-    println!("  askane -b <file.ask>    Disassemble compiled bytecode");
-    println!("  askane -h | --help      Show help");
-    println!("  askane -v | --version   Show version");
+    println!("  askane                       Start interactive REPL");
+    println!("  askane --gui [file.ask]      Open Askane Studio GUI editor (Windows)");
+    println!("  askane <file.ask>            Run an Askane script");
+    println!("  askane check [--json] <file> Syntax & compile check without running");
+    println!("  askane test <file_or_dir>    Run .ask test files");
+    println!("  askane -b <file.ask>         Disassemble compiled bytecode");
+    println!("  askane -h | --help           Show help");
+    println!("  askane -v | --version        Show version");
     println!();
     println!("Sandbox permissions:");
-    println!("  --allow-net[=hosts]     Allow HTTPS access (optionally comma-separated host[:port])");
-    println!("  --allow-read[=dirs]     Allow reading outside sandbox (optionally comma-separated dirs)");
-    println!("  --allow-write[=dirs]    Allow writing outside sandbox (optionally comma-separated dirs)");
-    println!("  --allow-env[=vars]      Allow sys.env() (optionally comma-separated names)");
-    println!("  --allow-args            Allow sys.args()");
-    println!("  --max-steps=N           Override sandbox instruction budget (default 10000000)");
-    println!("  --unsafe                Allow unrestricted files, network, env and process access");
+    println!(
+        "  --allow-net[=hosts]          Allow HTTPS access (optionally comma-separated host[:port])"
+    );
+    println!(
+        "  --allow-read[=dirs]          Allow reading outside sandbox (optionally comma-separated dirs)"
+    );
+    println!(
+        "  --allow-write[=dirs]         Allow writing outside sandbox (optionally comma-separated dirs)"
+    );
+    println!("  --allow-env[=vars]           Allow sys.env() (optionally comma-separated names)");
+    println!("  --allow-args                 Allow sys.args()");
+    println!(
+        "  --max-steps=N                Override sandbox instruction budget (default 10000000)"
+    );
+    println!(
+        "  --unsafe                     Allow unrestricted files, network, env and process access"
+    );
 }
 
 fn append_csv(target: &mut Option<Vec<String>>, value: Option<&str>) {
@@ -183,11 +435,54 @@ fn main() {
         return;
     }
 
+    if args[1] == "--gui" {
+        let initial = args.get(2).map(String::as_str);
+        if let Err(e) = gui::run(initial) {
+            eprintln!("GUI error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
+    if args[1] == "check" {
+        let mut json_out = false;
+        let mut target: Option<String> = None;
+        for arg in &args[2..] {
+            if arg == "--json" {
+                json_out = true;
+            } else if target.is_none() {
+                target = Some(arg.clone());
+            } else {
+                eprintln!("Usage: askane check [--json] <file.ask>");
+                process::exit(1);
+            }
+        }
+        let Some(path) = target else {
+            eprintln!("Usage: askane check [--json] <file.ask>");
+            process::exit(1);
+        };
+        if let Err(e) = run_check(&path, json_out) {
+            if !e.is_empty() {
+                eprintln!("Check failed: {}", e);
+            }
+            process::exit(1);
+        }
+        return;
+    }
+
+    let mut is_test_cmd = false;
+    let slice_start = if args[1] == "test" {
+        is_test_cmd = true;
+        2
+    } else {
+        1
+    };
+
     let mut dump_bytecode = false;
     let mut perms = Permissions::sandboxed();
     let mut script_path: Option<String> = None;
 
-    for arg in &args[1..] {
+    for arg in &args[slice_start..] {
         if arg == "-h" || arg == "--help" {
             print_help();
             return;
@@ -232,9 +527,21 @@ fn main() {
         } else if script_path.is_none() {
             script_path = Some(arg.clone());
         } else {
-            eprintln!("Unexpected extra argument '{}'. Run 'askane --help' for usage.", arg);
+            eprintln!(
+                "Unexpected extra argument '{}'. Run 'askane --help' for usage.",
+                arg
+            );
             process::exit(1);
         }
+    }
+
+    if is_test_cmd {
+        let target = script_path.as_deref().unwrap_or(".");
+        if let Err(e) = run_tests_cmd(target, perms) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+        return;
     }
 
     let Some(path) = script_path else {
@@ -752,8 +1059,16 @@ mod tests {
         let mut vm_ro = VM::new();
         vm_ro.set_permissions(perms_ro);
         let temp_file = std::env::temp_dir().join("askane_ro_test.txt");
-        assert!(vm_ro.resolve_read_path(&temp_file.to_string_lossy()).is_ok());
-        assert!(vm_ro.resolve_write_path(&temp_file.to_string_lossy()).is_err());
+        assert!(
+            vm_ro
+                .resolve_read_path(&temp_file.to_string_lossy())
+                .is_ok()
+        );
+        assert!(
+            vm_ro
+                .resolve_write_path(&temp_file.to_string_lossy())
+                .is_err()
+        );
     }
 
     #[test]
@@ -809,5 +1124,79 @@ mod tests {
             "#,
         );
         assert!(val.equals(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_v012_modules_and_collections() {
+        let val = eval(
+            r#"
+            import strings;
+            import path;
+            import time;
+            import random;
+            import base64;
+            import csv;
+            import log;
+            import test;
+
+            // strings (Unicode-aware)
+            test.assert_eq(strings.trim("  Привет 😀  "), "Привет 😀");
+            test.assert_eq(strings.find("Привет мир", "мир"), 7);
+            test.assert_eq(strings.slice("Привет 😀", 0, 6), "Привет");
+            test.assert_eq(strings.upper("askane"), "ASKANE");
+            test.assert_eq(strings.join(["a", "b", "c"], "-"), "a-b-c");
+
+            // path
+            test.assert_eq(path.stem("dir/hello.ask"), "hello");
+            test.assert_eq(path.extension("dir/hello.ask"), "ask");
+
+            // base64
+            let enc = base64.encode("Askane 🚀");
+            test.assert_eq(base64.decode(enc), "Askane 🚀");
+
+            // csv
+            let rows = csv.parse("name,score\n\"Alice, B\",100\nBob,80");
+            test.assert_eq(len(rows), 3);
+            test.assert_eq(rows[1][0], "Alice, B");
+            let dicts = csv.parse_dicts("a,b\n1,2");
+            test.assert_eq(dicts[0].a, "1");
+
+            // random & time
+            random.seed(42);
+            let r1 = random.int(1, 100);
+            random.seed(42);
+            let r2 = random.int(1, 100);
+            test.assert_eq(r1, r2);
+            test.assert_eq(len(random.crypto_bytes(8)), 8);
+            test.assert(time.now_ms() > 0);
+
+            // deterministic collections
+            let d = #{ b: 2, a: 1 };
+            test.assert_eq(keys(d), ["a", "b"]);
+            test.assert_eq(values(d), [1, 2]);
+            test.assert_eq(get(d, "missing", 99), 99);
+            test.assert_eq(sort([3, 1, 2]), [1, 2, 3]);
+            test.assert_eq(reverse("abc"), "cba");
+
+            // log & test.assert_err
+            log.set_level("warn");
+            test.assert_err(|| 1 / 0, "Division by zero");
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_v012_repl_and_diagnostics() {
+        assert!(needs_more_input("fn f(x) {"));
+        assert!(needs_more_input("let s = \"unclosed"));
+        assert!(needs_more_input("/* open comment"));
+        assert!(!needs_more_input("fn f(x) { x + 1 }"));
+        assert!(!needs_more_input("let s = \"{\"; 1"));
+
+        let src = "let x = 1;\nlet y = 1 / 0;\nprintln(y);";
+        let formatted = format_error_with_source(src, "[line 2] Division by zero");
+        assert!(formatted.contains("2 | let y = 1 / 0;"));
     }
 }
