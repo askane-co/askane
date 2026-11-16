@@ -241,9 +241,34 @@ mod winhttp {
 }
 
 #[cfg(windows)]
+fn format_headers_dict(val: &Value, fn_name: &str) -> Result<String, String> {
+    match val {
+        Value::Dict(d) => {
+            let mut out = String::new();
+            for (k, v) in d.borrow().iter() {
+                if k.contains('\r') || k.contains('\n') || k.contains('\0') {
+                    return Err(format!("http.{}(): invalid header name {:?}", fn_name, k));
+                }
+                let vs = format!("{}", v);
+                if vs.contains('\r') || vs.contains('\n') || vs.contains('\0') {
+                    return Err(format!("http.{}(): invalid header value for {:?}", fn_name, k));
+                }
+                out.push_str(&format!("{}: {}\r\n", k, vs));
+            }
+            Ok(out)
+        }
+        other => Err(format!(
+            "http.{}() expects a headers dict, got '{}'",
+            fn_name,
+            other.type_name()
+        )),
+    }
+}
+
+#[cfg(windows)]
 fn http_get(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err("http.get() expects 1 argument (url)".to_string());
+    if args.is_empty() || args.len() > 2 {
+        return Err("http.get() expects (url) or (url, headers_dict)".to_string());
     }
     let url = match &args[0] {
         Value::Str(s) => s.as_str(),
@@ -254,13 +279,21 @@ fn http_get(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
-    winhttp::request("GET", url, None, None)
+    let headers = if args.len() == 2 {
+        Some(format_headers_dict(&args[1], "get")?)
+    } else {
+        None
+    };
+    winhttp::request("GET", url, headers.as_deref(), None)
 }
 
 #[cfg(windows)]
 fn http_post(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
-        return Err("http.post() expects (url, body) or (url, body, content_type)".to_string());
+        return Err(
+            "http.post() expects (url, body) or (url, body, headers_dict | content_type)"
+                .to_string(),
+        );
     }
     let url = match &args[0] {
         Value::Str(s) => s.as_str(),
@@ -280,20 +313,20 @@ fn http_post(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
-    let content_type = if args.len() == 3 {
+    let header = if args.len() == 3 {
         match &args[2] {
-            Value::Str(s) => s.as_str(),
+            Value::Str(s) => format!("Content-Type: {}\r\n", s),
+            Value::Dict(_) => format_headers_dict(&args[2], "post")?,
             other => {
                 return Err(format!(
-                    "http.post() expects a string content_type, got '{}'",
+                    "http.post() expects string content_type or headers dict, got '{}'",
                     other.type_name()
                 ));
             }
         }
     } else {
-        "application/json"
+        "Content-Type: application/json\r\n".to_string()
     };
-    let header = format!("Content-Type: {}\r\n", content_type);
     winhttp::request("POST", url, Some(&header), Some(body))
 }
 

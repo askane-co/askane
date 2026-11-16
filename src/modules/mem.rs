@@ -60,7 +60,7 @@ mod win32 {
 
     pub type Handle = *mut c_void;
     pub const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
-    pub const PROCESS_ALL_ACCESS: u32 = 0x001F_0FFF;
+    pub const PROCESS_ACCESS: u32 = 0x0008 | 0x0010 | 0x0020 | 0x0400; // VM_OPERATION | VM_READ | VM_WRITE | QUERY_INFORMATION
     pub const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
     pub const TH32CS_SNAPMODULE: u32 = 0x0000_0008;
     pub const TH32CS_SNAPMODULE32: u32 = 0x0000_0010;
@@ -185,7 +185,7 @@ fn mem_open(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         _ => return Err("mem.open() expects a non-negative integer PID".to_string()),
     };
 
-    let handle = unsafe { win32::OpenProcess(win32::PROCESS_ALL_ACCESS, 0, pid) };
+    let handle = unsafe { win32::OpenProcess(win32::PROCESS_ACCESS, 0, pid) };
     if handle.is_null() {
         return Err(format!("Failed to open process {}", pid));
     }

@@ -13,8 +13,12 @@ pub fn module() -> Value {
             ("circle", gfx_circle),
             ("line", gfx_line),
             ("pixel", gfx_pixel),
+            ("text", gfx_text),
             ("present", gfx_present),
             ("key_down", gfx_key_down),
+            ("mouse_x", gfx_mouse_x),
+            ("mouse_y", gfx_mouse_y),
+            ("mouse_down", gfx_mouse_down),
             ("close", gfx_close),
         ],
         &[],
@@ -40,9 +44,27 @@ mod win32_gfx {
     const CW_USEDEFAULT: i32 = -2147483648;
     const PM_REMOVE: u32 = 0x0001;
     const WM_DESTROY: u32 = 0x0002;
+    const WM_PAINT: u32 = 0x000F;
     const WM_CLOSE: u32 = 0x0010;
     const DIB_RGB_COLORS: u32 = 0;
     const SRCCOPY: u32 = 0x00CC_0020;
+    const TRANSPARENT: i32 = 1;
+
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct PaintStruct {
+        hdc: Hdc,
+        f_erase: i32,
+        rc_paint: Rect,
+        f_restore: i32,
+        f_inc_update: i32,
+        rgb_reserved: [u8; 32],
+    }
 
     #[repr(C)]
     struct WndClassExW {
@@ -134,6 +156,10 @@ mod win32_gfx {
         fn GetAsyncKeyState(vKey: i32) -> i16;
         fn GetForegroundWindow() -> Hwnd;
         fn LoadCursorW(hInstance: HInstance, lpCursorName: *const u16) -> *mut c_void;
+        fn BeginPaint(hWnd: Hwnd, lpPaint: *mut PaintStruct) -> Hdc;
+        fn EndPaint(hWnd: Hwnd, lpPaint: *const PaintStruct) -> i32;
+        fn GetCursorPos(lpPoint: *mut Point) -> i32;
+        fn ScreenToClient(hWnd: Hwnd, lpPoint: *mut Point) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -158,6 +184,16 @@ mod win32_gfx {
             iUsage: u32,
             rop: u32,
         ) -> i32;
+        fn SetBkMode(hdc: Hdc, mode: i32) -> i32;
+        fn SetTextColor(hdc: Hdc, color: u32) -> u32;
+        fn TextOutW(hdc: Hdc, x: i32, y: i32, lpString: *const u16, c: i32) -> i32;
+    }
+
+    pub struct TextDraw {
+        pub x: i32,
+        pub y: i32,
+        pub text: Vec<u16>,
+        pub color_bgr: u32,
     }
 
     pub struct WindowState {
@@ -165,11 +201,53 @@ mod win32_gfx {
         pub width: i32,
         pub height: i32,
         pub buffer: Vec<u32>,
+        pub texts: Vec<TextDraw>,
         pub open: bool,
     }
 
     thread_local! {
         pub static WINDOW: RefCell<Option<WindowState>> = const { RefCell::new(None) };
+    }
+
+    unsafe fn paint_state_to_hdc(state: &WindowState, hdc: Hdc) {
+        let bmi = BitmapInfo {
+            bmi_header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: state.width,
+                bi_height: -state.height,
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            bmi_colors: [0],
+        };
+        unsafe {
+            StretchDIBits(
+                hdc,
+                0,
+                0,
+                state.width,
+                state.height,
+                0,
+                0,
+                state.width,
+                state.height,
+                state.buffer.as_ptr() as *const c_void,
+                &bmi,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+            SetBkMode(hdc, TRANSPARENT);
+            for t in &state.texts {
+                SetTextColor(hdc, t.color_bgr);
+                TextOutW(hdc, t.x, t.y, t.text.as_ptr(), t.text.len() as i32);
+            }
+        }
     }
 
     unsafe extern "system" fn wnd_proc(
@@ -179,6 +257,23 @@ mod win32_gfx {
         l_param: isize,
     ) -> isize {
         match msg {
+            WM_PAINT => {
+                unsafe {
+                    let mut ps: PaintStruct = std::mem::zeroed();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    if !hdc.is_null() {
+                        WINDOW.with(|w| {
+                            if let Some(state) = w.borrow().as_ref() {
+                                if state.hwnd == hwnd {
+                                    paint_state_to_hdc(state, hdc);
+                                }
+                            }
+                        });
+                    }
+                    EndPaint(hwnd, &ps);
+                }
+                0
+            }
             WM_CLOSE | WM_DESTROY => {
                 WINDOW.with(|w| {
                     if let Some(state) = w.borrow_mut().as_mut() {
@@ -260,6 +355,7 @@ mod win32_gfx {
                     width,
                     height,
                     buffer,
+                    texts: Vec::new(),
                     open: true,
                 });
             });
@@ -299,44 +395,29 @@ mod win32_gfx {
             if !state.open {
                 return Ok(());
             }
-            let bmi = BitmapInfo {
-                bmi_header: BitmapInfoHeader {
-                    bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
-                    bi_width: state.width,
-                    bi_height: -state.height, // top-down
-                    bi_planes: 1,
-                    bi_bit_count: 32,
-                    bi_compression: 0, // BI_RGB
-                    bi_size_image: 0,
-                    bi_x_pels_per_meter: 0,
-                    bi_y_pels_per_meter: 0,
-                    bi_clr_used: 0,
-                    bi_clr_important: 0,
-                },
-                bmi_colors: [0],
-            };
             unsafe {
                 let hdc = GetDC(state.hwnd);
                 if !hdc.is_null() {
-                    StretchDIBits(
-                        hdc,
-                        0,
-                        0,
-                        state.width,
-                        state.height,
-                        0,
-                        0,
-                        state.width,
-                        state.height,
-                        state.buffer.as_ptr() as *const c_void,
-                        &bmi,
-                        DIB_RGB_COLORS,
-                        SRCCOPY,
-                    );
+                    paint_state_to_hdc(state, hdc);
                     ReleaseDC(state.hwnd, hdc);
                 }
             }
             Ok(())
+        })
+    }
+
+    pub fn mouse_pos() -> Result<(i32, i32), String> {
+        WINDOW.with(|w| {
+            let borrow = w.borrow();
+            let state = borrow
+                .as_ref()
+                .ok_or_else(|| "No active gfx window".to_string())?;
+            let mut pt = Point { x: 0, y: 0 };
+            unsafe {
+                GetCursorPos(&mut pt);
+                ScreenToClient(state.hwnd, &mut pt);
+            }
+            Ok((pt.x, pt.y))
         })
     }
 
@@ -421,6 +502,7 @@ fn gfx_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .as_mut()
             .ok_or_else(|| "No active gfx window".to_string())?;
         state.buffer.fill(color);
+        state.texts.clear();
         Ok(Value::Unit)
     })
 }
@@ -471,8 +553,8 @@ fn gfx_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .ok_or_else(|| "No active gfx window".to_string())?;
         let x0 = x.max(0);
         let y0 = y.max(0);
-        let x1 = (x + rw).min(state.width);
-        let y1 = (y + rh).min(state.height);
+        let x1 = x.saturating_add(rw).min(state.width);
+        let y1 = y.saturating_add(rh).min(state.height);
         for py in y0..y1 {
             let row = (py * state.width) as usize;
             for px in x0..x1 {
@@ -616,6 +698,74 @@ fn gfx_key_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 #[cfg(windows)]
+fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 6 {
+        return Err("gfx.text() expects 6 arguments (x, y, text, r, g, b)".to_string());
+    }
+    let x = as_int(&args[0], "text")? as i32;
+    let y = as_int(&args[1], "text")? as i32;
+    let text = format!("{}", args[2]).encode_utf16().collect::<Vec<u16>>();
+    let r = as_int(&args[3], "text")?.clamp(0, 255) as u32;
+    let g = as_int(&args[4], "text")?.clamp(0, 255) as u32;
+    let b = as_int(&args[5], "text")?.clamp(0, 255) as u32;
+    let color_bgr = (b << 16) | (g << 8) | r;
+    win32_gfx::WINDOW.with(|w| {
+        let mut borrow = w.borrow_mut();
+        let state = borrow
+            .as_mut()
+            .ok_or_else(|| "No active gfx window".to_string())?;
+        state.texts.push(win32_gfx::TextDraw {
+            x,
+            y,
+            text,
+            color_bgr,
+        });
+        Ok(Value::Unit)
+    })
+}
+
+#[cfg(windows)]
+fn gfx_mouse_x(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.mouse_x() expects 0 arguments".to_string());
+    }
+    let (x, _) = win32_gfx::mouse_pos()?;
+    Ok(Value::Int(x as i64))
+}
+
+#[cfg(windows)]
+fn gfx_mouse_y(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.mouse_y() expects 0 arguments".to_string());
+    }
+    let (_, y) = win32_gfx::mouse_pos()?;
+    Ok(Value::Int(y as i64))
+}
+
+#[cfg(windows)]
+fn gfx_mouse_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.mouse_down() expects 1 argument (\"left\" | \"right\" | \"middle\")".to_string());
+    }
+    let btn = match &args[0] {
+        Value::Str(s) => s.to_lowercase(),
+        other => {
+            return Err(format!(
+                "gfx.mouse_down() expects string button name, got '{}'",
+                other.type_name()
+            ));
+        }
+    };
+    let vk = match btn.as_str() {
+        "left" => 0x01,
+        "right" => 0x02,
+        "middle" => 0x04,
+        _ => return Err(format!("Unknown mouse button '{}'", btn)),
+    };
+    Ok(Value::Bool(win32_gfx::key_down(vk)))
+}
+
+#[cfg(windows)]
 fn gfx_close(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.close() expects 0 arguments".to_string());
@@ -649,3 +799,11 @@ use unsupported as gfx_present;
 use unsupported as gfx_key_down;
 #[cfg(not(windows))]
 use unsupported as gfx_close;
+#[cfg(not(windows))]
+use unsupported as gfx_mouse_down;
+#[cfg(not(windows))]
+use unsupported as gfx_mouse_x;
+#[cfg(not(windows))]
+use unsupported as gfx_mouse_y;
+#[cfg(not(windows))]
+use unsupported as gfx_text;

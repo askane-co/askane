@@ -270,9 +270,28 @@ impl<'a> JsonParser<'a> {
                             .map_err(|_| "json.parse(): invalid \\u escape".to_string())?;
                         let code = u32::from_str_radix(hex, 16)
                             .map_err(|_| "json.parse(): invalid \\u hex".to_string())?;
-                        let ch = char::from_u32(code).unwrap_or('\u{FFFD}');
-                        out.push(ch);
                         self.pos += 4;
+                        if (0xD800..=0xDBFF).contains(&code)
+                            && self.pos + 6 <= self.bytes.len()
+                            && self.bytes[self.pos] == b'\\'
+                            && self.bytes[self.pos + 1] == b'u'
+                        {
+                            let low_hex =
+                                std::str::from_utf8(&self.bytes[self.pos + 2..self.pos + 6])
+                                    .map_err(|_| "json.parse(): invalid \\u escape".to_string())?;
+                            let low = u32::from_str_radix(low_hex, 16)
+                                .map_err(|_| "json.parse(): invalid \\u hex".to_string())?;
+                            if (0xDC00..=0xDFFF).contains(&low) {
+                                let combined =
+                                    0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+                                out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
+                                self.pos += 6;
+                            } else {
+                                out.push('\u{FFFD}');
+                            }
+                        } else {
+                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        }
                     }
                     other => {
                         return Err(format!(

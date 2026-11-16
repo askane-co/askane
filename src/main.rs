@@ -424,4 +424,108 @@ mod tests {
         assert!(err.contains("at outer"));
         assert!(err.contains("at <script>"));
     }
+
+    #[test]
+    fn test_security_sandbox_and_leaks() {
+        // 1. Filesystem sandbox blocks path traversal and absolute paths
+        let proto_fs = compile_source(
+            r#"
+            import fs;
+            fs.read("../../../Windows/System32/drivers/etc/hosts")
+            "#,
+        )
+        .unwrap();
+        let mut vm_sb = VM::new_with_sandbox(true);
+        let err_fs = vm_sb.run(proto_fs).unwrap_err();
+        assert!(err_fs.contains("outside the sandbox"));
+
+        let proto_abs = compile_source(
+            r#"
+            import fs;
+            fs.write("C:\\askane_escape_test.txt", "x")
+            "#,
+        )
+        .unwrap();
+        let mut vm_sb2 = VM::new_with_sandbox(true);
+        let err_abs = vm_sb2.run(proto_abs).unwrap_err();
+        assert!(err_abs.contains("outside the sandbox"));
+
+        // 2. Plain HTTP is blocked (HTTPS required)
+        let proto_http = compile_source(
+            r#"
+            import http;
+            http.get("http://example.com")
+            "#,
+        )
+        .unwrap();
+        let mut vm_http = VM::new();
+        let err_http = vm_http.run(proto_http).unwrap_err();
+        assert!(err_http.contains("https://"));
+
+        // 3. Deep parser nesting returns clean error instead of stack overflow
+        let deep = "(".repeat(300) + "1" + &")".repeat(300);
+        let err_parse = compile_source(&deep).unwrap_err();
+        assert!(err_parse.contains("Maximum expression nesting depth"));
+
+        // 4. Allocation stress test (no leaks / crashes across 50,000 iterations)
+        let val = eval(
+            r#"
+            let i = 0;
+            let last = 0;
+            while i < 50000 {
+                let d = #{ idx: i, list: [i, i + 1] };
+                last = d.idx;
+                i = i + 1;
+            }
+            last
+            "#,
+        );
+        assert!(val.equals(&Value::Int(49999)));
+    }
+
+    #[test]
+    fn test_module_fixes_and_upgrades() {
+        // 1. sys.env() blocked in sandbox mode
+        let proto_env = compile_source(
+            r#"
+            import sys;
+            sys.env("PATH")
+            "#,
+        )
+        .unwrap();
+        let mut vm_sb = VM::new_with_sandbox(true);
+        let err = vm_sb.run(proto_env).unwrap_err();
+        assert!(err.contains("disabled in sandbox"), "unexpected err: {}", err);
+
+        // 2. JSON UTF-16 surrogate pair decoding
+        let val = eval(
+            r#"
+            import json;
+            json.parse("\"\\uD83D\\uDE00\"")
+            "#,
+        );
+        assert!(val.equals(&Value::Str("😀".to_string())));
+
+        // 3. fs.list_dir / fs.is_dir in sandboxed VM
+        let val = eval(
+            r#"
+            import fs;
+            let entries = fs.list_dir(".");
+            type_of(entries) == "list" && fs.is_dir("src")
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // 4. gfx.text, gfx.mouse_x, gfx.mouse_y, gfx.mouse_down exported
+        let val = eval(
+            r#"
+            import gfx;
+            type_of(gfx.text) == "fn"
+                && type_of(gfx.mouse_x) == "fn"
+                && type_of(gfx.mouse_y) == "fn"
+                && type_of(gfx.mouse_down) == "fn"
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+    }
 }

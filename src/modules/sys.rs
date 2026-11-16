@@ -32,7 +32,10 @@ fn sys_args(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Rc::new(RefCell::new(list))))
 }
 
-fn sys_env(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn sys_env(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if vm.is_sandboxed() {
+        return Err("sys.env() is disabled in sandbox mode (run with --unsafe to allow)".to_string());
+    }
     if args.len() != 1 {
         return Err("sys.env() expects 1 argument (name)".to_string());
     }

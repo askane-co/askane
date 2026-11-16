@@ -84,12 +84,12 @@ Global functions:
 
 Built-in standard modules (`import <name>;`):
 - `math`: `pi`, `e`, `sqrt`, `abs`, `pow`, `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`
-- `fs`: `read`, `write`, `append`, `exists`, `remove`
-- `sys`: `args`, `env`, `exit`, `os`, `arch`, `sleep`
+- `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`
+- `sys`: `args`, `env` (requires `--unsafe`), `exit`, `os`, `arch`, `sleep`
 - `json`: `parse`, `stringify`
-- `http` (Windows): `get`, `post`
-- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `circle`, `line`, `pixel`, `present`, `key_down`, `close`
-- `mem` (Windows): `current_pid`, `find_pid`, `open`, `close`, `module_base`, `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
+- `http` (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
+- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `circle`, `line`, `pixel`, `text`, `present`, `key_down`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
+- `mem` (Windows): `current_pid`, `find_pid` (returns `unit` if not found), `open`, `close`, `module_base` (returns `unit` if not found), `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
 
 ## Security model
 

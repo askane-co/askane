@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::rc::Rc;
 
 use crate::modules::build_module;
 use crate::value::Value;
@@ -14,6 +16,9 @@ pub fn module() -> Value {
             ("append", fs_append),
             ("exists", fs_exists),
             ("remove", fs_remove),
+            ("list_dir", fs_list_dir),
+            ("mkdir", fs_mkdir),
+            ("is_dir", fs_is_dir),
         ],
         &[],
     )
@@ -85,4 +90,37 @@ fn fs_remove(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let path_buf = vm.resolve_path(path)?;
     fs::remove_file(&path_buf).map_err(|e| format!("fs.remove('{}'): {}", path, e))?;
     Ok(Value::Unit)
+}
+
+fn fs_list_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("fs.list_dir() expects 1 argument (path)".to_string());
+    }
+    let path = expect_str(&args[0], "list_dir")?;
+    let path_buf = vm.resolve_path(path)?;
+    let entries = fs::read_dir(&path_buf).map_err(|e| format!("fs.list_dir('{}'): {}", path, e))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("fs.list_dir('{}'): {}", path, e))?;
+        names.push(Value::Str(entry.file_name().to_string_lossy().to_string()));
+    }
+    Ok(Value::List(Rc::new(RefCell::new(names))))
+}
+
+fn fs_mkdir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("fs.mkdir() expects 1 argument (path)".to_string());
+    }
+    let path = expect_str(&args[0], "mkdir")?;
+    let path_buf = vm.resolve_path(path)?;
+    fs::create_dir_all(&path_buf).map_err(|e| format!("fs.mkdir('{}'): {}", path, e))?;
+    Ok(Value::Unit)
+}
+
+fn fs_is_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("fs.is_dir() expects 1 argument (path)".to_string());
+    }
+    let path = expect_str(&args[0], "is_dir")?;
+    Ok(Value::Bool(vm.resolve_path(path).is_ok_and(|p| p.is_dir())))
 }

@@ -3,7 +3,7 @@ use crate::ast::{
 };
 use crate::lexer::{Span, Token, TokenKind};
 
-const MAX_PARSE_DEPTH: usize = 256;
+const MAX_PARSE_DEPTH: usize = 64;
 
 pub struct Parser {
     tokens: Vec<Token>,

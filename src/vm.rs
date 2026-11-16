@@ -65,6 +65,10 @@ impl VM {
         self.sandbox_root = dir;
     }
 
+    pub fn is_sandboxed(&self) -> bool {
+        self.sandboxed
+    }
+
     /// Resolve a script-controlled path without allowing it to escape the script directory.
     pub fn resolve_path(&self, input: &str) -> Result<PathBuf, String> {
         let raw = Path::new(input);
