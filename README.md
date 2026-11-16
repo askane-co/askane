@@ -54,23 +54,24 @@ let x = {
     a * 2
 };
 
-// Pipelines
+// Pipelines with short lambdas
 range(1, 7)
-    |> filter(fn(n) { n % 2 == 0 })
-    |> map(fn(n) { n * n })
+    |> filter(|n| n % 2 == 0)
+    |> map(|n| n * n)
     |> println;
 
-// Pattern matching
+// Pattern matching with guards and string interpolation
 let label = match x {
     0 => "zero",
-    20 => "twenty",
-    other => "value: " + str(other),
+    n if n > 10 => "big: ${n}",
+    other => "value: ${other}",
 };
 
-// Dictionaries
+// Dictionaries, dot-assignment, optional chaining (?.) and ??
 let player = #{ name: "Askane", hp: 100 };
-player["hp"] = 90;
-println(player.name, player.hp, keys(player));
+player.hp = 90;
+let mana = player?.mana ?? 50;
+println("${player.name}: hp=${player.hp}, mana=${mana}", keys(player));
 ```
 
 ## Built-in Functions & Modules
