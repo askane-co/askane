@@ -392,6 +392,11 @@ GUI permission prompts, `hash`/`datetime`/`ini`/`toml` с лимитами и `a
 - Для Windows есть ручной checklist: Job Object, clipboard, dialog, BMP, reparse point,
   process allowlist, timeout, output limit и аварийное закрытие Studio.
 
+## 0.14.2-fix — hotfix
+
+- **Критичный баг компилятора (`compiler.rs`):** в `Expr::ListComp` (и аналогично в `Expr::Block` / `Expr::Match` / `Expr::TryCatch`) при компиляции внутри другого выражения (например, `state.bullets = [b for b in state.bullets if b.y > 0];` или `f(arg1, [x for x in arr])`) на стеке VM уже лежат временные операнды (`state`, `f`, `arg1`), которые не учитываются в `locals`, из-за чего `add_local` для `__comp_iter` / `__comp_idx` / `__comp_len` / `out_slot` сдвигается относительно реального стека. Нужно либо отслеживать `stack_depth` временных значений при вычислении слотов, либо компилировать такие выражения со стабильной базой/фреймом.
+- Вынести CLI `process.run()` в отдельный Job Object/worker с настраиваемым `--timeout`.
+
 ## 0.15+ — следующие крупные этапы
 
 - Пользовательские структуры/классы (`struct` / `class` с методами и `self`).

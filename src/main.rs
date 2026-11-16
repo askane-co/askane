@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.14.0";
+const VERSION: &str = "0.14.1";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {

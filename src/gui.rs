@@ -69,10 +69,13 @@ mod win32_gui {
     const ID_BTN_CLEAR: usize = 109;
     const ID_BTN_CHECK: usize = 110;
     const ID_CHK_DARK: usize = 111;
+    const ID_EDIT_IN: usize = 112;
+    const ID_BTN_SEND: usize = 113;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_CTLCOLOREDIT: u32 = 0x0133;
     const WM_CTLCOLORSTATIC: u32 = 0x0138;
     const VK_CONTROL: i32 = 0x11;
+    const VK_RETURN: usize = 0x0D;
     const VK_F5: usize = 0x74;
 
     #[repr(C)]
@@ -257,6 +260,13 @@ mod win32_gui {
             lpNumberOfBytesRead: *mut u32,
             lpOverlapped: *mut c_void,
         ) -> i32;
+        fn WriteFile(
+            hFile: Handle,
+            lpBuffer: *const u8,
+            nNumberOfBytesToWrite: u32,
+            lpNumberOfBytesWritten: *mut u32,
+            lpOverlapped: *mut c_void,
+        ) -> i32;
         fn TerminateProcess(hProcess: Handle, uExitCode: u32) -> i32;
         fn CreateJobObjectW(
             lpJobAttributes: *const SecurityAttributes,
@@ -280,6 +290,8 @@ mod win32_gui {
     struct GuiState {
         hwnd_code: Hwnd,
         hwnd_out: Hwnd,
+        hwnd_in: Hwnd,
+        hwnd_send: Hwnd,
         hwnd_chk_unsafe: Hwnd,
         hwnd_flags: Hwnd,
         mono_font: Hfont,
@@ -289,6 +301,7 @@ mod win32_gui {
         current_file: Option<PathBuf>,
         child_proc: Arc<Mutex<Option<isize>>>,
         child_job: Arc<Mutex<Option<isize>>>,
+        child_stdin: Arc<Mutex<Option<isize>>>,
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -324,6 +337,12 @@ mod win32_gui {
     }
 
     fn stop_child(state: &GuiState) {
+        {
+            let mut in_guard = state.child_stdin.lock().unwrap();
+            if let Some(raw_in) = in_guard.take() {
+                unsafe { CloseHandle(raw_in as Handle) };
+            }
+        }
         {
             let mut job_guard = state.child_job.lock().unwrap();
             if let Some(raw_job) = job_guard.take() {
@@ -461,6 +480,20 @@ mod win32_gui {
             SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0);
         }
 
+        let mut h_in_read: Handle = null_mut();
+        let mut h_in_write: Handle = null_mut();
+        if unsafe { CreatePipe(&mut h_in_read, &mut h_in_write, &sa, 0) } == 0 {
+            unsafe {
+                CloseHandle(h_read);
+                CloseHandle(h_write);
+            }
+            append_out(state.hwnd_out, "Failed to create input pipe.\n");
+            return;
+        }
+        unsafe {
+            SetHandleInformation(h_in_write, HANDLE_FLAG_INHERIT, 0);
+        }
+
         let si = StartupInfoW {
             cb: std::mem::size_of::<StartupInfoW>() as u32,
             lp_reserved: null_mut(),
@@ -477,7 +510,7 @@ mod win32_gui {
             w_show_window: 0,
             cb_reserved2: 0,
             lp_reserved2: null_mut(),
-            h_std_input: null_mut(),
+            h_std_input: h_in_read,
             h_std_output: h_write,
             h_std_error: h_write,
         };
@@ -505,9 +538,13 @@ mod win32_gui {
         };
         unsafe {
             CloseHandle(h_write);
+            CloseHandle(h_in_read);
         }
         if ok == 0 {
-            unsafe { CloseHandle(h_read) };
+            unsafe {
+                CloseHandle(h_read);
+                CloseHandle(h_in_write);
+            }
             append_out(state.hwnd_out, "Failed to start askane child process.\n");
             return;
         }
@@ -521,6 +558,7 @@ mod win32_gui {
                     CloseHandle(h_job);
                     CloseHandle(pi.h_process);
                     CloseHandle(h_read);
+                    CloseHandle(h_in_write);
                 }
                 append_out(
                     state.hwnd_out,
@@ -534,6 +572,7 @@ mod win32_gui {
                 TerminateProcess(pi.h_process, 1);
                 CloseHandle(pi.h_process);
                 CloseHandle(h_read);
+                CloseHandle(h_in_write);
             }
             append_out(
                 state.hwnd_out,
@@ -543,11 +582,13 @@ mod win32_gui {
         }
         let h_proc_raw = pi.h_process as isize;
         *state.child_proc.lock().unwrap() = Some(h_proc_raw);
+        *state.child_stdin.lock().unwrap() = Some(h_in_write as isize);
 
         let hwnd_raw = hwnd as isize;
         let h_read_raw = h_read as isize;
         let child_arc = Arc::clone(&state.child_proc);
         let job_arc = Arc::clone(&state.child_job);
+        let stdin_arc = Arc::clone(&state.child_stdin);
         let cleanup_tmp = Some(temp_path);
 
         std::thread::spawn(move || {
@@ -593,6 +634,12 @@ mod win32_gui {
                 let mut jguard = job_arc.lock().unwrap();
                 if let Some(jraw) = jguard.take() {
                     unsafe { CloseHandle(jraw as Handle) };
+                }
+            }
+            {
+                let mut iguard = stdin_arc.lock().unwrap();
+                if let Some(iraw) = iguard.take() {
+                    unsafe { CloseHandle(iraw as Handle) };
                 }
             }
             if let Some(p) = cleanup_tmp {
@@ -693,8 +740,10 @@ mod win32_gui {
                     let w = (lparam & 0xFFFF) as i32;
                     let h = ((lparam >> 16) & 0xFFFF) as i32;
                     let top_h = 44;
-                    let out_h = ((h - top_h) / 3).max(120);
-                    let code_h = (h - top_h - out_h - 16).max(120);
+                    let in_h = 34;
+                    let out_h = ((h - top_h - in_h) / 3).max(100);
+                    let code_h = (h - top_h - out_h - in_h - 18).max(120);
+                    let in_y = top_h + code_h + 8 + out_h + 6;
                     unsafe {
                         MoveWindow(state.hwnd_code, 8, top_h, (w - 16).max(100), code_h, 1);
                         MoveWindow(
@@ -705,6 +754,8 @@ mod win32_gui {
                             out_h,
                             1,
                         );
+                        MoveWindow(state.hwnd_in, 8, in_y, (w - 94).max(80), 26, 1);
+                        MoveWindow(state.hwnd_send, (w - 80).max(94), in_y, 72, 26, 1);
                     }
                 }
                 0
@@ -754,6 +805,27 @@ mod win32_gui {
                             append_out(state.hwnd_out, "\n[Stopped by user]\n");
                         }
                         ID_BTN_CLEAR => set_text(state.hwnd_out, ""),
+                        ID_BTN_SEND => {
+                            let line = get_text(state.hwnd_in).replace(['\r', '\n'], "");
+                            set_text(state.hwnd_in, "");
+                            let guard = state.child_stdin.lock().unwrap();
+                            if let Some(raw_in) = *guard {
+                                append_out(state.hwnd_out, &format!("> {}\n", line));
+                                let payload = format!("{}\n", line);
+                                let mut written: u32 = 0;
+                                unsafe {
+                                    WriteFile(
+                                        raw_in as Handle,
+                                        payload.as_ptr(),
+                                        payload.len() as u32,
+                                        &mut written,
+                                        null_mut(),
+                                    );
+                                }
+                            } else {
+                                append_out(state.hwnd_out, "[No running process to receive input]\n");
+                            }
+                        }
                         ID_BTN_CHECK => {
                             let code = get_text(state.hwnd_code).replace("\r\n", "\n");
                             match crate::compile_source(&code) {
@@ -786,7 +858,9 @@ mod win32_gui {
                 if !state_ptr.is_null() {
                     let state = unsafe { &*state_ptr };
                     let ctrl = lparam as Hwnd;
-                    if state.dark_mode && (ctrl == state.hwnd_code || ctrl == state.hwnd_out) {
+                    if state.dark_mode
+                        && (ctrl == state.hwnd_code || ctrl == state.hwnd_out || ctrl == state.hwnd_in)
+                    {
                         let hdc = wparam as *mut c_void;
                         unsafe {
                             SetTextColor(hdc, 0x00DC_DCDC);
@@ -1027,6 +1101,46 @@ mod win32_gui {
             SendMessageW(hwnd_out, EM_SETLIMITTEXT, 1_048_576, 0);
         }
 
+        let hwnd_in = unsafe {
+            CreateWindowExW(
+                0,
+                edit_cls.as_ptr(),
+                empty.as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+                8,
+                566,
+                730,
+                26,
+                hwnd,
+                ID_EDIT_IN as Hmenu,
+                h_inst,
+                null_mut(),
+            )
+        };
+        unsafe {
+            SendMessageW(hwnd_in, WM_SETFONT, mono_font as Wparam, 1);
+        }
+        let send_lbl = to_wide("Send");
+        let hwnd_send = unsafe {
+            CreateWindowExW(
+                0,
+                btn_cls.as_ptr(),
+                send_lbl.as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                744,
+                566,
+                72,
+                26,
+                hwnd,
+                ID_BTN_SEND as Hmenu,
+                h_inst,
+                null_mut(),
+            )
+        };
+        unsafe {
+            SendMessageW(hwnd_send, WM_SETFONT, ui_font as Wparam, 1);
+        }
+
         let mut current_file = None;
         if let Some(path) = initial_file {
             let p = PathBuf::from(path);
@@ -1045,6 +1159,8 @@ mod win32_gui {
         let state = Box::new(GuiState {
             hwnd_code,
             hwnd_out,
+            hwnd_in,
+            hwnd_send,
             hwnd_chk_unsafe,
             hwnd_flags,
             mono_font,
@@ -1054,6 +1170,7 @@ mod win32_gui {
             current_file,
             child_proc: Arc::new(Mutex::new(None)),
             child_job: Arc::new(Mutex::new(None)),
+            child_stdin: Arc::new(Mutex::new(None)),
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -1085,6 +1202,9 @@ mod win32_gui {
                     continue;
                 } else if ctrl && msg.w_param == 0x41 && msg.hwnd == hwnd_code {
                     unsafe { SendMessageW(hwnd_code, EM_SETSEL, 0, -1) };
+                    continue;
+                } else if msg.w_param == VK_RETURN && msg.hwnd == hwnd_in {
+                    unsafe { SendMessageW(hwnd, WM_COMMAND, ID_BTN_SEND, 0) };
                     continue;
                 }
             }
