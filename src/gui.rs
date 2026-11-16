@@ -66,6 +66,10 @@ mod win32_gui {
     const ID_EDIT_FLAGS: usize = 106;
     const ID_EDIT_CODE: usize = 107;
     const ID_EDIT_OUT: usize = 108;
+    const ID_BTN_CLEAR: usize = 109;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_F5: usize = 0x74;
 
     #[repr(C)]
     struct WndClassExW {
@@ -192,6 +196,7 @@ mod win32_gui {
         fn LoadCursorW(hInstance: Hinstance, lpCursorName: *const u16) -> *mut c_void;
         fn GetWindowLongPtrW(hwnd: Hwnd, nIndex: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: Hwnd, nIndex: i32, dwNewLong: isize) -> isize;
+        fn GetKeyState(nVirtKey: i32) -> i16;
     }
 
     #[link(name = "gdi32")]
@@ -245,6 +250,12 @@ mod win32_gui {
             lpOverlapped: *mut c_void,
         ) -> i32;
         fn TerminateProcess(hProcess: Handle, uExitCode: u32) -> i32;
+        fn CreateJobObjectW(
+            lpJobAttributes: *const SecurityAttributes,
+            lpName: *const u16,
+        ) -> Handle;
+        fn AssignProcessToJobObject(hJob: Handle, hProcess: Handle) -> i32;
+        fn TerminateJobObject(hJob: Handle, uExitCode: u32) -> i32;
         fn WaitForSingleObject(hHandle: Handle, dwMilliseconds: u32) -> u32;
         fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut u32) -> i32;
         fn CloseHandle(hObject: Handle) -> i32;
@@ -267,6 +278,7 @@ mod win32_gui {
         ui_font: Hfont,
         current_file: Option<PathBuf>,
         child_proc: Arc<Mutex<Option<isize>>>,
+        child_job: Arc<Mutex<Option<isize>>>,
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -302,6 +314,16 @@ mod win32_gui {
     }
 
     fn stop_child(state: &GuiState) {
+        {
+            let mut job_guard = state.child_job.lock().unwrap();
+            if let Some(raw_job) = job_guard.take() {
+                let h_job = raw_job as Handle;
+                unsafe {
+                    TerminateJobObject(h_job, 1);
+                    CloseHandle(h_job);
+                }
+            }
+        }
         let mut guard = state.child_proc.lock().unwrap();
         if let Some(raw) = guard.take() {
             let h = raw as Handle;
@@ -339,12 +361,14 @@ mod win32_gui {
                 c == '"' || c == '\r' || c == '\n' || c == '&' || c == '|' || c == '<' || c == '>'
             })
             && (flag == "--allow-args"
+                || flag == "--allow-clipboard"
                 || flag == "--unsafe"
                 || flag.starts_with("--allow-net=")
                 || flag.starts_with("--allow-read=")
                 || flag.starts_with("--allow-write=")
                 || flag.starts_with("--allow-env=")
-                || flag.starts_with("--max-steps="))
+                || flag.starts_with("--max-steps=")
+                || flag.starts_with("--timeout="))
     }
 
     fn run_script(hwnd: Hwnd, state: &GuiState) {
@@ -477,12 +501,41 @@ mod win32_gui {
         }
 
         unsafe { CloseHandle(pi.h_thread) };
+        let h_job = unsafe { CreateJobObjectW(null(), null()) };
+        if !h_job.is_null() {
+            if unsafe { AssignProcessToJobObject(h_job, pi.h_process) } == 0 {
+                unsafe {
+                    TerminateProcess(pi.h_process, 1);
+                    CloseHandle(h_job);
+                    CloseHandle(pi.h_process);
+                    CloseHandle(h_read);
+                }
+                append_out(
+                    state.hwnd_out,
+                    "Failed to isolate Askane child process in a Job Object.\n",
+                );
+                return;
+            }
+            *state.child_job.lock().unwrap() = Some(h_job as isize);
+        } else {
+            unsafe {
+                TerminateProcess(pi.h_process, 1);
+                CloseHandle(pi.h_process);
+                CloseHandle(h_read);
+            }
+            append_out(
+                state.hwnd_out,
+                "Failed to create Job Object; child process was not started.\n",
+            );
+            return;
+        }
         let h_proc_raw = pi.h_process as isize;
         *state.child_proc.lock().unwrap() = Some(h_proc_raw);
 
         let hwnd_raw = hwnd as isize;
         let h_read_raw = h_read as isize;
         let child_arc = Arc::clone(&state.child_proc);
+        let job_arc = Arc::clone(&state.child_job);
         let cleanup_tmp = Some(temp_path);
 
         std::thread::spawn(move || {
@@ -522,6 +575,12 @@ mod win32_gui {
                 if *guard == Some(h_proc_raw) {
                     guard.take();
                     unsafe { CloseHandle(h_proc) };
+                }
+            }
+            {
+                let mut jguard = job_arc.lock().unwrap();
+                if let Some(jraw) = jguard.take() {
+                    unsafe { CloseHandle(jraw as Handle) };
                 }
             }
             if let Some(p) = cleanup_tmp {
@@ -682,6 +741,7 @@ mod win32_gui {
                             stop_child(state);
                             append_out(state.hwnd_out, "\n[Stopped by user]\n");
                         }
+                        ID_BTN_CLEAR => set_text(state.hwnd_out, ""),
                         _ => {}
                     }
                 }
@@ -828,11 +888,12 @@ mod win32_gui {
             h
         };
 
-        mk_btn("Open", 8, 72, ID_BTN_OPEN, BS_PUSHBUTTON);
-        mk_btn("Save", 86, 72, ID_BTN_SAVE, BS_PUSHBUTTON);
-        mk_btn("Run", 164, 72, ID_BTN_RUN, BS_PUSHBUTTON);
-        mk_btn("Stop", 242, 72, ID_BTN_STOP, BS_PUSHBUTTON);
-        let hwnd_chk_unsafe = mk_btn("Unsafe", 324, 74, ID_CHK_UNSAFE, BS_AUTOCHECKBOX);
+        mk_btn("Open", 8, 68, ID_BTN_OPEN, BS_PUSHBUTTON);
+        mk_btn("Save", 82, 68, ID_BTN_SAVE, BS_PUSHBUTTON);
+        mk_btn("Run", 156, 68, ID_BTN_RUN, BS_PUSHBUTTON);
+        mk_btn("Stop", 230, 68, ID_BTN_STOP, BS_PUSHBUTTON);
+        mk_btn("Clear", 304, 68, ID_BTN_CLEAR, BS_PUSHBUTTON);
+        let hwnd_chk_unsafe = mk_btn("Unsafe", 380, 74, ID_CHK_UNSAFE, BS_AUTOCHECKBOX);
 
         let flags_hint = to_wide("");
         let hwnd_flags = unsafe {
@@ -841,9 +902,9 @@ mod win32_gui {
                 edit_cls.as_ptr(),
                 flags_hint.as_ptr(),
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                406,
+                460,
                 10,
-                410,
+                356,
                 24,
                 hwnd,
                 ID_EDIT_FLAGS as Hmenu,
@@ -936,6 +997,7 @@ mod win32_gui {
             ui_font,
             current_file,
             child_proc: Arc::new(Mutex::new(None)),
+            child_job: Arc::new(Mutex::new(None)),
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -954,6 +1016,22 @@ mod win32_gui {
             l_private: 0,
         };
         while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
+            if msg.message == WM_KEYDOWN {
+                let ctrl = unsafe { GetKeyState(VK_CONTROL) } < 0;
+                if msg.w_param == VK_F5 {
+                    unsafe { SendMessageW(hwnd, WM_COMMAND, ID_BTN_RUN, 0) };
+                    continue;
+                } else if ctrl && msg.w_param == 0x53 {
+                    unsafe { SendMessageW(hwnd, WM_COMMAND, ID_BTN_SAVE, 0) };
+                    continue;
+                } else if ctrl && msg.w_param == 0x4F {
+                    unsafe { SendMessageW(hwnd, WM_COMMAND, ID_BTN_OPEN, 0) };
+                    continue;
+                } else if ctrl && msg.w_param == 0x41 && msg.hwnd == hwnd_code {
+                    unsafe { SendMessageW(hwnd_code, EM_SETSEL, 0, -1) };
+                    continue;
+                }
+            }
             unsafe {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);

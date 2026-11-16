@@ -87,7 +87,7 @@ let parsed = try {
 Global functions:
 - I/O: `print(...)`, `println(...)`, `read_line()`
 - Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `has(dict, key)`
-- Higher-order: `map(list, fn)`, `filter(list, fn)`, `reduce(list, init, fn)`
+- Higher-order & Sequences: `map(seq, fn)`, `filter(seq, fn)`, `reduce(seq, init, fn)`, `enumerate(seq)`, `zip(a, b)`, `take(seq, n)`, `skip(seq, n)`, `any(seq, fn)`, `all(seq, fn)`, `find(seq, fn)`
 - Conversions & Utils: `str(x)`, `int(x)`, `float(x)`, `type_of(x)`, `clock()`
 
 Built-in standard modules (`import <name>;`):
@@ -100,6 +100,10 @@ Built-in standard modules (`import <name>;`):
 - `csv`: `parse`, `parse_dicts`, `stringify`
 - `log`: `set_level`, `debug`, `info`, `warn`, `error`
 - `test`: `assert`, `assert_eq`, `assert_ne`, `assert_err`
+- `hash`: `sha256`, `crc32`, `fnv1a`
+- `ini`: `parse`, `stringify`
+- `datetime`: `utc_now`, `from_timestamp`, `format`, `parse_iso`
+- `clipboard` (Windows): `get_text`, `set_text` (requires `--allow-clipboard` or `--unsafe`)
 - `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`
 - `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`
 - `json`: `parse`, `stringify`
@@ -108,9 +112,11 @@ Built-in standard modules (`import <name>;`):
 - `mem` (Windows): `current_pid`, `find_pid` (returns `unit` if not found), `open`, `close`, `module_base` (returns `unit` if not found), `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
 
 CLI tools:
-- `askane` — multiline REPL (supports `:help`, `:exit`, `:reset`, `:modules`, `:bc`)
-- `askane --gui [file.ask]` — Askane Studio GUI editor & runner (Windows)
-- `askane check [--json] <file.ask>` — syntax/compile check without execution
+- `askane` — multiline REPL (supports `:help`, `:gui`, `:exit`, `:reset`, `:modules`, `:bc`)
+- `askane -e "<code>"` — evaluate inline Askane code
+- `askane --gui [file.ask]` — Askane Studio GUI editor & runner (Windows, Job Object isolation, F5/Ctrl+S/Ctrl+O/Ctrl+A)
+- `askane check [--json] <file_or_dir>` — syntax/compile check without execution
+- `askane permissions <file.ask>` — inspect capabilities imported by a script
 - `askane test <file_or_dir>` — run `.ask` test files in isolated VMs
 
 ## Security model
@@ -126,6 +132,8 @@ Granular permission flags are supported in addition to `--unsafe`:
 - `--allow-env[=VAR,...]`: allow `sys.env()` (all or specific variables)
 - `--allow-args`: allow `sys.args()`
 - `--max-steps=N`: override the 10-million sandbox instruction budget
+- `--timeout=MS`: override the 30-second sandbox wall-clock deadline
+- `--allow-clipboard`: allow `clipboard.get_text()` and `clipboard.set_text()`
 
 `askane --unsafe script.ask` enables unrestricted files, HTTPS network requests and
 system functions. Memory access additionally requires `ASKANE_ENABLE_UNSAFE_MEM=1`.

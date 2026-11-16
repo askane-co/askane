@@ -1,8 +1,12 @@
 mod base64;
+mod clipboard;
 mod csv;
+mod datetime;
 mod fs;
 mod gfx;
+mod hash;
 mod http;
+mod ini;
 mod json;
 mod log;
 mod math;
@@ -64,6 +68,10 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "csv" => Some(csv::module()),
         "log" => Some(log::module()),
         "test" => Some(test::module()),
+        "hash" => Some(hash::module()),
+        "ini" => Some(ini::module()),
+        "datetime" => Some(datetime::module()),
+        "clipboard" => Some(clipboard::module()),
         _ => None,
     }
 }

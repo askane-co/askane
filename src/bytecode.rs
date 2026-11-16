@@ -30,6 +30,8 @@ impl fmt::Display for Constant {
 pub struct FunctionProto {
     pub name: String,
     pub arity: u8,
+    pub local_count: u16,
+    pub upvalue_count: u16,
     pub chunk: Chunk,
 }
 
@@ -193,4 +195,114 @@ impl Chunk {
 
         out
     }
+}
+
+pub fn verify_proto(proto: &FunctionProto) -> Result<(), String> {
+    verify_proto_depth(proto, 0)
+}
+
+fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String> {
+    if depth > 64 {
+        return Err("Bytecode verification failed: function nesting too deep".to_string());
+    }
+    let chunk = &proto.chunk;
+    if chunk.code.len() != chunk.lines.len() {
+        return Err(format!(
+            "Bytecode verification failed in '{}': code/lines length mismatch",
+            proto.name
+        ));
+    }
+    if chunk.code.is_empty() {
+        return Err(format!(
+            "Bytecode verification failed in '{}': empty chunk",
+            proto.name
+        ));
+    }
+    let code_len = chunk.code.len();
+    let const_len = chunk.constants.len();
+    if proto.local_count < proto.arity as u16 + 1 {
+        return Err(format!(
+            "Bytecode verification failed in '{}': invalid local count",
+            proto.name
+        ));
+    }
+    let check_str = |idx: u16, op_name: &str| -> Result<(), String> {
+        match chunk.constants.get(idx as usize) {
+            Some(Constant::Str(_)) => Ok(()),
+            _ => Err(format!(
+                "Bytecode verification failed in '{}': {} constant {} is not a string",
+                proto.name, op_name, idx
+            )),
+        }
+    };
+
+    for (ip, op) in chunk.code.iter().enumerate() {
+        match *op {
+            Op::GetLocal(idx) | Op::SetLocal(idx) => {
+                if idx >= proto.local_count {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': local {} out of bounds at ip {}",
+                        proto.name, idx, ip
+                    ));
+                }
+            }
+            Op::GetUpvalue(idx) | Op::SetUpvalue(idx) => {
+                if idx >= proto.upvalue_count {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': upvalue {} out of bounds at ip {}",
+                        proto.name, idx, ip
+                    ));
+                }
+            }
+            Op::Constant(idx) => {
+                if (idx as usize) >= const_len {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': Constant({}) out of bounds at ip {}",
+                        proto.name, idx, ip
+                    ));
+                }
+            }
+            Op::GetGlobal(idx)
+            | Op::DefineGlobal(idx)
+            | Op::SetGlobal(idx)
+            | Op::GetAttr(idx)
+            | Op::SetAttr(idx)
+            | Op::OptGetAttr(idx)
+            | Op::Import(idx, _) => {
+                check_str(idx, "string-operand")?;
+            }
+            Op::Closure(fn_idx, uv_idx) => {
+                match chunk.constants.get(fn_idx as usize) {
+                    Some(Constant::Function(child)) => verify_proto_depth(child, depth + 1)?,
+                    _ => {
+                        return Err(format!(
+                            "Bytecode verification failed in '{}': Closure({}) is not a function",
+                            proto.name, fn_idx
+                        ));
+                    }
+                }
+                if (uv_idx as usize) >= chunk.upvalue_lists.len() {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': upvalue list {} out of bounds",
+                        proto.name, uv_idx
+                    ));
+                }
+            }
+            Op::Jump(t)
+            | Op::JumpIfFalsePop(t)
+            | Op::JumpIfFalsePeek(t)
+            | Op::JumpIfTruePeek(t)
+            | Op::JumpIfNotUnitPeek(t)
+            | Op::SetupTry(t) => {
+                if t >= code_len {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': jump target {} out of bounds (len {})",
+                        proto.name, t, code_len
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

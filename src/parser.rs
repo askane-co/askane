@@ -126,11 +126,67 @@ impl Parser {
             }
             TokenKind::Let => {
                 self.advance();
-                let name = self.expect_ident("Expected variable name after 'let'")?;
-                self.expect(&TokenKind::Assign, "Expected '=' after variable name")?;
-                let value = self.parse_expr()?;
-                self.expect(&TokenKind::Semicolon, "Expected ';' after 'let' statement")?;
-                Ok(Stmt::Let { name, value, span })
+                if self.match_kind(&TokenKind::LBracket) {
+                    let mut names = Vec::new();
+                    if !self.check(&TokenKind::RBracket) {
+                        loop {
+                            names.push(
+                                self.expect_ident("Expected variable name in list destructuring")?,
+                            );
+                            if !self.match_kind(&TokenKind::Comma) {
+                                break;
+                            }
+                            if self.check(&TokenKind::RBracket) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(
+                        &TokenKind::RBracket,
+                        "Expected ']' after list destructuring",
+                    )?;
+                    self.expect(
+                        &TokenKind::Assign,
+                        "Expected '=' after destructuring pattern",
+                    )?;
+                    let value = self.parse_expr()?;
+                    self.expect(&TokenKind::Semicolon, "Expected ';' after 'let' statement")?;
+                    Ok(Stmt::LetList { names, value, span })
+                } else if self.match_kind(&TokenKind::Hash) {
+                    self.expect(&TokenKind::LBrace, "Expected '{' after '#'")?;
+                    let mut fields = Vec::new();
+                    if !self.check(&TokenKind::RBrace) {
+                        loop {
+                            fields.push(
+                                self.expect_ident("Expected field name in dict destructuring")?,
+                            );
+                            if !self.match_kind(&TokenKind::Comma) {
+                                break;
+                            }
+                            if self.check(&TokenKind::RBrace) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace, "Expected '}' after dict destructuring")?;
+                    self.expect(
+                        &TokenKind::Assign,
+                        "Expected '=' after destructuring pattern",
+                    )?;
+                    let value = self.parse_expr()?;
+                    self.expect(&TokenKind::Semicolon, "Expected ';' after 'let' statement")?;
+                    Ok(Stmt::LetDict {
+                        fields,
+                        value,
+                        span,
+                    })
+                } else {
+                    let name = self.expect_ident("Expected variable name after 'let'")?;
+                    self.expect(&TokenKind::Assign, "Expected '=' after variable name")?;
+                    let value = self.parse_expr()?;
+                    self.expect(&TokenKind::Semicolon, "Expected ';' after 'let' statement")?;
+                    Ok(Stmt::Let { name, value, span })
+                }
             }
             TokenKind::Fn => {
                 self.advance();

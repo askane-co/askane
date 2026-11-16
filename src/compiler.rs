@@ -55,6 +55,19 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    fn local_count(chunk: &Chunk, minimum: u16) -> u16 {
+        let mut max = minimum.saturating_sub(1);
+        for op in &chunk.code {
+            let slot = match op {
+                crate::bytecode::Op::GetLocal(i) | crate::bytecode::Op::SetLocal(i) => Some(*i),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                max = max.max(slot);
+            }
+        }
+        max.saturating_add(1)
+    }
     pub fn compile(program: &Program) -> Result<Rc<FunctionProto>, String> {
         let mut compiler = Self {
             frames: vec![FunctionCompiler::new("<script>".to_string(), 0)],
@@ -80,6 +93,8 @@ impl Compiler {
         Ok(Rc::new(FunctionProto {
             name: frame.name,
             arity: frame.arity,
+            local_count: Self::local_count(&frame.chunk, frame.arity as u16 + 1),
+            upvalue_count: frame.upvalues.len() as u16,
             chunk: frame.chunk,
         }))
     }
@@ -133,6 +148,8 @@ impl Compiler {
         Ok(Rc::new(FunctionProto {
             name: frame.name,
             arity: frame.arity,
+            local_count: Self::local_count(&frame.chunk, frame.arity as u16 + 1),
+            upvalue_count: frame.upvalues.len() as u16,
             chunk: frame.chunk,
         }))
     }
@@ -254,6 +271,57 @@ impl Compiler {
                     self.emit(Op::DefineGlobal(idx), span.line);
                 } else {
                     self.add_local(name.clone());
+                }
+                Ok(())
+            }
+            Stmt::LetList { names, value, span } => {
+                let top_level = self.current().scope_depth == 0;
+                if top_level {
+                    self.begin_scope();
+                }
+                self.compile_expr(value)?;
+                let tmp = self.add_local(String::new());
+                for (i, name) in names.iter().enumerate() {
+                    self.emit(Op::GetLocal(tmp), span.line);
+                    let idx_c = self.current().chunk.add_constant(Constant::Int(i as i64));
+                    self.emit(Op::Constant(idx_c), span.line);
+                    self.emit(Op::GetIndex, span.line);
+                    if top_level {
+                        let idx = self.current().chunk.add_string_constant(name);
+                        self.emit(Op::DefineGlobal(idx), span.line);
+                    } else {
+                        self.add_local(name.clone());
+                    }
+                }
+                if top_level {
+                    self.end_scope(span.line);
+                }
+                Ok(())
+            }
+            Stmt::LetDict {
+                fields,
+                value,
+                span,
+            } => {
+                let top_level = self.current().scope_depth == 0;
+                if top_level {
+                    self.begin_scope();
+                }
+                self.compile_expr(value)?;
+                let tmp = self.add_local(String::new());
+                for field in fields {
+                    self.emit(Op::GetLocal(tmp), span.line);
+                    let f_idx = self.current().chunk.add_string_constant(field);
+                    self.emit(Op::GetAttr(f_idx), span.line);
+                    if top_level {
+                        let idx = self.current().chunk.add_string_constant(field);
+                        self.emit(Op::DefineGlobal(idx), span.line);
+                    } else {
+                        self.add_local(field.clone());
+                    }
+                }
+                if top_level {
+                    self.end_scope(span.line);
                 }
                 Ok(())
             }
@@ -894,6 +962,8 @@ impl Compiler {
         let proto = Rc::new(FunctionProto {
             name: compiled.name,
             arity: compiled.arity,
+            local_count: Self::local_count(&compiled.chunk, compiled.arity as u16 + 1),
+            upvalue_count: compiled.upvalues.len() as u16,
             chunk: compiled.chunk,
         });
         let idx = self.current().chunk.add_constant(Constant::Function(proto));

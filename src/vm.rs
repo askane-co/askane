@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::bytecode::{Constant, FunctionProto, Op};
+use crate::bytecode::{Constant, FunctionProto, Op, verify_proto};
 use crate::compiler::Compiler;
 use crate::lexer::Lexer;
 use crate::modules;
@@ -36,7 +36,9 @@ pub struct Permissions {
     pub allow_write: Option<Vec<PathBuf>>,
     pub allow_env: Option<Vec<String>>,
     pub allow_sys_args: bool,
+    pub allow_clipboard: bool,
     pub max_instructions: Option<u64>,
+    pub max_duration_ms: Option<u64>,
 }
 
 impl Permissions {
@@ -48,7 +50,9 @@ impl Permissions {
             allow_write: None,
             allow_env: None,
             allow_sys_args: false,
+            allow_clipboard: false,
             max_instructions: Some(10_000_000),
+            max_duration_ms: Some(30_000),
         }
     }
 
@@ -60,7 +64,9 @@ impl Permissions {
             allow_write: Some(Vec::new()),
             allow_env: Some(Vec::new()),
             allow_sys_args: true,
+            allow_clipboard: true,
             max_instructions: None,
+            max_duration_ms: None,
         }
     }
 }
@@ -78,6 +84,7 @@ pub struct VM {
     module_cache: HashMap<String, Value>,
     loading_modules: HashSet<String>,
     instructions_left: u64,
+    run_start: Instant,
     try_handlers: Vec<TryHandler>,
 }
 
@@ -107,6 +114,7 @@ impl VM {
             module_cache: HashMap::new(),
             loading_modules: HashSet::new(),
             instructions_left,
+            run_start: Instant::now(),
             try_handlers: Vec::new(),
         };
         vm.register_natives();
@@ -199,6 +207,17 @@ impl VM {
         } else {
             Err(
                 "sys.args() is disabled in sandbox mode (pass --allow-args or --unsafe)"
+                    .to_string(),
+            )
+        }
+    }
+
+    pub fn check_clipboard(&self) -> Result<(), String> {
+        if self.permissions.allow_all || self.permissions.allow_clipboard {
+            Ok(())
+        } else {
+            Err(
+                "clipboard is disabled in sandbox mode (pass --allow-clipboard or --unsafe)"
                     .to_string(),
             )
         }
@@ -307,6 +326,13 @@ impl VM {
             ("remove", native_remove),
             ("sort", native_sort),
             ("reverse", native_reverse),
+            ("enumerate", native_enumerate),
+            ("zip", native_zip),
+            ("take", native_take),
+            ("skip", native_skip),
+            ("any", native_any),
+            ("all", native_all),
+            ("find", native_find),
             ("has", native_has),
             ("read_line", native_read_line),
             ("clock", native_clock),
@@ -321,11 +347,13 @@ impl VM {
     }
 
     pub fn run(&mut self, proto: Rc<FunctionProto>) -> Result<Value, String> {
+        verify_proto(&proto)?;
         if self.frames.len() >= MAX_CALL_DEPTH || self.loading_modules.len() > 32 {
             return Err("Maximum call/import depth exceeded".to_string());
         }
         if self.frames.is_empty() {
             self.instructions_left = self.permissions.max_instructions.unwrap_or(u64::MAX);
+            self.run_start = Instant::now();
             self.try_handlers.clear();
         }
         let closure = Rc::new(Closure {
@@ -427,6 +455,13 @@ impl VM {
                     return Err("Sandbox instruction limit exceeded".to_string());
                 }
                 self.instructions_left -= 1;
+            }
+            if let Some(limit_ms) = self.permissions.max_duration_ms {
+                if (self.instructions_left & 4095) == 0
+                    && self.run_start.elapsed().as_millis() as u64 > limit_ms
+                {
+                    return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+                }
             }
             match self.step(target_depth) {
                 Ok(Some(val)) => return Ok(val),
@@ -1552,4 +1587,137 @@ fn native_clock(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err(format!("clock() expects 0 arguments, got {}", args.len()));
     }
     Ok(Value::Float(vm.start_time.elapsed().as_secs_f64()))
+}
+
+fn native_enumerate(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "enumerate() expects 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let items = collect_iterable(&args[0], "enumerate")?;
+    let out: Vec<Value> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| Value::List(Rc::new(RefCell::new(vec![Value::Int(i as i64), v]))))
+        .collect();
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+fn native_zip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("zip() expects 2 arguments, got {}", args.len()));
+    }
+    let a = collect_iterable(&args[0], "zip")?;
+    let b = collect_iterable(&args[1], "zip")?;
+    let out: Vec<Value> = a
+        .into_iter()
+        .zip(b)
+        .map(|(x, y)| Value::List(Rc::new(RefCell::new(vec![x, y]))))
+        .collect();
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+fn native_take(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("take() expects 2 arguments, got {}", args.len()));
+    }
+    let n = match &args[1] {
+        Value::Int(v) if *v >= 0 => *v as usize,
+        _ => return Err("take() count must be a non-negative integer".to_string()),
+    };
+    if n > 10_000_000 {
+        return Err("take() count exceeds maximum limit of 10,000,000".to_string());
+    }
+    match &args[0] {
+        Value::Range { start, end } => {
+            if *end <= *start || n == 0 {
+                return Ok(Value::List(Rc::new(RefCell::new(Vec::new()))));
+            }
+            let max_end = (*start as i128 + n as i128).min(*end as i128) as i64;
+            let out: Vec<Value> = (*start..max_end).map(Value::Int).collect();
+            Ok(Value::List(Rc::new(RefCell::new(out))))
+        }
+        Value::List(l) => {
+            let out: Vec<Value> = l.borrow().iter().take(n).cloned().collect();
+            Ok(Value::List(Rc::new(RefCell::new(out))))
+        }
+        other => Err(format!(
+            "take() expects a list or range, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn native_skip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("skip() expects 2 arguments, got {}", args.len()));
+    }
+    let n = match &args[1] {
+        Value::Int(v) if *v >= 0 => *v as usize,
+        _ => return Err("skip() count must be a non-negative integer".to_string()),
+    };
+    match &args[0] {
+        Value::Range { start, end } => {
+            let new_start = (*start as i128 + n as i128).min(*end as i128) as i64;
+            Ok(Value::Range {
+                start: new_start,
+                end: *end,
+            })
+        }
+        Value::List(l) => {
+            let out: Vec<Value> = l.borrow().iter().skip(n).cloned().collect();
+            Ok(Value::List(Rc::new(RefCell::new(out))))
+        }
+        other => Err(format!(
+            "skip() expects a list or range, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn native_any(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("any() expects 2 arguments, got {}", args.len()));
+    }
+    let items = collect_iterable(&args[0], "any")?;
+    let func = args[1].clone();
+    for item in items {
+        if vm.call_value(func.clone(), &[item])?.is_truthy() {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn native_all(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("all() expects 2 arguments, got {}", args.len()));
+    }
+    let items = collect_iterable(&args[0], "all")?;
+    let func = args[1].clone();
+    for item in items {
+        if !vm.call_value(func.clone(), &[item])?.is_truthy() {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn native_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("find() expects 2 arguments, got {}", args.len()));
+    }
+    let items = collect_iterable(&args[0], "find")?;
+    let func = args[1].clone();
+    for item in items {
+        if vm
+            .call_value(func.clone(), std::slice::from_ref(&item))?
+            .is_truthy()
+        {
+            return Ok(item);
+        }
+    }
+    Ok(Value::Unit)
 }

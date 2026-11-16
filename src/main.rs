@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.12.0";
+const VERSION: &str = "0.13.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -119,7 +119,7 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn run_check(path: &str, json_out: bool) -> Result<(), String> {
+fn check_single_file(path: &str, json_out: bool) -> Result<(), String> {
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
     match compile_source(&source) {
@@ -144,6 +144,99 @@ fn run_check(path: &str, json_out: bool) -> Result<(), String> {
             }
         }
     }
+}
+
+fn run_check(path: &str, json_out: bool) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if p.is_dir() {
+        let mut files = Vec::new();
+        collect_ask_files(p, &mut files)?;
+        if files.is_empty() {
+            return Err(format!("No .ask files found in '{}'", path));
+        }
+        let mut failed = 0usize;
+        for f in &files {
+            if let Err(e) = check_single_file(&f.display().to_string(), json_out) {
+                if !e.is_empty() {
+                    eprintln!("Check failed: {}", e);
+                }
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            Err(if json_out {
+                String::new()
+            } else {
+                format!("{} file(s) failed check", failed)
+            })
+        } else {
+            Ok(())
+        }
+    } else {
+        check_single_file(path, json_out)
+    }
+}
+
+fn inspect_permissions(path: &str) -> Result<Vec<String>, String> {
+    let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
+        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err("Source size limit exceeded".to_string());
+    }
+    let mut lexer = Lexer::new(&source);
+    let tokens = lexer.tokenize()?;
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program()?;
+
+    let mut capabilities = Vec::new();
+    for stmt in &program.stmts {
+        if let ast::Stmt::Import { source, .. } = stmt {
+            match source {
+                ast::ImportSource::Name(name) => {
+                    let desc = match name.as_str() {
+                        "fs" => Some(
+                            "fs (sandboxed to script dir; --allow-read / --allow-write for external dirs)",
+                        ),
+                        "http" => Some("http (blocked by default; requires --allow-net[=host])"),
+                        "sys" => Some(
+                            "sys (sys.env requires --allow-env, sys.args requires --allow-args)",
+                        ),
+                        "clipboard" => {
+                            Some("clipboard (blocked by default; requires --allow-clipboard)")
+                        }
+                        "mem" => Some("mem (requires --unsafe and ASKANE_ENABLE_UNSAFE_MEM=1)"),
+                        "gfx" => Some("gfx (Win32 GUI window)"),
+                        _ => None,
+                    };
+                    if let Some(d) = desc {
+                        if !capabilities.contains(&d.to_string()) {
+                            capabilities.push(d.to_string());
+                        }
+                    }
+                }
+                ast::ImportSource::Path(p) => {
+                    let d = format!("file import '{}' (inherits caller permissions)", p);
+                    if !capabilities.contains(&d) {
+                        capabilities.push(d);
+                    }
+                }
+            }
+        }
+    }
+    Ok(capabilities)
+}
+
+fn run_eval(code: &str, perms: Permissions) -> Result<(), String> {
+    let proto = compile_source(code).map_err(|e| format_error_with_source(code, &e))?;
+    let mut vm = VM::new_with_sandbox(!perms.allow_all);
+    vm.set_permissions(perms);
+    let val = vm
+        .run(proto)
+        .map_err(|e| format_error_with_source(code, &e))?;
+    if !matches!(val, Value::Unit) {
+        println!("{}", val);
+    }
+    Ok(())
 }
 
 fn collect_ask_files(
@@ -313,10 +406,17 @@ fn run_repl() {
                 ":help" | "help" => {
                     println!("Commands:");
                     println!("  :help     Show this message");
+                    println!("  :gui      Open Askane Studio GUI editor");
                     println!("  :exit     Exit the REPL");
                     println!("  :reset    Reset VM state and globals");
                     println!("  :modules  List built-in standard modules");
                     println!("  :bc       Prefix any code with ':bc ' to inspect its bytecode");
+                    continue;
+                }
+                ":gui" | "gui" => {
+                    if let Err(e) = gui::run(None) {
+                        eprintln!("GUI error: {}", e);
+                    }
                     continue;
                 }
                 ":reset" => {
@@ -326,7 +426,7 @@ fn run_repl() {
                 }
                 ":modules" => {
                     println!(
-                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, csv, log, test, http, gfx, mem"
+                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, csv, log, test, hash, ini, datetime, clipboard, http, gfx, mem"
                     );
                     continue;
                 }
@@ -374,7 +474,9 @@ fn print_help() {
     println!("  askane                       Start interactive REPL");
     println!("  askane --gui [file.ask]      Open Askane Studio GUI editor (Windows)");
     println!("  askane <file.ask>            Run an Askane script");
-    println!("  askane check [--json] <file> Syntax & compile check without running");
+    println!("  askane -e \"<code>\"           Evaluate inline code");
+    println!("  askane check [--json] <path> Syntax & compile check for file or directory");
+    println!("  askane permissions <file>    Inspect capabilities imported by a script");
     println!("  askane test <file_or_dir>    Run .ask test files");
     println!("  askane -b <file.ask>         Disassemble compiled bytecode");
     println!("  askane -h | --help           Show help");
@@ -392,6 +494,7 @@ fn print_help() {
     );
     println!("  --allow-env[=vars]           Allow sys.env() (optionally comma-separated names)");
     println!("  --allow-args                 Allow sys.args()");
+    println!("  --allow-clipboard            Allow clipboard.get_text() / set_text()");
     println!(
         "  --max-steps=N                Override sandbox instruction budget (default 10000000)"
     );
@@ -470,6 +573,30 @@ fn main() {
         return;
     }
 
+    if args[1] == "permissions" {
+        let Some(path) = args.get(2) else {
+            eprintln!("Usage: askane permissions <file.ask>");
+            process::exit(1);
+        };
+        match inspect_permissions(path) {
+            Ok(caps) => {
+                if caps.is_empty() {
+                    println!("{}: no privileged modules imported", path);
+                } else {
+                    println!("{} imports:", path);
+                    for c in caps {
+                        println!("  - {}", c);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
     let mut is_test_cmd = false;
     let slice_start = if args[1] == "test" {
         is_test_cmd = true;
@@ -479,10 +606,13 @@ fn main() {
     };
 
     let mut dump_bytecode = false;
+    let mut eval_code: Option<String> = None;
     let mut perms = Permissions::sandboxed();
     let mut script_path: Option<String> = None;
 
-    for arg in &args[slice_start..] {
+    let mut i = slice_start;
+    while i < args.len() {
+        let arg = &args[i];
         if arg == "-h" || arg == "--help" {
             print_help();
             return;
@@ -493,6 +623,13 @@ fn main() {
         }
         if arg == "-b" || arg == "--bytecode" {
             dump_bytecode = true;
+        } else if arg == "-e" || arg == "--eval" {
+            i += 1;
+            let Some(code) = args.get(i) else {
+                eprintln!("Missing code after {}", arg);
+                process::exit(1);
+            };
+            eval_code = Some(code.clone());
         } else if arg == "--unsafe" {
             perms = Permissions::unrestricted();
         } else if arg == "--allow-net" {
@@ -513,11 +650,21 @@ fn main() {
             append_csv(&mut perms.allow_env, Some(val));
         } else if arg == "--allow-args" {
             perms.allow_sys_args = true;
+        } else if arg == "--allow-clipboard" {
+            perms.allow_clipboard = true;
         } else if let Some(val) = arg.strip_prefix("--max-steps=") {
             match val.parse::<u64>() {
                 Ok(n) => perms.max_instructions = Some(n),
                 Err(_) => {
                     eprintln!("Invalid --max-steps value: {}", val);
+                    process::exit(1);
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--timeout=") {
+            match val.parse::<u64>() {
+                Ok(n) => perms.max_duration_ms = Some(n),
+                Err(_) => {
+                    eprintln!("Invalid --timeout value: {}", val);
                     process::exit(1);
                 }
             }
@@ -533,6 +680,15 @@ fn main() {
             );
             process::exit(1);
         }
+        i += 1;
+    }
+
+    if let Some(code) = eval_code {
+        if let Err(e) = run_eval(&code, perms) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+        return;
     }
 
     if is_test_cmd {
@@ -1198,5 +1354,114 @@ mod tests {
         let src = "let x = 1;\nlet y = 1 / 0;\nprintln(y);";
         let formatted = format_error_with_source(src, "[line 2] Division by zero");
         assert!(formatted.contains("2 | let y = 1 / 0;"));
+    }
+
+    #[test]
+    fn test_v013_modules_and_permissions() {
+        let val = eval(
+            r#"
+            import hash;
+            import ini;
+            import datetime;
+            import test;
+
+            test.assert_eq(
+                hash.sha256("abc"),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+            test.assert_eq(hash.crc32("123456789"), 3421780262);
+            test.assert(hash.fnv1a("askane") != 0);
+
+            let cfg = ini.parse("app = askane\n[server]\nport = 8080\n");
+            test.assert_eq(cfg.app, "askane");
+            test.assert_eq(cfg.server.port, "8080");
+            test.assert(len(ini.stringify(cfg)) > 0);
+
+            let dt0 = datetime.from_timestamp(0);
+            test.assert_eq(dt0.iso, "1970-01-01T00:00:00Z");
+            test.assert_eq(datetime.format(0, "%Y-%m-%d"), "1970-01-01");
+            test.assert_eq(datetime.parse_iso("1970-01-01T00:00:00Z"), 0);
+            test.assert(len(datetime.utc_now()) == 20);
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // clipboard must be blocked in default sandbox
+        let proto_clip = compile_source(
+            r#"
+            import clipboard;
+            clipboard.get_text()
+            "#,
+        )
+        .unwrap();
+        let mut vm_sb = VM::new_with_sandbox(true);
+        let err = vm_sb.run(proto_clip).unwrap_err();
+        assert!(err.contains("allow-clipboard"), "err: {}", err);
+    }
+
+    #[test]
+    fn audit_v013_clipboard_and_permissions_are_denied_by_default() {
+        let source = "import clipboard; clipboard.get_text()";
+        let err = VM::new().run(compile_source(source).unwrap()).unwrap_err();
+        assert!(err.contains("clipboard is disabled"));
+
+        let source = "import fs; import http; import sys; import mem; 1";
+        let proto = compile_source(source).unwrap();
+        let mut vm = VM::new();
+        assert!(vm.run(proto).is_ok() || vm.run(compile_source("1").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_v013_sequences_destructuring_and_verifier() {
+        let val = eval(
+            r#"
+            import test;
+
+            // Sequence helpers (including lazy range take/skip)
+            let first3 = range(0, 10000000) |> skip(5) |> take(3);
+            test.assert_eq(first3, [5, 6, 7]);
+            test.assert_eq(enumerate(["a", "b"]), [[0, "a"], [1, "b"]]);
+            test.assert_eq(zip([1, 2], ["x", "y"]), [[1, "x"], [2, "y"]]);
+            test.assert_eq(any([1, 3, 4], |x| x % 2 == 0), true);
+            test.assert_eq(all([2, 4, 6], |x| x % 2 == 0), true);
+            test.assert_eq(find([1, 5, 8], |x| x > 4), 5);
+
+            // Top-level destructuring
+            let [x, y] = [10, 20];
+            let #{ name, hp } = #{ name: "Hero", hp: 100 };
+            test.assert_eq(x + y, 30);
+            test.assert_eq(name, "Hero");
+            test.assert_eq(hp, 100);
+
+            // Local scope destructuring
+            fn pair_sum() {
+                let [a, b] = [3, 4];
+                let #{ v } = #{ v: 5 };
+                a + b + v
+            }
+            test.assert_eq(pair_sum(), 12);
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // Bytecode verifier rejects corrupted jumps cleanly without panic
+        let bad_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            name: "bad".to_string(),
+            arity: 0,
+            local_count: 1,
+            upvalue_count: 0,
+            chunk: bytecode::Chunk {
+                code: vec![bytecode::Op::Jump(999)],
+                constants: vec![],
+                lines: vec![1],
+                upvalue_lists: vec![],
+                limit_exceeded: false,
+            },
+        });
+        let mut vm = VM::new();
+        let err = vm.run(bad_proto).unwrap_err();
+        assert!(err.contains("Bytecode verification failed"), "err: {}", err);
     }
 }

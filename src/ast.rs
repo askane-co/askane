@@ -24,6 +24,16 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    LetList {
+        names: Vec<String>,
+        value: Expr,
+        span: Span,
+    },
+    LetDict {
+        fields: Vec<String>,
+        value: Expr,
+        span: Span,
+    },
     FnDecl {
         name: String,
         params: Vec<String>,

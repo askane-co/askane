@@ -48,15 +48,55 @@ fn log_set_level(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
+fn redact_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        let rest_lower = &lower[i..];
+        let matched_key = [
+            "bearer ",
+            "token=",
+            "secret=",
+            "password=",
+            "api_key=",
+            "apikey=",
+        ]
+        .iter()
+        .find(|kw| rest_lower.starts_with(*kw));
+
+        if let Some(kw) = matched_key {
+            out.push_str(&text[i..i + kw.len()]);
+            out.push_str("[REDACTED]");
+            i += kw.len();
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && bytes[i] != b'&'
+                && bytes[i] != b'"'
+            {
+                i += 1;
+            }
+        } else if let Some(ch) = text[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 fn emit_log(level: u8, tag: &str, args: &[Value]) {
     if LOG_LEVEL.with(|c| c.get()) > level {
         return;
     }
     let parts: Vec<String> = args.iter().map(|v| format!("{}", v)).collect();
+    let msg = redact_secrets(&parts.join(" "));
     if level >= 2 {
-        eprintln!("[{}] {}", tag, parts.join(" "));
+        eprintln!("[{}] {}", tag, msg);
     } else {
-        println!("[{}] {}", tag, parts.join(" "));
+        println!("[{}] {}", tag, msg);
     }
 }
 
