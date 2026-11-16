@@ -75,6 +75,19 @@ mod winhttp {
             lpdwNumberOfBytesRead: *mut u32,
         ) -> i32;
         fn WinHttpCloseHandle(hInternet: HInternet) -> i32;
+        fn WinHttpSetTimeouts(
+            hInternet: HInternet,
+            resolve: i32,
+            connect: i32,
+            send: i32,
+            receive: i32,
+        ) -> i32;
+        fn WinHttpSetOption(
+            hInternet: HInternet,
+            option: u32,
+            buffer: *const c_void,
+            length: u32,
+        ) -> i32;
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -89,8 +102,12 @@ mod winhttp {
     }
 
     fn parse_url(url: &str) -> Result<ParsedUrl, String> {
-        if url.contains('\0') {
-            return Err("URL cannot contain null bytes".to_string());
+        if url.len() > 8192
+            || url
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+        {
+            return Err("Invalid URL characters or URL size".to_string());
         }
         let (is_https, rest) = if let Some(r) = url.strip_prefix("https://") {
             (true, r)
@@ -98,7 +115,8 @@ mod winhttp {
             return Err("Only https:// URLs are allowed".to_string());
         };
 
-        let (host_port, path) = match rest.find('/') {
+        let rest = rest.split('#').next().unwrap_or(rest);
+        let (host_port, path) = match rest.find(['/', '?']) {
             Some(idx) => (&rest[..idx], &rest[idx..]),
             None => (rest, "/"),
         };
@@ -113,7 +131,7 @@ mod winhttp {
             None => (host_port.to_string(), if is_https { 443 } else { 80 }),
         };
 
-        if host.is_empty() {
+        if host.is_empty() || host.contains('@') || port == 0 {
             return Err("Empty host in URL".to_string());
         }
 
@@ -121,7 +139,11 @@ mod winhttp {
             is_https,
             host,
             port,
-            path: path.to_string(),
+            path: if path.starts_with('?') {
+                format!("/{}", path)
+            } else {
+                path.to_string()
+            },
         })
     }
 
@@ -132,6 +154,11 @@ mod winhttp {
         body: Option<&[u8]>,
     ) -> Result<Value, String> {
         let parsed = parse_url(url)?;
+        if body.is_some_and(|b| b.len() > 32 * 1024 * 1024)
+            || headers.is_some_and(|h| h.len() > 64 * 1024)
+        {
+            return Err("HTTP request size limit exceeded".to_string());
+        }
         let agent = to_wide("Askane/0.1");
         let host_w = to_wide(&parsed.host);
         let method_w = to_wide(method);
@@ -148,6 +175,10 @@ mod winhttp {
             );
             if session.is_null() {
                 return Err("WinHttpOpen failed".to_string());
+            }
+            if WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000) == 0 {
+                WinHttpCloseHandle(session);
+                return Err("Could not configure HTTP timeouts".to_string());
             }
 
             let connect = WinHttpConnect(session, host_w.as_ptr(), parsed.port, 0);
@@ -175,6 +206,17 @@ mod winhttp {
                 WinHttpCloseHandle(session);
                 return Err("WinHttpOpenRequest failed".to_string());
             }
+            // Never forward credentials to a redirect target or use ambient Windows credentials.
+            let redirect_policy: u32 = 0; // WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+            let autologon_policy: u32 = 2; // WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH
+            if WinHttpSetOption(req, 88, (&redirect_policy as *const u32).cast(), 4) == 0
+                || WinHttpSetOption(req, 77, (&autologon_policy as *const u32).cast(), 4) == 0
+            {
+                WinHttpCloseHandle(req);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                return Err("Could not configure HTTP security policy".to_string());
+            }
 
             let (hdr_ptr, hdr_len) = match &headers_w {
                 Some(h) => (h.as_ptr(), (h.len() - 1) as u32),
@@ -190,7 +232,7 @@ mod winhttp {
                 WinHttpCloseHandle(req);
                 WinHttpCloseHandle(connect);
                 WinHttpCloseHandle(session);
-                return Err(format!("HTTP request to '{}' failed", url));
+                return Err("HTTP request failed".to_string());
             }
 
             let mut status_code: u32 = 0;
@@ -246,12 +288,19 @@ fn format_headers_dict(val: &Value, fn_name: &str) -> Result<String, String> {
         Value::Dict(d) => {
             let mut out = String::new();
             for (k, v) in d.borrow().iter() {
-                if k.contains('\r') || k.contains('\n') || k.contains('\0') {
+                if k.is_empty()
+                    || !k
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+                {
                     return Err(format!("http.{}(): invalid header name {:?}", fn_name, k));
                 }
                 let vs = format!("{}", v);
                 if vs.contains('\r') || vs.contains('\n') || vs.contains('\0') {
-                    return Err(format!("http.{}(): invalid header value for {:?}", fn_name, k));
+                    return Err(format!(
+                        "http.{}(): invalid header value for {:?}",
+                        fn_name, k
+                    ));
                 }
                 out.push_str(&format!("{}: {}\r\n", k, vs));
             }
@@ -266,7 +315,7 @@ fn format_headers_dict(val: &Value, fn_name: &str) -> Result<String, String> {
 }
 
 #[cfg(windows)]
-fn http_get(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn http_get(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("http.get() expects (url) or (url, headers_dict)".to_string());
     }
@@ -279,6 +328,10 @@ fn http_get(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
+    if !url.starts_with("https://") {
+        return Err("Only https:// URLs are allowed".to_string());
+    }
+    vm.check_net(url)?;
     let headers = if args.len() == 2 {
         Some(format_headers_dict(&args[1], "get")?)
     } else {
@@ -288,7 +341,7 @@ fn http_get(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 #[cfg(windows)]
-fn http_post(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn http_post(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err(
             "http.post() expects (url, body) or (url, body, headers_dict | content_type)"
@@ -304,6 +357,10 @@ fn http_post(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
+    if !url.starts_with("https://") {
+        return Err("Only https:// URLs are allowed".to_string());
+    }
+    vm.check_net(url)?;
     let body = match &args[1] {
         Value::Str(s) => s.as_bytes(),
         other => {
@@ -315,7 +372,12 @@ fn http_post(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
     let header = if args.len() == 3 {
         match &args[2] {
-            Value::Str(s) => format!("Content-Type: {}\r\n", s),
+            Value::Str(s) => {
+                if s.chars().any(char::is_control) {
+                    return Err("Invalid Content-Type".to_string());
+                }
+                format!("Content-Type: {}\r\n", s)
+            }
             Value::Dict(_) => format_headers_dict(&args[2], "post")?,
             other => {
                 return Err(format!(

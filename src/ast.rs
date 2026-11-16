@@ -122,6 +122,16 @@ pub enum Expr {
         right: Box<Expr>,
         span: Span,
     },
+    TryCatch {
+        try_body: Box<Expr>,
+        catch_var: Option<String>,
+        catch_body: Box<Expr>,
+        span: Span,
+    },
+    Throw {
+        value: Box<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -146,7 +156,9 @@ impl Expr {
             | Expr::Index { span, .. }
             | Expr::GetAttr { span, .. }
             | Expr::OptGetAttr { span, .. }
-            | Expr::NullCoalesce { span, .. } => *span,
+            | Expr::NullCoalesce { span, .. }
+            | Expr::TryCatch { span, .. }
+            | Expr::Throw { span, .. } => *span,
         }
     }
 }

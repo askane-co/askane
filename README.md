@@ -72,6 +72,14 @@ let player = #{ name: "Askane", hp: 100 };
 player.hp = 90;
 let mana = player?.mana ?? 50;
 println("${player.name}: hp=${player.hp}, mana=${mana}", keys(player));
+
+// Error handling with try / catch / throw
+let parsed = try {
+    if mana < 0 { throw "invalid mana"; }
+    mana
+} catch err {
+    0
+};
 ```
 
 ## Built-in Functions & Modules
@@ -93,12 +101,30 @@ Built-in standard modules (`import <name>;`):
 
 ## Security model
 
-Scripts run in a filesystem sandbox rooted at the script's directory. The `fs` module
-cannot escape this directory through absolute paths, `..`, or symlinks. HTTP requests
-require HTTPS. The Windows `mem` module is disabled by default because it can inspect
-and modify other processes; enable it only for trusted scripts with
-`ASKANE_ENABLE_UNSAFE_MEM=1`. The `--unsafe` command-line option disables the filesystem
-sandbox and should only be used with trusted code.
+By default filesystem paths are checked against the script directory. Network access,
+`sys.env`, `sys.args`, `sys.exit`, and `mem` are blocked. The VM has a 10-million
+instruction budget per top-level run; source files are limited to 4 MiB and `fs.read`
+to 32 MiB. Graphics scripts exceeding the budget need trusted mode for now.
+
+Granular permission flags are supported in addition to `--unsafe`:
+- `--allow-net[=host[:port],...]`: allow HTTPS requests (all hosts or specific allowlist)
+- `--allow-read[=dir,...]` / `--allow-write[=dir,...]`: allow reading/writing outside the script directory
+- `--allow-env[=VAR,...]`: allow `sys.env()` (all or specific variables)
+- `--allow-args`: allow `sys.args()`
+- `--max-steps=N`: override the 10-million sandbox instruction budget
+
+`askane --unsafe script.ask` enables unrestricted files, HTTPS network requests and
+system functions. Memory access additionally requires `ASKANE_ENABLE_UNSAFE_MEM=1`.
+HTTPS requests verify certificates using WinHTTP, disable automatic redirects and
+ambient Windows authentication, and use per-operation timeouts. HTTP errors omit URLs
+to avoid leaking query-string credentials. The API example requires `--unsafe`.
+
+This is an in-process policy, **not an OS security boundary**: filesystem checks are
+not atomic with opening files, hard links are not isolated, memory is not fully metered,
+and graphics/console I/O remain available. Run hostile scripts in an OS-isolated
+environment without sensitive files. HTTPS is encryption, not anonymity: a contacted
+server can see your public IP address. See [SECURITY_AUDIT.md](SECURITY_AUDIT.md)
+for findings and [ROADMAP.md](ROADMAP.md) for proposed next releases.
 
 ## License
 

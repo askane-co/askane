@@ -3,10 +3,7 @@ use crate::value::Value;
 use crate::vm::VM;
 
 pub fn module() -> Value {
-    if !cfg!(test)
-        && std::env::var_os("ASKANE_ENABLE_UNSAFE_MEM").as_deref()
-            != Some(std::ffi::OsStr::new("1"))
-    {
+    if std::env::var_os("ASKANE_ENABLE_UNSAFE_MEM").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return build_module(
             "mem",
             &[

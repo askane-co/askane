@@ -24,7 +24,8 @@ pub fn module() -> Value {
     )
 }
 
-fn sys_args(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn sys_args(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    vm.check_sys_args()?;
     if !args.is_empty() {
         return Err("sys.args() expects 0 arguments".to_string());
     }
@@ -33,9 +34,6 @@ fn sys_args(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn sys_env(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
-    if vm.is_sandboxed() {
-        return Err("sys.env() is disabled in sandbox mode (run with --unsafe to allow)".to_string());
-    }
     if args.len() != 1 {
         return Err("sys.env() expects 1 argument (name)".to_string());
     }
@@ -48,13 +46,17 @@ fn sys_env(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
+    vm.check_env(name)?;
     match env::var(name) {
         Ok(val) => Ok(Value::Str(val)),
         Err(_) => Ok(Value::Unit),
     }
 }
 
-fn sys_exit(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn sys_exit(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if vm.is_sandboxed() {
+        return Err("sys.exit() is disabled in sandbox mode".to_string());
+    }
     let code = match args {
         [] => 0,
         [Value::Int(c)] => *c as i32,
@@ -77,12 +79,15 @@ fn sys_arch(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Str(env::consts::ARCH.to_string()))
 }
 
-fn sys_sleep(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn sys_sleep(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("sys.sleep() expects 1 argument (milliseconds)".to_string());
     }
     match &args[0] {
         Value::Int(ms) if *ms >= 0 => {
+            if vm.is_sandboxed() && *ms > 1000 {
+                return Err("Sandbox sleep limit is 1000 ms per call".to_string());
+            }
             thread::sleep(Duration::from_millis(*ms as u64));
             Ok(Value::Unit)
         }

@@ -13,6 +13,7 @@ struct Local {
 struct LoopContext {
     break_scope_depth: usize,
     continue_scope_depth: usize,
+    try_depth: usize,
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
 }
@@ -24,6 +25,7 @@ struct FunctionCompiler {
     locals: Vec<Local>,
     upvalues: Vec<UpvalueDesc>,
     scope_depth: usize,
+    try_depth: usize,
     loops: Vec<LoopContext>,
 }
 
@@ -42,6 +44,7 @@ impl FunctionCompiler {
             locals,
             upvalues: Vec::new(),
             scope_depth: 0,
+            try_depth: 0,
             loops: Vec::new(),
         }
     }
@@ -71,6 +74,9 @@ impl Compiler {
         }
 
         let frame = compiler.frames.pop().unwrap();
+        if frame.chunk.limit_exceeded {
+            return Err("Bytecode constant/local limit exceeded".to_string());
+        }
         Ok(Rc::new(FunctionProto {
             name: frame.name,
             arity: frame.arity,
@@ -121,6 +127,9 @@ impl Compiler {
         compiler.emit(Op::Return, 0);
 
         let frame = compiler.frames.pop().unwrap();
+        if frame.chunk.limit_exceeded {
+            return Err("Bytecode constant/local limit exceeded".to_string());
+        }
         Ok(Rc::new(FunctionProto {
             name: frame.name,
             arity: frame.arity,
@@ -168,6 +177,10 @@ impl Compiler {
     }
 
     fn add_local(&mut self, name: String) -> u16 {
+        if self.current().locals.len() > u16::MAX as usize {
+            self.current().chunk.limit_exceeded = true;
+            return 0;
+        }
         let depth = self.current().scope_depth;
         let idx = self.current().locals.len() as u16;
         self.current().locals.push(Local {
@@ -262,9 +275,11 @@ impl Compiler {
             Stmt::While { cond, body, span } => {
                 let loop_start = self.current_ip();
                 let scope_depth = self.current().scope_depth;
+                let loop_try_depth = self.current().try_depth;
                 self.current().loops.push(LoopContext {
                     break_scope_depth: scope_depth,
                     continue_scope_depth: scope_depth,
+                    try_depth: loop_try_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                 });
@@ -316,9 +331,11 @@ impl Compiler {
                 let exit_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
 
                 let continue_scope_depth = self.current().scope_depth;
+                let loop_try_depth = self.current().try_depth;
                 self.current().loops.push(LoopContext {
                     break_scope_depth,
                     continue_scope_depth,
+                    try_depth: loop_try_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                 });
@@ -378,7 +395,13 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let target_depth = self.current().loops.last().unwrap().break_scope_depth;
+                let (target_depth, loop_try_depth) = {
+                    let l = self.current().loops.last().unwrap();
+                    (l.break_scope_depth, l.try_depth)
+                };
+                for _ in loop_try_depth..self.current().try_depth {
+                    self.emit(Op::PopTry, span.line);
+                }
                 self.pop_locals_to_depth(target_depth, span.line);
                 let j = self.emit(Op::Jump(0), span.line);
                 self.current().loops.last_mut().unwrap().break_jumps.push(j);
@@ -391,7 +414,13 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let target_depth = self.current().loops.last().unwrap().continue_scope_depth;
+                let (target_depth, loop_try_depth) = {
+                    let l = self.current().loops.last().unwrap();
+                    (l.continue_scope_depth, l.try_depth)
+                };
+                for _ in loop_try_depth..self.current().try_depth {
+                    self.emit(Op::PopTry, span.line);
+                }
                 self.pop_locals_to_depth(target_depth, span.line);
                 let j = self.emit(Op::Jump(0), span.line);
                 self.current()
@@ -466,6 +495,9 @@ impl Compiler {
                 Ok(())
             }
             Expr::List(items, span) => {
+                if items.len() > u16::MAX as usize {
+                    return Err("Too many list elements (max 65535)".to_string());
+                }
                 for item in items {
                     self.compile_expr(item)?;
                 }
@@ -473,6 +505,9 @@ impl Compiler {
                 Ok(())
             }
             Expr::Dict(entries, span) => {
+                if entries.len() > u16::MAX as usize {
+                    return Err("Too many dictionary entries (max 65535)".to_string());
+                }
                 for (k, v) in entries {
                     self.compile_expr(k)?;
                     self.compile_expr(v)?;
@@ -605,6 +640,43 @@ impl Compiler {
                     self.emit(Op::Unit, span.line);
                 }
                 self.patch_jump(end_jump);
+                Ok(())
+            }
+            Expr::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+                span,
+            } => {
+                self.emit(Op::Unit, span.line);
+                let res_slot = self.add_local(String::new());
+                let setup_jump = self.emit(Op::SetupTry(0), span.line);
+
+                self.current().try_depth += 1;
+                self.compile_expr(try_body)?;
+                self.current().try_depth -= 1;
+
+                self.emit(Op::SetLocal(res_slot), span.line);
+                self.emit(Op::Pop, span.line);
+                self.emit(Op::PopTry, span.line);
+                let end_jump = self.emit(Op::Jump(0), span.line);
+
+                self.patch_jump(setup_jump);
+                self.begin_scope();
+                let var_name = catch_var.clone().unwrap_or_else(|| "__err".to_string());
+                self.add_local(var_name);
+                self.compile_expr(catch_body)?;
+                self.emit(Op::SetLocal(res_slot), span.line);
+                self.emit(Op::Pop, span.line);
+                self.end_scope(span.line);
+
+                self.patch_jump(end_jump);
+                self.current().locals.pop();
+                Ok(())
+            }
+            Expr::Throw { value, span } => {
+                self.compile_expr(value)?;
+                self.emit(Op::Throw, span.line);
                 Ok(())
             }
             Expr::Match {
@@ -814,6 +886,9 @@ impl Compiler {
         self.compile_expr(body)?;
         self.emit(Op::Return, span.line);
         let compiled = self.frames.pop().unwrap();
+        if compiled.chunk.limit_exceeded {
+            return Err("Bytecode constant/local limit exceeded".to_string());
+        }
 
         let upvalues = compiled.upvalues.clone();
         let proto = Rc::new(FunctionProto {

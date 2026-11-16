@@ -16,11 +16,31 @@ use compiler::Compiler;
 use lexer::Lexer;
 use parser::Parser;
 use value::Value;
-use vm::VM;
+use vm::{Permissions, VM};
 
-const VERSION: &str = "0.10.2-fix";
+const VERSION: &str = "0.11.0";
+pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Only regular files can be read".to_string());
+    }
+    let mut text = String::new();
+    file.take(limit as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    if text.len() > limit {
+        return Err(format!("File exceeds {} byte limit", limit));
+    }
+    Ok(text)
+}
 
 fn compile_source(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, String> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err("Source size limit exceeded".to_string());
+    }
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize()?;
     let mut parser = Parser::new(tokens);
@@ -28,15 +48,16 @@ fn compile_source(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, 
     Compiler::compile(&program)
 }
 
-fn run_file(path: &str, dump_bytecode: bool, unsafe_mode: bool) -> Result<(), String> {
-    let source =
-        fs::read_to_string(path).map_err(|e| format!("Could not read '{}': {}", path, e))?;
+fn run_file(path: &str, dump_bytecode: bool, permissions: Permissions) -> Result<(), String> {
+    let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
+        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
     let proto = compile_source(&source)?;
     if dump_bytecode {
         print!("{}", proto.chunk.disassemble(&proto.name));
         return Ok(());
     }
-    let mut vm = VM::new_with_sandbox(!unsafe_mode);
+    let mut vm = VM::new_with_sandbox(!permissions.allow_all);
+    vm.set_permissions(permissions);
     if let Some(parent) = std::path::Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
@@ -116,38 +137,113 @@ fn print_help() {
     println!("  askane -b <file.ask>    Disassemble compiled bytecode");
     println!("  askane -h | --help      Show help");
     println!("  askane -v | --version   Show version");
-    println!("  askane --unsafe <file>  Disable the filesystem/process sandbox");
+    println!();
+    println!("Sandbox permissions:");
+    println!("  --allow-net[=hosts]     Allow HTTPS access (optionally comma-separated host[:port])");
+    println!("  --allow-read[=dirs]     Allow reading outside sandbox (optionally comma-separated dirs)");
+    println!("  --allow-write[=dirs]    Allow writing outside sandbox (optionally comma-separated dirs)");
+    println!("  --allow-env[=vars]      Allow sys.env() (optionally comma-separated names)");
+    println!("  --allow-args            Allow sys.args()");
+    println!("  --max-steps=N           Override sandbox instruction budget (default 10000000)");
+    println!("  --unsafe                Allow unrestricted files, network, env and process access");
+}
+
+fn append_csv(target: &mut Option<Vec<String>>, value: Option<&str>) {
+    match value {
+        Some(list) if !list.is_empty() => {
+            let items = target.get_or_insert_with(Vec::new);
+            for part in list.split(',').filter(|s| !s.is_empty()) {
+                items.push(part.to_string());
+            }
+        }
+        _ => {
+            *target = Some(Vec::new());
+        }
+    }
+}
+
+fn append_csv_paths(target: &mut Option<Vec<std::path::PathBuf>>, value: Option<&str>) {
+    match value {
+        Some(list) if !list.is_empty() => {
+            let items = target.get_or_insert_with(Vec::new);
+            for part in list.split(',').filter(|s| !s.is_empty()) {
+                items.push(std::path::PathBuf::from(part));
+            }
+        }
+        _ => {
+            *target = Some(Vec::new());
+        }
+    }
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.len() == 1 {
+        run_repl();
+        return;
+    }
 
-    match args.as_slice() {
-        [_] => run_repl(),
-        [_, flag] if flag == "-h" || flag == "--help" => print_help(),
-        [_, flag] if flag == "-v" || flag == "--version" => println!("askane {}", VERSION),
-        [_, path] => {
-            if let Err(e) = run_file(path, false, false) {
-                eprintln!("Error: {}", e);
-                process::exit(1);
-            }
+    let mut dump_bytecode = false;
+    let mut perms = Permissions::sandboxed();
+    let mut script_path: Option<String> = None;
+
+    for arg in &args[1..] {
+        if arg == "-h" || arg == "--help" {
+            print_help();
+            return;
         }
-        [_, flag, path] if flag == "-b" || flag == "--bytecode" => {
-            if let Err(e) = run_file(path, true, false) {
-                eprintln!("Error: {}", e);
-                process::exit(1);
-            }
+        if arg == "-v" || arg == "--version" {
+            println!("askane {}", VERSION);
+            return;
         }
-        [_, flag, path] if flag == "--unsafe" => {
-            if let Err(e) = run_file(path, false, true) {
-                eprintln!("Error: {}", e);
-                process::exit(1);
+        if arg == "-b" || arg == "--bytecode" {
+            dump_bytecode = true;
+        } else if arg == "--unsafe" {
+            perms = Permissions::unrestricted();
+        } else if arg == "--allow-net" {
+            append_csv(&mut perms.allow_net, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-net=") {
+            append_csv(&mut perms.allow_net, Some(val));
+        } else if arg == "--allow-read" {
+            append_csv_paths(&mut perms.allow_read, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-read=") {
+            append_csv_paths(&mut perms.allow_read, Some(val));
+        } else if arg == "--allow-write" {
+            append_csv_paths(&mut perms.allow_write, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-write=") {
+            append_csv_paths(&mut perms.allow_write, Some(val));
+        } else if arg == "--allow-env" {
+            append_csv(&mut perms.allow_env, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-env=") {
+            append_csv(&mut perms.allow_env, Some(val));
+        } else if arg == "--allow-args" {
+            perms.allow_sys_args = true;
+        } else if let Some(val) = arg.strip_prefix("--max-steps=") {
+            match val.parse::<u64>() {
+                Ok(n) => perms.max_instructions = Some(n),
+                Err(_) => {
+                    eprintln!("Invalid --max-steps value: {}", val);
+                    process::exit(1);
+                }
             }
-        }
-        _ => {
-            eprintln!("Invalid arguments. Run 'askane --help' for usage.");
+        } else if arg.starts_with('-') {
+            eprintln!("Unknown option '{}'. Run 'askane --help' for usage.", arg);
+            process::exit(1);
+        } else if script_path.is_none() {
+            script_path = Some(arg.clone());
+        } else {
+            eprintln!("Unexpected extra argument '{}'. Run 'askane --help' for usage.", arg);
             process::exit(1);
         }
+    }
+
+    let Some(path) = script_path else {
+        eprintln!("Missing script file. Run 'askane --help' for usage.");
+        process::exit(1);
+    };
+    if let Err(e) = run_file(&path, dump_bytecode, perms) {
+        eprintln!("Error: {}", e);
+        process::exit(1);
     }
 }
 
@@ -159,6 +255,98 @@ mod tests {
         let proto = compile_source(src).expect("compile failed");
         let mut vm = VM::new();
         vm.run(proto).expect("runtime failed")
+    }
+
+    #[test]
+    fn audit_recursive_syntax_and_chains_are_bounded() {
+        for source in [
+            "!".repeat(2000) + "true",
+            "a=".repeat(2000) + "1",
+            "if false { 0 } else ".repeat(200) + "{ 1 }",
+            "1+".repeat(2000) + "1",
+            "a.b".to_string() + &".b".repeat(2000),
+        ] {
+            assert!(compile_source(&source).is_err());
+        }
+    }
+
+    #[test]
+    fn audit_vm_recovers_after_error_with_captured_locals() {
+        let mut vm = VM::new();
+        let source = "let saved = unit; fn fail() { let x = 42; saved = || x; 1 / 0 } fail()";
+        assert!(vm.run(compile_source(source).unwrap()).is_err());
+        let value = vm.run(compile_source("saved() + 1").unwrap()).unwrap();
+        assert!(value.equals(&Value::Int(43)));
+    }
+
+    #[test]
+    fn audit_instruction_budget_and_private_apis() {
+        let mut vm = VM::new();
+        let err = vm
+            .run(compile_source("while true {} ").unwrap())
+            .unwrap_err();
+        assert!(err.contains("instruction limit"));
+        for source in [
+            "import sys; sys.args()",
+            "import sys; sys.exit()",
+            "import mem; mem.open(1)",
+        ] {
+            assert!(
+                VM::new()
+                    .run(compile_source(source).unwrap())
+                    .unwrap_err()
+                    .contains("disabled")
+            );
+        }
+        assert!(
+            vm.run(compile_source("42").unwrap())
+                .unwrap()
+                .equals(&Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn audit_json_strict_numbers_controls_and_depth() {
+        for raw in ["01", "1.", "1e", "1e+", "1e9999", "-01", "\"raw\nline\""] {
+            let source = format!("import json; json.parse({:?})", raw);
+            assert!(
+                VM::new().run(compile_source(&source).unwrap()).is_err(),
+                "accepted {raw:?}"
+            );
+        }
+        let source = "import json; let a = []; for i in range(100) { a = [a]; } json.stringify(a)";
+        assert!(
+            VM::new()
+                .run(compile_source(source).unwrap())
+                .unwrap_err()
+                .contains("nesting depth")
+        );
+    }
+
+    #[test]
+    fn audit_sandbox_devices_and_traversal() {
+        let vm = VM::new();
+        for path in ["NUL", "CON.txt", "COM1", "file:secret", "file.", "file "] {
+            assert!(vm.resolve_read_path(path).is_err(), "accepted {path}");
+        }
+        assert!(vm.resolve_read_path("../outside.ask").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_http_injection_and_network_policy() {
+        let source = "import http; http.post(\"https://example.com\", \"\", \"text/plain\\r\\nX-Injected: yes\")";
+        let err = VM::new_with_sandbox(false)
+            .run(compile_source(source).unwrap())
+            .unwrap_err();
+        assert!(err.contains("Invalid Content-Type"));
+        let source = "import http; http.get(\"https://example.com\")";
+        assert!(
+            VM::new()
+                .run(compile_source(source).unwrap())
+                .unwrap_err()
+                .contains("Network is disabled")
+        );
     }
 
     #[test]
@@ -289,17 +477,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_mem_module_current_process() {
-        let val = eval(
-            r#"
-            import mem;
-            let pid = mem.current_pid();
-            let h = mem.open(pid);
-            let ok = pid > 0 && h != 0;
-            mem.close(h);
-            ok
-            "#,
-        );
-        assert!(val.equals(&Value::Bool(true)));
+        let mut vm = VM::new();
+        let err = vm
+            .run(compile_source("import mem; mem.current_pid()").unwrap())
+            .unwrap_err();
+        assert!(err.contains("disabled in sandbox"));
     }
 
     #[test]
@@ -495,7 +677,11 @@ mod tests {
         .unwrap();
         let mut vm_sb = VM::new_with_sandbox(true);
         let err = vm_sb.run(proto_env).unwrap_err();
-        assert!(err.contains("disabled in sandbox"), "unexpected err: {}", err);
+        assert!(
+            err.contains("disabled in sandbox"),
+            "unexpected err: {}",
+            err
+        );
 
         // 2. JSON UTF-16 surrogate pair decoding
         let val = eval(
@@ -524,6 +710,102 @@ mod tests {
                 && type_of(gfx.mouse_x) == "fn"
                 && type_of(gfx.mouse_y) == "fn"
                 && type_of(gfx.mouse_down) == "fn"
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_v011_permissions() {
+        let mut perms = Permissions::sandboxed();
+        perms.allow_env = Some(vec!["PATH".to_string()]);
+        perms.allow_net = Some(vec!["api.example.com".to_string()]);
+        perms.allow_sys_args = true;
+        let mut vm = VM::new();
+        vm.set_permissions(perms);
+
+        assert!(vm.check_net("https://api.example.com/v1").is_ok());
+        assert!(vm.check_net("https://evil.com/").is_err());
+
+        let proto_ok = compile_source(
+            r#"
+            import sys;
+            type_of(sys.args()) == "list" && sys.env("PATH") != unit
+            "#,
+        )
+        .unwrap();
+        assert!(vm.run(proto_ok).unwrap().equals(&Value::Bool(true)));
+
+        let proto_denied = compile_source(
+            r#"
+            import sys;
+            sys.env("USERNAME")
+            "#,
+        )
+        .unwrap();
+        let err = vm.run(proto_denied).unwrap_err();
+        assert!(err.contains("allow-env=USERNAME"), "err: {}", err);
+
+        // Read-only permission allows reading outside sandbox but still blocks writing
+        let mut perms_ro = Permissions::sandboxed();
+        perms_ro.allow_read = Some(vec![std::env::temp_dir()]);
+        let mut vm_ro = VM::new();
+        vm_ro.set_permissions(perms_ro);
+        let temp_file = std::env::temp_dir().join("askane_ro_test.txt");
+        assert!(vm_ro.resolve_read_path(&temp_file.to_string_lossy()).is_ok());
+        assert!(vm_ro.resolve_write_path(&temp_file.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn test_v011_try_catch_and_throw() {
+        let val = eval(
+            r#"
+            import json;
+            let a = try {
+                json.parse("{bad")
+            } catch err {
+                "caught"
+            };
+            let b = try {
+                throw "boom";
+                1
+            } catch (e) {
+                e
+            };
+            fn inner() { 10 / 0 }
+            fn outer() { inner() }
+            let c = try {
+                outer()
+            } catch e {
+                42
+            };
+            let d = try {
+                try { throw "inner"; } catch _ { throw "rethrow"; }
+            } catch outer_err {
+                let f = || outer_err;
+                f()
+            };
+            [a, b, c, d]
+            "#,
+        );
+        let expected = eval(r#"["caught", "boom", 42, "rethrow"]"#);
+        assert!(val.equals(&expected));
+    }
+
+    #[test]
+    fn test_v011_lazy_range() {
+        let val = eval(
+            r#"
+            let r = range(0, 1000000000);
+            let sum = 0;
+            for i in range(1, 6) {
+                sum = sum + i;
+            }
+            type_of(r) == "range"
+                && len(r) == 1000000000
+                && r[500000000] == 500000000
+                && r[-1] == 999999999
+                && sum == 15
             "#,
         );
         assert!(val.equals(&Value::Bool(true)));

@@ -19,7 +19,51 @@ struct CallFrame {
     base: usize,
 }
 
+#[derive(Clone)]
+struct TryHandler {
+    frame_depth: usize,
+    stack_len: usize,
+    catch_ip: usize,
+}
+
 const MAX_CALL_DEPTH: usize = 1024;
+
+#[derive(Clone, Debug)]
+pub struct Permissions {
+    pub allow_all: bool,
+    pub allow_net: Option<Vec<String>>,
+    pub allow_read: Option<Vec<PathBuf>>,
+    pub allow_write: Option<Vec<PathBuf>>,
+    pub allow_env: Option<Vec<String>>,
+    pub allow_sys_args: bool,
+    pub max_instructions: Option<u64>,
+}
+
+impl Permissions {
+    pub fn sandboxed() -> Self {
+        Self {
+            allow_all: false,
+            allow_net: None,
+            allow_read: None,
+            allow_write: None,
+            allow_env: None,
+            allow_sys_args: false,
+            max_instructions: Some(10_000_000),
+        }
+    }
+
+    pub fn unrestricted() -> Self {
+        Self {
+            allow_all: true,
+            allow_net: Some(Vec::new()),
+            allow_read: Some(Vec::new()),
+            allow_write: Some(Vec::new()),
+            allow_env: Some(Vec::new()),
+            allow_sys_args: true,
+            max_instructions: None,
+        }
+    }
+}
 
 pub struct VM {
     stack: Vec<Value>,
@@ -30,8 +74,11 @@ pub struct VM {
     current_dir: PathBuf,
     sandbox_root: PathBuf,
     sandboxed: bool,
+    permissions: Permissions,
     module_cache: HashMap<String, Value>,
     loading_modules: HashSet<String>,
+    instructions_left: u64,
+    try_handlers: Vec<TryHandler>,
 }
 
 impl VM {
@@ -41,6 +88,12 @@ impl VM {
 
     pub fn new_with_sandbox(sandboxed: bool) -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let permissions = if sandboxed {
+            Permissions::sandboxed()
+        } else {
+            Permissions::unrestricted()
+        };
+        let instructions_left = permissions.max_instructions.unwrap_or(u64::MAX);
         let mut vm = Self {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
@@ -50,11 +103,20 @@ impl VM {
             current_dir,
             sandbox_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             sandboxed,
+            permissions,
             module_cache: HashMap::new(),
             loading_modules: HashSet::new(),
+            instructions_left,
+            try_handlers: Vec::new(),
         };
         vm.register_natives();
         vm
+    }
+
+    pub fn set_permissions(&mut self, permissions: Permissions) {
+        self.sandboxed = !permissions.allow_all;
+        self.instructions_left = permissions.max_instructions.unwrap_or(u64::MAX);
+        self.permissions = permissions;
     }
 
     pub fn set_current_dir(&mut self, dir: PathBuf) {
@@ -69,19 +131,120 @@ impl VM {
         self.sandboxed
     }
 
-    /// Resolve a script-controlled path without allowing it to escape the script directory.
-    pub fn resolve_path(&self, input: &str) -> Result<PathBuf, String> {
+    pub fn check_net(&self, url: &str) -> Result<(), String> {
+        if self.permissions.allow_all {
+            return Ok(());
+        }
+        let Some(allowed) = &self.permissions.allow_net else {
+            return Err("Network is disabled in sandbox mode (pass --allow-net or --unsafe)".to_string());
+        };
+        if allowed.is_empty() {
+            return Ok(());
+        }
+        let rest = url
+            .strip_prefix("https://")
+            .ok_or_else(|| "Only https:// URLs are allowed".to_string())?;
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host_only = if host_port.starts_with('[') {
+            host_port
+                .find(']')
+                .map(|i| &host_port[..=i])
+                .unwrap_or(host_port)
+        } else {
+            host_port.split(':').next().unwrap_or(host_port)
+        };
+        if allowed
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(host_port) || p.eq_ignore_ascii_case(host_only))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "Network access to '{}' is not allowed (pass --allow-net={})",
+                host_port, host_port
+            ))
+        }
+    }
+
+    pub fn check_env(&self, name: &str) -> Result<(), String> {
+        if self.permissions.allow_all {
+            return Ok(());
+        }
+        let Some(allowed) = &self.permissions.allow_env else {
+            return Err(
+                "sys.env() is disabled in sandbox mode (run with --allow-env or --unsafe to allow)"
+                    .to_string(),
+            );
+        };
+        if allowed.is_empty() || allowed.iter().any(|k| k == name) {
+            Ok(())
+        } else {
+            Err(format!(
+                "sys.env('{}') is disabled in sandbox mode (pass --allow-env={})",
+                name, name
+            ))
+        }
+    }
+
+    pub fn check_sys_args(&self) -> Result<(), String> {
+        if self.permissions.allow_all || self.permissions.allow_sys_args {
+            Ok(())
+        } else {
+            Err("sys.args() is disabled in sandbox mode (pass --allow-args or --unsafe)".to_string())
+        }
+    }
+
+    pub fn resolve_read_path(&self, input: &str) -> Result<PathBuf, String> {
+        self.resolve_path_with_roots(input, &self.permissions.allow_read)
+    }
+
+    pub fn resolve_write_path(&self, input: &str) -> Result<PathBuf, String> {
+        self.resolve_path_with_roots(input, &self.permissions.allow_write)
+    }
+
+    fn resolve_path_with_roots(
+        &self,
+        input: &str,
+        extra_roots: &Option<Vec<PathBuf>>,
+    ) -> Result<PathBuf, String> {
         let raw = Path::new(input);
         let candidate = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
             self.current_dir.join(raw)
         };
-        if !self.sandboxed {
+        if self.permissions.allow_all {
             return Ok(candidate);
         }
-        let root =
-            fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
+        // Reject Windows device names, alternate data streams and ambiguous names
+        // before Win32 can reinterpret them. The drive prefix is handled separately.
+        for component in raw.components() {
+            if let std::path::Component::Normal(name) = component {
+                let name = name.to_string_lossy();
+                let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+                if name.contains(':')
+                    || name.contains('\0')
+                    || name.ends_with(['.', ' '])
+                    || matches!(
+                        stem.as_str(),
+                        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+                    )
+                    || (stem.len() == 4
+                        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                        && stem.as_bytes()[3].is_ascii_digit())
+                {
+                    return Err(
+                        "path is outside the sandbox policy (device or ambiguous name)".to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(dirs) = extra_roots {
+            if dirs.is_empty() {
+                return Ok(candidate);
+            }
+        }
         let existing = if candidate.symlink_metadata().is_ok() {
             fs::canonicalize(&candidate).map_err(|e| format!("path '{}': {}", input, e))?
         } else {
@@ -96,11 +259,21 @@ impl VM {
                     .ok_or_else(|| "invalid path".to_string())?,
             )
         };
+        let root =
+            fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
         if existing == root || existing.starts_with(&root) {
-            Ok(existing)
-        } else {
-            Err(format!("path '{}' is outside the sandbox", input))
+            return Ok(existing);
         }
+        if let Some(dirs) = extra_roots {
+            for dir in dirs {
+                if let Ok(allowed_root) = fs::canonicalize(dir) {
+                    if existing == allowed_root || existing.starts_with(&allowed_root) {
+                        return Ok(existing);
+                    }
+                }
+            }
+        }
+        Err(format!("path '{}' is outside the sandbox", input))
     }
 
     fn register_natives(&mut self) {
@@ -133,6 +306,13 @@ impl VM {
     }
 
     pub fn run(&mut self, proto: Rc<FunctionProto>) -> Result<Value, String> {
+        if self.frames.len() >= MAX_CALL_DEPTH || self.loading_modules.len() > 32 {
+            return Err("Maximum call/import depth exceeded".to_string());
+        }
+        if self.frames.is_empty() {
+            self.instructions_left = self.permissions.max_instructions.unwrap_or(u64::MAX);
+            self.try_handlers.clear();
+        }
         let closure = Rc::new(Closure {
             proto,
             upvalues: Vec::new(),
@@ -157,6 +337,13 @@ impl VM {
                 self.close_upvalues_from(stack_base);
                 self.frames.truncate(base_depth);
                 self.stack.truncate(stack_base);
+                while self
+                    .try_handlers
+                    .last()
+                    .is_some_and(|h| h.frame_depth > base_depth)
+                {
+                    self.try_handlers.pop();
+                }
                 Err(msg)
             }
         }
@@ -177,7 +364,10 @@ impl VM {
             } else {
                 0
             };
-            out.push_str(&format!("\n  at {} (line {})", frame.closure.proto.name, line));
+            out.push_str(&format!(
+                "\n  at {} (line {})",
+                frame.closure.proto.name, line
+            ));
         }
         out
     }
@@ -217,15 +407,43 @@ impl VM {
 
     fn execute(&mut self, target_depth: usize) -> Result<Value, String> {
         loop {
-            let (op, line) = {
-                let frame = self.frames.last_mut().unwrap();
-                let op = frame.closure.proto.chunk.code[frame.ip];
-                let line = frame.closure.proto.chunk.lines[frame.ip];
-                frame.ip += 1;
-                (op, line)
-            };
+            if self.permissions.max_instructions.is_some() {
+                if self.instructions_left == 0 {
+                    return Err("Sandbox instruction limit exceeded".to_string());
+                }
+                self.instructions_left -= 1;
+            }
+            match self.step(target_depth) {
+                Ok(Some(val)) => return Ok(val),
+                Ok(None) => {}
+                Err(err) => {
+                    if let Some(handler) = self.try_handlers.last().cloned() {
+                        if handler.frame_depth > target_depth {
+                            self.try_handlers.pop();
+                            self.frames.truncate(handler.frame_depth);
+                            self.close_upvalues_from(handler.stack_len);
+                            self.stack.truncate(handler.stack_len);
+                            self.stack.push(Value::Str(err));
+                            self.frames.last_mut().unwrap().ip = handler.catch_ip;
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
 
-            match op {
+    fn step(&mut self, target_depth: usize) -> Result<Option<Value>, String> {
+        let (op, line) = {
+            let frame = self.frames.last_mut().unwrap();
+            let op = frame.closure.proto.chunk.code[frame.ip];
+            let line = frame.closure.proto.chunk.lines[frame.ip];
+            frame.ip += 1;
+            (op, line)
+        };
+
+        match op {
                 Op::Constant(idx) => {
                     let val = self.read_constant(idx);
                     self.stack.push(val);
@@ -274,9 +492,10 @@ impl VM {
                         Constant::Str(s) => s.as_str(),
                         _ => unreachable!(),
                     };
-                    let val = self.globals.get(name).cloned().ok_or_else(|| {
-                        format!("[line {}] Undefined variable '{}'", line, name)
-                    })?;
+                    let val =
+                        self.globals.get(name).cloned().ok_or_else(|| {
+                            format!("[line {}] Undefined variable '{}'", line, name)
+                        })?;
                     self.stack.push(val);
                 }
                 Op::DefineGlobal(idx) => {
@@ -488,7 +707,8 @@ impl VM {
                             Constant::Function(p) => p.clone(),
                             _ => unreachable!(),
                         };
-                        let descs = frame.closure.proto.chunk.upvalue_lists[uv_idx as usize].clone();
+                        let descs =
+                            frame.closure.proto.chunk.upvalue_lists[uv_idx as usize].clone();
                         (proto, descs)
                     };
                     let mut upvalues = Vec::with_capacity(upvalue_descs.len());
@@ -563,6 +783,21 @@ impl VM {
                         }
                         (Value::Dict(dict), Value::Str(key)) => {
                             dict.borrow().get(&key).cloned().unwrap_or(Value::Unit)
+                        }
+                        (Value::Range { start, end }, Value::Int(i)) => {
+                            let len = if end > start {
+                                (end as i128) - (start as i128)
+                            } else {
+                                0
+                            };
+                            let actual = if i < 0 { len + i as i128 } else { i as i128 };
+                            if actual < 0 || actual >= len {
+                                return Err(format!(
+                                    "[line {}] Index {} out of bounds for range of length {}",
+                                    line, i, len
+                                ));
+                            }
+                            Value::Int((start as i128 + actual) as i64)
                         }
                         (o, i) => {
                             return Err(format!(
@@ -641,12 +876,13 @@ impl VM {
                         let attr = self.read_string(idx);
                         match obj {
                             Value::Module { name, exports } => {
-                                let val = exports.borrow().get(&attr).cloned().ok_or_else(|| {
-                                    format!(
-                                        "[line {}] Module '{}' has no export '{}'",
-                                        line, name, attr
-                                    )
-                                })?;
+                                let val =
+                                    exports.borrow().get(&attr).cloned().ok_or_else(|| {
+                                        format!(
+                                            "[line {}] Module '{}' has no export '{}'",
+                                            line, name, attr
+                                        )
+                                    })?;
                                 self.stack.push(val);
                             }
                             Value::Dict(dict) => {
@@ -706,18 +942,39 @@ impl VM {
                         exports: Rc::new(RefCell::new(exports)),
                     });
                 }
+                Op::SetupTry(catch_ip) => {
+                    self.try_handlers.push(TryHandler {
+                        frame_depth: self.frames.len(),
+                        stack_len: self.stack.len(),
+                        catch_ip,
+                    });
+                }
+                Op::PopTry => {
+                    self.try_handlers.pop();
+                }
+                Op::Throw => {
+                    let val = self.stack.pop().unwrap();
+                    return Err(val.to_string());
+                }
                 Op::Return => {
                     let result = self.stack.pop().unwrap();
                     let frame = self.frames.pop().unwrap();
+                    while self
+                        .try_handlers
+                        .last()
+                        .is_some_and(|h| h.frame_depth > self.frames.len())
+                    {
+                        self.try_handlers.pop();
+                    }
                     self.close_upvalues_from(frame.base);
                     self.stack.truncate(frame.base);
                     if self.frames.len() == target_depth {
-                        return Ok(result);
+                        return Ok(Some(result));
                     }
                     self.stack.push(result);
                 }
             }
-        }
+        Ok(None)
     }
 
     fn read_constant(&self, idx: u16) -> Value {
@@ -772,6 +1029,9 @@ impl VM {
 
     fn load_module(&mut self, source: &str, is_path: bool) -> Result<Value, String> {
         if !is_path {
+            if source == "mem" && self.sandboxed {
+                return Err("mem is disabled in sandbox mode (requires --unsafe and ASKANE_ENABLE_UNSAFE_MEM=1)".to_string());
+            }
             if let Some(cached) = self.module_cache.get(source) {
                 return Ok(cached.clone());
             }
@@ -782,10 +1042,11 @@ impl VM {
             }
         }
 
-        let mut file_path = self.resolve_path(source)?;
+        let mut file_path = PathBuf::from(source);
         if file_path.extension().is_none() {
             file_path.set_extension("ask");
         }
+        let file_path = self.resolve_read_path(&file_path.to_string_lossy())?;
 
         let cache_key = fs::canonicalize(&file_path)
             .unwrap_or_else(|_| file_path.clone())
@@ -802,7 +1063,7 @@ impl VM {
             ));
         }
 
-        let code = match fs::read_to_string(&file_path) {
+        let code = match crate::read_text_limited(&file_path, crate::MAX_SOURCE_BYTES) {
             Ok(c) => c,
             Err(e) => {
                 self.loading_modules.remove(&cache_key);
@@ -931,6 +1192,14 @@ fn native_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::List(l) => Ok(Value::Int(l.borrow().len() as i64)),
         Value::Dict(d) => Ok(Value::Int(d.borrow().len() as i64)),
+        Value::Range { start, end } => {
+            let len = if end > start {
+                (*end as i128) - (*start as i128)
+            } else {
+                0
+            };
+            Ok(Value::Int(len.min(i64::MAX as i128) as i64))
+        }
         other => Err(format!("len() not supported for '{}'", other.type_name())),
     }
 }
@@ -970,21 +1239,34 @@ fn native_range(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         [Value::Int(start), Value::Int(end)] => (*start, *end),
         _ => return Err("range() expects (end) or (start, end) integers".to_string()),
     };
-    if end > start && (end as i128 - start as i128) > 10_000_000 {
-        return Err("range() size exceeds maximum limit of 10,000,000".to_string());
+    Ok(Value::Range { start, end })
+}
+
+fn collect_iterable(val: &Value, fn_name: &str) -> Result<Vec<Value>, String> {
+    match val {
+        Value::List(l) => Ok(l.borrow().clone()),
+        Value::Range { start, end } => {
+            if *end > *start && (*end as i128 - *start as i128) > 10_000_000 {
+                return Err(format!(
+                    "{}() range size exceeds maximum limit of 10,000,000",
+                    fn_name
+                ));
+            }
+            Ok((*start..*end).map(Value::Int).collect())
+        }
+        other => Err(format!(
+            "{}() expects a list or range, got '{}'",
+            fn_name,
+            other.type_name()
+        )),
     }
-    let items = (start..end).map(Value::Int).collect();
-    Ok(Value::List(Rc::new(RefCell::new(items))))
 }
 
 fn native_map(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("map() expects 2 arguments, got {}", args.len()));
     }
-    let items = match &args[0] {
-        Value::List(l) => l.borrow().clone(),
-        other => return Err(format!("map() expects a list, got '{}'", other.type_name())),
-    };
+    let items = collect_iterable(&args[0], "map")?;
     let func = args[1].clone();
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -997,15 +1279,7 @@ fn native_filter(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("filter() expects 2 arguments, got {}", args.len()));
     }
-    let items = match &args[0] {
-        Value::List(l) => l.borrow().clone(),
-        other => {
-            return Err(format!(
-                "filter() expects a list, got '{}'",
-                other.type_name()
-            ));
-        }
-    };
+    let items = collect_iterable(&args[0], "filter")?;
     let func = args[1].clone();
     let mut out = Vec::new();
     for item in items {
@@ -1021,15 +1295,7 @@ fn native_reduce(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err(format!("reduce() expects 3 arguments, got {}", args.len()));
     }
-    let items = match &args[0] {
-        Value::List(l) => l.borrow().clone(),
-        other => {
-            return Err(format!(
-                "reduce() expects a list, got '{}'",
-                other.type_name()
-            ));
-        }
-    };
+    let items = collect_iterable(&args[0], "reduce")?;
     let mut acc = args[1].clone();
     let func = args[2].clone();
     for item in items {

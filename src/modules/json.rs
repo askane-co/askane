@@ -47,6 +47,12 @@ fn json_stringify(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn stringify_value(val: &Value, out: &mut String, seen: &mut HashSet<usize>) -> Result<(), String> {
+    if seen.len() >= 64 {
+        return Err("json.stringify(): maximum nesting depth exceeded".to_string());
+    }
+    if out.len() > 32 * 1024 * 1024 {
+        return Err("json.stringify(): output size limit exceeded".to_string());
+    }
     match val {
         Value::Unit => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -210,17 +216,41 @@ impl<'a> JsonParser<'a> {
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
-        let mut is_float = false;
-        while let Some(b) = self.peek() {
-            if b.is_ascii_digit() {
+        match self.peek() {
+            Some(b'0') => {
                 self.pos += 1;
-            } else if b == b'.' || b == b'e' || b == b'E' || b == b'+' || b == b'-' {
-                if b == b'.' || b == b'e' || b == b'E' {
-                    is_float = true;
+            }
+            Some(b'1'..=b'9') => {
+                while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                    self.pos += 1;
                 }
+            }
+            _ => return Err("json.parse(): invalid number".to_string()),
+        }
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            let digits = self.pos;
+            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
                 self.pos += 1;
-            } else {
-                break;
+            }
+            if self.pos == digits {
+                return Err("json.parse(): missing fraction digits".to_string());
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            let digits = self.pos;
+            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                self.pos += 1;
+            }
+            if self.pos == digits {
+                return Err("json.parse(): missing exponent digits".to_string());
             }
         }
         let slice = std::str::from_utf8(&self.bytes[start..self.pos])
@@ -229,6 +259,9 @@ impl<'a> JsonParser<'a> {
             let f: f64 = slice
                 .parse()
                 .map_err(|_| format!("json.parse(): invalid float '{}'", slice))?;
+            if !f.is_finite() {
+                return Err("json.parse(): number out of range".to_string());
+            }
             Ok(Value::Float(f))
         } else {
             let i: i64 = slice
@@ -282,8 +315,7 @@ impl<'a> JsonParser<'a> {
                             let low = u32::from_str_radix(low_hex, 16)
                                 .map_err(|_| "json.parse(): invalid \\u hex".to_string())?;
                             if (0xDC00..=0xDFFF).contains(&low) {
-                                let combined =
-                                    0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+                                let combined = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
                                 out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
                                 self.pos += 6;
                             } else {
@@ -300,6 +332,8 @@ impl<'a> JsonParser<'a> {
                         ));
                     }
                 }
+            } else if b < 0x20 {
+                return Err("json.parse(): unescaped control character".to_string());
             } else if b < 0x80 {
                 out.push(b as char);
             } else {

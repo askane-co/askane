@@ -85,6 +85,10 @@ pub enum Op {
     Import(u16, bool),
     MakeModule(u16, u16),
 
+    SetupTry(usize),
+    PopTry,
+    Throw,
+
     Return,
 }
 
@@ -94,6 +98,7 @@ pub struct Chunk {
     pub constants: Vec<Constant>,
     pub lines: Vec<usize>,
     pub upvalue_lists: Vec<Vec<UpvalueDesc>>,
+    pub limit_exceeded: bool,
 }
 
 impl Chunk {
@@ -105,6 +110,10 @@ impl Chunk {
     }
 
     pub fn add_constant(&mut self, c: Constant) -> u16 {
+        if self.constants.len() > u16::MAX as usize {
+            self.limit_exceeded = true;
+            return 0;
+        }
         self.constants.push(c);
         (self.constants.len() - 1) as u16
     }
@@ -121,6 +130,10 @@ impl Chunk {
     }
 
     pub fn add_upvalue_list(&mut self, list: Vec<UpvalueDesc>) -> u16 {
+        if self.upvalue_lists.len() > u16::MAX as usize {
+            self.limit_exceeded = true;
+            return 0;
+        }
         self.upvalue_lists.push(list);
         (self.upvalue_lists.len() - 1) as u16
     }
@@ -131,7 +144,8 @@ impl Chunk {
             | Op::JumpIfFalsePop(target)
             | Op::JumpIfFalsePeek(target)
             | Op::JumpIfTruePeek(target)
-            | Op::JumpIfNotUnitPeek(target) => {
+            | Op::JumpIfNotUnitPeek(target)
+            | Op::SetupTry(target) => {
                 *target = target_ip;
             }
             other => panic!("Cannot patch non-jump op: {:?}", other),
@@ -164,9 +178,7 @@ impl Chunk {
                     let upval_len = self.upvalue_lists[*uv_idx as usize].len();
                     format!(
                         "Closure({}, {} upvalues) ; {}",
-                        idx,
-                        upval_len,
-                        self.constants[*idx as usize]
+                        idx, upval_len, self.constants[*idx as usize]
                     )
                 }
                 other => format!("{:?}", other),

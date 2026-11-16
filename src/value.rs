@@ -32,6 +32,10 @@ pub enum Value {
     Str(String),
     List(Rc<RefCell<Vec<Value>>>),
     Dict(Rc<RefCell<HashMap<String, Value>>>),
+    Range {
+        start: i64,
+        end: i64,
+    },
     Unit,
     Closure(Rc<Closure>),
     NativeFn(NativeFunction),
@@ -51,6 +55,7 @@ impl Value {
             Value::Str(s) => !s.is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
             Value::Dict(d) => !d.borrow().is_empty(),
+            Value::Range { start, end } => end > start,
             _ => true,
         }
     }
@@ -63,6 +68,7 @@ impl Value {
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Dict(_) => "dict",
+            Value::Range { .. } => "range",
             Value::Unit => "unit",
             Value::Closure(_) | Value::NativeFn(_) => "fn",
             Value::Module { .. } => "module",
@@ -114,6 +120,9 @@ impl Value {
             }
             (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
             (Value::NativeFn(a), Value::NativeFn(b)) => std::ptr::fn_addr_eq(a.func, b.func),
+            (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
+                s1 == s2 && e1 == e2
+            }
             (Value::Module { exports: a, .. }, Value::Module { exports: b, .. }) => {
                 Rc::ptr_eq(a, b)
             }
@@ -137,6 +146,9 @@ impl fmt::Display for Value {
 
 impl Value {
     fn fmt_with_seen(&self, f: &mut fmt::Formatter<'_>, seen: &mut HashSet<usize>) -> fmt::Result {
+        if seen.len() >= 64 {
+            return write!(f, "<depth limit>");
+        }
         match self {
             Value::Int(v) => write!(f, "{}", v),
             Value::Float(v) => {
@@ -193,6 +205,7 @@ impl Value {
                 write!(f, "}}")
             }
             Value::Module { name, .. } => write!(f, "<module {}>", name),
+            Value::Range { start, end } => write!(f, "range({}, {})", start, end),
         }
     }
 }

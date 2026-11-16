@@ -91,6 +91,7 @@ mod win32_gfx {
         time: u32,
         pt_x: i32,
         pt_y: i32,
+        l_private: u32,
     }
 
     #[repr(C)]
@@ -365,7 +366,8 @@ mod win32_gfx {
 
     pub fn close_window() {
         WINDOW.with(|w| {
-            if let Some(state) = w.borrow_mut().take() {
+            let state = w.borrow_mut().take();
+            if let Some(state) = state {
                 if !state.hwnd.is_null() && state.open {
                     unsafe {
                         DestroyWindow(state.hwnd);
@@ -445,8 +447,12 @@ fn rgb(r: i64, g: i64, b: i64) -> u32 {
 #[cfg(windows)]
 fn as_int(v: &Value, fn_name: &str) -> Result<i64, String> {
     match v {
-        Value::Int(i) => Ok(*i),
-        Value::Float(f) => Ok(*f as i64),
+        Value::Int(i) if (-32767..=32767).contains(i) => Ok(*i),
+        Value::Float(f) if f.is_finite() && (-32767.0..=32767.0).contains(f) => Ok(*f as i64),
+        Value::Int(_) | Value::Float(_) => Err(format!(
+            "gfx.{}(): numeric argument must be finite and between -32767 and 32767",
+            fn_name
+        )),
         other => Err(format!(
             "gfx.{}() expects integer, got '{}'",
             fn_name,
@@ -745,7 +751,9 @@ fn gfx_mouse_y(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 #[cfg(windows)]
 fn gfx_mouse_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
-        return Err("gfx.mouse_down() expects 1 argument (\"left\" | \"right\" | \"middle\")".to_string());
+        return Err(
+            "gfx.mouse_down() expects 1 argument (\"left\" | \"right\" | \"middle\")".to_string(),
+        );
     }
     let btn = match &args[0] {
         Value::Str(s) => s.to_lowercase(),

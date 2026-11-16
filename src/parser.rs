@@ -205,7 +205,7 @@ impl Parser {
         let expr = self.parse_coalesce()?;
         if self.match_kind(&TokenKind::Assign) {
             let span = expr.span();
-            let value = self.parse_assign()?;
+            let value = self.parse_expr()?;
             let target = match expr {
                 Expr::Ident(name, _) => AssignTarget::Var(name),
                 Expr::Index { object, index, .. } => AssignTarget::Index { object, index },
@@ -227,8 +227,10 @@ impl Parser {
     }
 
     fn parse_coalesce(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_or()?;
         while self.match_kind(&TokenKind::DoubleQuestion) {
+            self.check_chain(start)?;
             let span = expr.span();
             let right = self.parse_or()?;
             expr = Expr::NullCoalesce {
@@ -241,8 +243,10 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_and()?;
         while self.match_kind(&TokenKind::Or) {
+            self.check_chain(start)?;
             let span = expr.span();
             let right = self.parse_and()?;
             expr = Expr::Binary {
@@ -256,8 +260,10 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_equality()?;
         while self.match_kind(&TokenKind::And) {
+            self.check_chain(start)?;
             let span = expr.span();
             let right = self.parse_equality()?;
             expr = Expr::Binary {
@@ -271,8 +277,10 @@ impl Parser {
     }
 
     fn parse_equality(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_comparison()?;
         loop {
+            self.check_chain(start)?;
             let op = if self.match_kind(&TokenKind::Eq) {
                 BinaryOp::Eq
             } else if self.match_kind(&TokenKind::Ne) {
@@ -293,8 +301,10 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_pipe()?;
         loop {
+            self.check_chain(start)?;
             let op = if self.match_kind(&TokenKind::Lt) {
                 BinaryOp::Lt
             } else if self.match_kind(&TokenKind::Le) {
@@ -319,8 +329,10 @@ impl Parser {
     }
 
     fn parse_pipe(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_term()?;
         while self.match_kind(&TokenKind::Pipe) {
+            self.check_chain(start)?;
             let right = self.parse_term()?;
             let span = right.span();
             expr = match right {
@@ -347,8 +359,10 @@ impl Parser {
     }
 
     fn parse_term(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_factor()?;
         loop {
+            self.check_chain(start)?;
             let op = if self.match_kind(&TokenKind::Plus) {
                 BinaryOp::Add
             } else if self.match_kind(&TokenKind::Minus) {
@@ -369,8 +383,10 @@ impl Parser {
     }
 
     fn parse_factor(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_unary()?;
         loop {
+            self.check_chain(start)?;
             let op = if self.match_kind(&TokenKind::Star) {
                 BinaryOp::Mul
             } else if self.match_kind(&TokenKind::Slash) {
@@ -395,7 +411,7 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, String> {
         let span = self.current_span();
         if self.match_kind(&TokenKind::Minus) {
-            let expr = self.parse_unary()?;
+            let expr = self.parse_nested_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
                 expr: Box::new(expr),
@@ -403,19 +419,43 @@ impl Parser {
             });
         }
         if self.match_kind(&TokenKind::Bang) {
-            let expr = self.parse_unary()?;
+            let expr = self.parse_nested_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(expr),
                 span,
             });
         }
+        if self.match_kind(&TokenKind::Throw) {
+            if self.depth >= MAX_PARSE_DEPTH {
+                return Err("Maximum expression nesting depth exceeded".to_string());
+            }
+            self.depth += 1;
+            let value = self.parse_expr();
+            self.depth -= 1;
+            return Ok(Expr::Throw {
+                value: Box::new(value?),
+                span,
+            });
+        }
         self.parse_postfix()
     }
 
+    fn parse_nested_unary(&mut self) -> Result<Expr, String> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err("Maximum expression nesting depth exceeded".to_string());
+        }
+        self.depth += 1;
+        let result = self.parse_unary();
+        self.depth -= 1;
+        result
+    }
+
     fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let mut expr = self.parse_primary()?;
         loop {
+            self.check_chain(start)?;
             if self.match_kind(&TokenKind::LParen) {
                 let span = expr.span();
                 let mut args = Vec::new();
@@ -485,8 +525,10 @@ impl Parser {
             }
             TokenKind::InterpStart(first) => {
                 self.advance();
+                let start = self.pos;
                 let mut acc = Expr::Str(first, span);
                 loop {
+                    self.check_chain(start)?;
                     let expr = self.parse_expr()?;
                     let expr_span = expr.span();
                     let str_call = Expr::Call {
@@ -602,6 +644,7 @@ impl Parser {
             }
             TokenKind::LBrace => self.parse_block(),
             TokenKind::If => self.parse_if(),
+            TokenKind::Try => self.parse_try(),
             TokenKind::Match => self.parse_match(),
             TokenKind::Fn => {
                 self.advance();
@@ -668,6 +711,17 @@ impl Parser {
         Ok(Expr::Block { stmts, tail, span })
     }
 
+    fn check_chain(&self, start: usize) -> Result<(), String> {
+        if self.pos.saturating_sub(start) > 512 {
+            Err(
+                "Expression token/chain limit exceeded (split into smaller expressions)"
+                    .to_string(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+
     fn parse_if(&mut self) -> Result<Expr, String> {
         let span = self.current_span();
         self.expect(&TokenKind::If, "Expected 'if'")?;
@@ -675,7 +729,7 @@ impl Parser {
         let then_branch = self.parse_block()?;
         let else_branch = if self.match_kind(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
-                Some(Box::new(self.parse_if()?))
+                Some(Box::new(self.parse_expr()?))
             } else {
                 Some(Box::new(self.parse_block()?))
             }
@@ -686,6 +740,29 @@ impl Parser {
             cond: Box::new(cond),
             then_branch: Box::new(then_branch),
             else_branch,
+            span,
+        })
+    }
+
+    fn parse_try(&mut self) -> Result<Expr, String> {
+        let span = self.current_span();
+        self.expect(&TokenKind::Try, "Expected 'try'")?;
+        let try_body = self.parse_block()?;
+        self.expect(&TokenKind::Catch, "Expected 'catch' after 'try' block")?;
+        let catch_var = if self.match_kind(&TokenKind::LParen) {
+            let name = self.expect_ident("Expected error variable name in catch")?;
+            self.expect(&TokenKind::RParen, "Expected ')' after catch variable")?;
+            Some(name)
+        } else if matches!(self.peek_kind(), TokenKind::Ident(_)) {
+            Some(self.expect_ident("Expected error variable name in catch")?)
+        } else {
+            None
+        };
+        let catch_body = self.parse_block()?;
+        Ok(Expr::TryCatch {
+            try_body: Box::new(try_body),
+            catch_var,
+            catch_body: Box::new(catch_body),
             span,
         })
     }
@@ -875,6 +952,10 @@ impl Parser {
 fn is_block_expr(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::Block { .. } | Expr::If { .. } | Expr::Match { .. } | Expr::Fn { .. }
+        Expr::Block { .. }
+            | Expr::If { .. }
+            | Expr::TryCatch { .. }
+            | Expr::Match { .. }
+            | Expr::Fn { .. }
     )
 }
