@@ -202,13 +202,14 @@ impl Parser {
     }
 
     fn parse_assign(&mut self) -> Result<Expr, String> {
-        let expr = self.parse_pipe()?;
+        let expr = self.parse_coalesce()?;
         if self.match_kind(&TokenKind::Assign) {
             let span = expr.span();
             let value = self.parse_assign()?;
             let target = match expr {
                 Expr::Ident(name, _) => AssignTarget::Var(name),
                 Expr::Index { object, index, .. } => AssignTarget::Index { object, index },
+                Expr::GetAttr { object, name, .. } => AssignTarget::Attr { object, name },
                 _ => {
                     return Err(format!(
                         "[{}:{}] Invalid assignment target",
@@ -225,29 +226,15 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_pipe(&mut self) -> Result<Expr, String> {
+    fn parse_coalesce(&mut self) -> Result<Expr, String> {
         let mut expr = self.parse_or()?;
-        while self.match_kind(&TokenKind::Pipe) {
+        while self.match_kind(&TokenKind::DoubleQuestion) {
+            let span = expr.span();
             let right = self.parse_or()?;
-            let span = right.span();
-            expr = match right {
-                Expr::Call {
-                    callee,
-                    mut args,
-                    span: call_span,
-                } => {
-                    args.insert(0, expr);
-                    Expr::Call {
-                        callee,
-                        args,
-                        span: call_span,
-                    }
-                }
-                other => Expr::Call {
-                    callee: Box::new(other),
-                    args: vec![expr],
-                    span,
-                },
+            expr = Expr::NullCoalesce {
+                left: Box::new(expr),
+                right: Box::new(right),
+                span,
             };
         }
         Ok(expr)
@@ -306,7 +293,7 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let mut expr = self.parse_term()?;
+        let mut expr = self.parse_pipe()?;
         loop {
             let op = if self.match_kind(&TokenKind::Lt) {
                 BinaryOp::Lt
@@ -320,12 +307,40 @@ impl Parser {
                 break;
             };
             let span = expr.span();
-            let right = self.parse_term()?;
+            let right = self.parse_pipe()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 op,
                 right: Box::new(right),
                 span,
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_pipe(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_term()?;
+        while self.match_kind(&TokenKind::Pipe) {
+            let right = self.parse_term()?;
+            let span = right.span();
+            expr = match right {
+                Expr::Call {
+                    callee,
+                    mut args,
+                    span: call_span,
+                } => {
+                    args.insert(0, expr);
+                    Expr::Call {
+                        callee,
+                        args,
+                        span: call_span,
+                    }
+                }
+                other => Expr::Call {
+                    callee: Box::new(other),
+                    args: vec![expr],
+                    span,
+                },
             };
         }
         Ok(expr)
@@ -438,6 +453,14 @@ impl Parser {
                     name,
                     span,
                 };
+            } else if self.match_kind(&TokenKind::QuestionDot) {
+                let span = expr.span();
+                let name = self.expect_ident("Expected property or method name after '?.'")?;
+                expr = Expr::OptGetAttr {
+                    object: Box::new(expr),
+                    name,
+                    span,
+                };
             } else {
                 break;
             }
@@ -459,6 +482,57 @@ impl Parser {
             TokenKind::Str(s) => {
                 self.advance();
                 Ok(Expr::Str(s, span))
+            }
+            TokenKind::InterpStart(first) => {
+                self.advance();
+                let mut acc = Expr::Str(first, span);
+                loop {
+                    let expr = self.parse_expr()?;
+                    let expr_span = expr.span();
+                    let str_call = Expr::Call {
+                        callee: Box::new(Expr::Ident("str".to_string(), expr_span)),
+                        args: vec![expr],
+                        span: expr_span,
+                    };
+                    acc = Expr::Binary {
+                        left: Box::new(acc),
+                        op: BinaryOp::Add,
+                        right: Box::new(str_call),
+                        span,
+                    };
+                    match self.peek_kind().clone() {
+                        TokenKind::InterpMid(mid) => {
+                            self.advance();
+                            if !mid.is_empty() {
+                                acc = Expr::Binary {
+                                    left: Box::new(acc),
+                                    op: BinaryOp::Add,
+                                    right: Box::new(Expr::Str(mid, span)),
+                                    span,
+                                };
+                            }
+                        }
+                        TokenKind::InterpEnd(end) => {
+                            self.advance();
+                            if !end.is_empty() {
+                                acc = Expr::Binary {
+                                    left: Box::new(acc),
+                                    op: BinaryOp::Add,
+                                    right: Box::new(Expr::Str(end, span)),
+                                    span,
+                                };
+                            }
+                            break;
+                        }
+                        other => {
+                            return Err(format!(
+                                "[{}:{}] Expected string interpolation continuation, got {:?}",
+                                span.line, span.col, other
+                            ));
+                        }
+                    }
+                }
+                Ok(acc)
             }
             TokenKind::Bool(b) => {
                 self.advance();
@@ -539,6 +613,37 @@ impl Parser {
                     span,
                 })
             }
+            TokenKind::Bar => {
+                self.advance();
+                let mut params = Vec::new();
+                if !self.check(&TokenKind::Bar) {
+                    loop {
+                        params.push(self.expect_ident("Expected parameter name")?);
+                        if !self.match_kind(&TokenKind::Comma) {
+                            break;
+                        }
+                        if self.check(&TokenKind::Bar) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::Bar, "Expected '|' after lambda parameters")?;
+                let body = self.parse_expr()?;
+                Ok(Expr::Fn {
+                    params,
+                    body: Box::new(body),
+                    span,
+                })
+            }
+            TokenKind::Or => {
+                self.advance();
+                let body = self.parse_expr()?;
+                Ok(Expr::Fn {
+                    params: Vec::new(),
+                    body: Box::new(body),
+                    span,
+                })
+            }
             other => Err(format!(
                 "[{}:{}] Unexpected token {:?}",
                 span.line, span.col, other
@@ -595,11 +700,17 @@ impl Parser {
         while !self.check(&TokenKind::RBrace) && !self.is_eof() {
             let arm_span = self.current_span();
             let pattern = self.parse_pattern()?;
+            let guard = if self.match_kind(&TokenKind::If) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(&TokenKind::FatArrow, "Expected '=>' after match pattern")?;
             let body = self.parse_expr()?;
             let needs_comma = !is_block_expr(&body);
             arms.push(MatchArm {
                 pattern,
+                guard,
                 body,
                 span: arm_span,
             });

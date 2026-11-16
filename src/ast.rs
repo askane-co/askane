@@ -112,6 +112,16 @@ pub enum Expr {
         name: String,
         span: Span,
     },
+    OptGetAttr {
+        object: Box<Expr>,
+        name: String,
+        span: Span,
+    },
+    NullCoalesce {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -134,7 +144,9 @@ impl Expr {
             | Expr::Fn { span, .. }
             | Expr::Call { span, .. }
             | Expr::Index { span, .. }
-            | Expr::GetAttr { span, .. } => *span,
+            | Expr::GetAttr { span, .. }
+            | Expr::OptGetAttr { span, .. }
+            | Expr::NullCoalesce { span, .. } => *span,
         }
     }
 }
@@ -143,6 +155,7 @@ impl Expr {
 pub enum AssignTarget {
     Var(String),
     Index { object: Box<Expr>, index: Box<Expr> },
+    Attr { object: Box<Expr>, name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +184,7 @@ pub enum BinaryOp {
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    pub guard: Option<Expr>,
     pub body: Expr,
     pub span: Span,
 }

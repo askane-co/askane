@@ -18,7 +18,7 @@ use parser::Parser;
 use value::Value;
 use vm::VM;
 
-const VERSION: &str = "0.1.0-beta.1";
+const VERSION: &str = "0.10.2-fix";
 
 fn compile_source(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, String> {
     let mut lexer = Lexer::new(source);
@@ -344,5 +344,84 @@ mod tests {
             "#,
         );
         assert!(val.equals(&Value::Str("[1, [...]]".to_string())));
+    }
+
+    #[test]
+    fn test_v0102_features() {
+        let val = eval(
+            r#"
+            let player = #{ name: "Askane", hp: 25 };
+            let missing = unit;
+            let mana = player?.mana ?? missing?.mana ?? 50;
+
+            let status = match player.hp {
+                0 => "dead",
+                h if h < 30 => "critical",
+                _ => "alive",
+            };
+
+            let total = range(1, 7)
+                |> filter(|n| n % 2 == 0)
+                |> map(|n| n * n)
+                |> reduce(0, |acc, n| acc + n);
+
+            let zero_fn = || 7;
+            "${player.name}:${status}:${mana}:${total + zero_fn()}"
+            "#,
+        );
+        assert!(val.equals(&Value::Str("Askane:critical:50:63".to_string())));
+    }
+
+    #[test]
+    fn test_for_break_stack_attr_assign_pipe_prec_and_trace() {
+        let val = eval(
+            r#"
+            fn test_for_break() {
+                let acc = 0;
+                for i in range(1, 10) {
+                    if i == 4 {
+                        break;
+                    }
+                    acc = acc + i;
+                }
+                let after = 100;
+                let another = 200;
+                acc + after + another
+            }
+
+            let player = #{ hp: 100, stats: #{ mana: 10 } };
+            player.hp = 90;
+            player.stats.mana = 50;
+
+            fn double(x) { x * 2 }
+            let x = 4;
+            let pipe_ok = x + 1 |> double == 10;
+            import math;
+            let float_falsy = !0.0 && !math.sqrt(-1.0);
+
+            if pipe_ok && float_falsy {
+                test_for_break() + player.hp + player.stats.mana
+            } else {
+                0
+            }
+            "#,
+        );
+        // 6 + 100 + 200 + 90 + 50 = 446
+        assert!(val.equals(&Value::Int(446)));
+
+        let proto = compile_source(
+            r#"
+            fn inner() { 1 / 0 }
+            fn outer() { inner() }
+            outer()
+            "#,
+        )
+        .unwrap();
+        let mut vm = VM::new();
+        let err = vm.run(proto).unwrap_err();
+        assert!(err.contains("Division by zero"));
+        assert!(err.contains("at inner"));
+        assert!(err.contains("at outer"));
+        assert!(err.contains("at <script>"));
     }
 }

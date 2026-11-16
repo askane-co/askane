@@ -9,6 +9,9 @@ pub enum TokenKind {
     Int(i64),
     Float(f64),
     Str(String),
+    InterpStart(String),
+    InterpMid(String),
+    InterpEnd(String),
     Bool(bool),
     Ident(String),
 
@@ -54,7 +57,10 @@ pub enum TokenKind {
     And,
     Or,
     Bang,
+    Bar,
     Pipe,
+    DoubleQuestion,
+    QuestionDot,
     FatArrow,
 
     Eof,
@@ -71,6 +77,7 @@ pub struct Lexer {
     pos: usize,
     line: usize,
     col: usize,
+    interp_braces: Vec<usize>,
 }
 
 impl Lexer {
@@ -80,6 +87,7 @@ impl Lexer {
             pos: 0,
             line: 1,
             col: 1,
+            interp_braces: Vec::new(),
         }
     }
 
@@ -138,7 +146,8 @@ impl Lexer {
             }
 
             if ch == '"' {
-                tokens.push(self.lex_string(span)?);
+                self.advance(); // opening quote
+                tokens.push(self.lex_string_part(span, false)?);
                 continue;
             }
 
@@ -153,10 +162,22 @@ impl Lexer {
                 }
                 '{' => {
                     self.advance();
+                    if let Some(depth) = self.interp_braces.last_mut() {
+                        *depth += 1;
+                    }
                     TokenKind::LBrace
                 }
                 '}' => {
                     self.advance();
+                    if let Some(&depth) = self.interp_braces.last() {
+                        if depth == 0 {
+                            self.interp_braces.pop();
+                            tokens.push(self.lex_string_part(span, true)?);
+                            continue;
+                        } else if let Some(d) = self.interp_braces.last_mut() {
+                            *d -= 1;
+                        }
+                    }
                     TokenKind::RBrace
                 }
                 '[' => {
@@ -267,8 +288,20 @@ impl Lexer {
                         self.advance();
                         TokenKind::Pipe
                     } else {
+                        TokenKind::Bar
+                    }
+                }
+                '?' => {
+                    self.advance();
+                    if self.peek() == Some('?') {
+                        self.advance();
+                        TokenKind::DoubleQuestion
+                    } else if self.peek() == Some('.') {
+                        self.advance();
+                        TokenKind::QuestionDot
+                    } else {
                         return Err(format!(
-                            "[{}:{}] Unexpected character '|' (did you mean '||' or '|>'?)",
+                            "[{}:{}] Unexpected character '?' (did you mean '??' or '?.'?)",
                             span.line, span.col
                         ));
                     }
@@ -367,15 +400,31 @@ impl Lexer {
         Token { kind, span }
     }
 
-    fn lex_string(&mut self, span: Span) -> Result<Token, String> {
-        self.advance(); // opening quote
+    fn lex_string_part(&mut self, span: Span, in_interp: bool) -> Result<Token, String> {
         let mut out = String::new();
 
         while let Some(c) = self.peek() {
             if c == '"' {
                 self.advance();
                 return Ok(Token {
-                    kind: TokenKind::Str(out),
+                    kind: if in_interp {
+                        TokenKind::InterpEnd(out)
+                    } else {
+                        TokenKind::Str(out)
+                    },
+                    span,
+                });
+            }
+            if c == '$' && self.peek_next() == Some('{') {
+                self.advance();
+                self.advance();
+                self.interp_braces.push(0);
+                return Ok(Token {
+                    kind: if in_interp {
+                        TokenKind::InterpMid(out)
+                    } else {
+                        TokenKind::InterpStart(out)
+                    },
                     span,
                 });
             }
@@ -391,6 +440,7 @@ impl Lexer {
                     't' => out.push('\t'),
                     '\\' => out.push('\\'),
                     '"' => out.push('"'),
+                    '$' => out.push('$'),
                     '0' => out.push('\0'),
                     other => {
                         return Err(format!(

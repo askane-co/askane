@@ -11,7 +11,8 @@ struct Local {
 }
 
 struct LoopContext {
-    scope_depth: usize,
+    break_scope_depth: usize,
+    continue_scope_depth: usize,
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
 }
@@ -262,7 +263,8 @@ impl Compiler {
                 let loop_start = self.current_ip();
                 let scope_depth = self.current().scope_depth;
                 self.current().loops.push(LoopContext {
-                    scope_depth,
+                    break_scope_depth: scope_depth,
+                    continue_scope_depth: scope_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                 });
@@ -292,6 +294,7 @@ impl Compiler {
                 body,
                 span,
             } => {
+                let break_scope_depth = self.current().scope_depth;
                 self.begin_scope();
                 self.compile_expr(iter)?;
                 let iter_slot = self.add_local("__for_iter".to_string());
@@ -312,9 +315,10 @@ impl Compiler {
                 self.emit(Op::Lt, span.line);
                 let exit_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
 
-                let loop_scope_depth = self.current().scope_depth;
+                let continue_scope_depth = self.current().scope_depth;
                 self.current().loops.push(LoopContext {
-                    scope_depth: loop_scope_depth,
+                    break_scope_depth,
+                    continue_scope_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                 });
@@ -345,11 +349,11 @@ impl Compiler {
                 self.emit(Op::Jump(loop_start), span.line);
                 self.patch_jump(exit_jump);
 
+                self.end_scope(span.line);
+
                 for j in ctx.break_jumps {
                     self.patch_jump(j);
                 }
-
-                self.end_scope(span.line);
                 Ok(())
             }
             Stmt::Return { value, span } => {
@@ -374,7 +378,7 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let target_depth = self.current().loops.last().unwrap().scope_depth;
+                let target_depth = self.current().loops.last().unwrap().break_scope_depth;
                 self.pop_locals_to_depth(target_depth, span.line);
                 let j = self.emit(Op::Jump(0), span.line);
                 self.current().loops.last_mut().unwrap().break_jumps.push(j);
@@ -387,7 +391,7 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let target_depth = self.current().loops.last().unwrap().scope_depth;
+                let target_depth = self.current().loops.last().unwrap().continue_scope_depth;
                 self.pop_locals_to_depth(target_depth, span.line);
                 let j = self.emit(Op::Jump(0), span.line);
                 self.current()
@@ -551,6 +555,13 @@ impl Compiler {
                     self.emit(Op::SetIndex, span.line);
                     Ok(())
                 }
+                AssignTarget::Attr { object, name } => {
+                    self.compile_expr(object)?;
+                    self.compile_expr(value)?;
+                    let idx = self.current().chunk.add_string_constant(name);
+                    self.emit(Op::SetAttr(idx), span.line);
+                    Ok(())
+                }
             },
             Expr::Block { stmts, tail, span } => {
                 if let Some(tail_expr) = tail {
@@ -614,26 +625,51 @@ impl Compiler {
                 for arm in arms {
                     match &arm.pattern {
                         Pattern::Wildcard => {
-                            self.compile_expr(&arm.body)?;
-                            self.emit(Op::SetLocal(res_slot), arm.span.line);
-                            self.emit(Op::Pop, arm.span.line);
-                            let j = self.emit(Op::Jump(0), arm.span.line);
-                            end_jumps.push(j);
-                            has_irrefutable = true;
-                            break;
+                            if let Some(guard) = &arm.guard {
+                                self.compile_expr(guard)?;
+                                let next_arm = self.emit(Op::JumpIfFalsePop(0), arm.span.line);
+                                self.compile_expr(&arm.body)?;
+                                self.emit(Op::SetLocal(res_slot), arm.span.line);
+                                self.emit(Op::Pop, arm.span.line);
+                                let j = self.emit(Op::Jump(0), arm.span.line);
+                                end_jumps.push(j);
+                                self.patch_jump(next_arm);
+                            } else {
+                                self.compile_expr(&arm.body)?;
+                                self.emit(Op::SetLocal(res_slot), arm.span.line);
+                                self.emit(Op::Pop, arm.span.line);
+                                let j = self.emit(Op::Jump(0), arm.span.line);
+                                end_jumps.push(j);
+                                has_irrefutable = true;
+                                break;
+                            }
                         }
                         Pattern::Ident(name) => {
                             self.begin_scope();
                             self.emit(Op::GetLocal(subj_slot), arm.span.line);
                             self.add_local(name.clone());
-                            self.compile_expr(&arm.body)?;
-                            self.emit(Op::SetLocal(res_slot), arm.span.line);
-                            self.emit(Op::Pop, arm.span.line);
-                            self.end_scope(arm.span.line);
-                            let j = self.emit(Op::Jump(0), arm.span.line);
-                            end_jumps.push(j);
-                            has_irrefutable = true;
-                            break;
+                            if let Some(guard) = &arm.guard {
+                                self.compile_expr(guard)?;
+                                let guard_fail = self.emit(Op::JumpIfFalsePop(0), arm.span.line);
+                                self.compile_expr(&arm.body)?;
+                                self.emit(Op::SetLocal(res_slot), arm.span.line);
+                                self.emit(Op::Pop, arm.span.line);
+                                let target_depth = self.current().scope_depth - 1;
+                                self.pop_locals_to_depth(target_depth, arm.span.line);
+                                let j = self.emit(Op::Jump(0), arm.span.line);
+                                end_jumps.push(j);
+                                self.patch_jump(guard_fail);
+                                self.end_scope(arm.span.line);
+                            } else {
+                                self.compile_expr(&arm.body)?;
+                                self.emit(Op::SetLocal(res_slot), arm.span.line);
+                                self.emit(Op::Pop, arm.span.line);
+                                self.end_scope(arm.span.line);
+                                let j = self.emit(Op::Jump(0), arm.span.line);
+                                end_jumps.push(j);
+                                has_irrefutable = true;
+                                break;
+                            }
                         }
                         literal => {
                             self.emit(Op::GetLocal(subj_slot), arm.span.line);
@@ -662,11 +698,22 @@ impl Compiler {
                             self.emit(Op::Eq, arm.span.line);
                             let next_arm = self.emit(Op::JumpIfFalsePop(0), arm.span.line);
 
-                            self.compile_expr(&arm.body)?;
-                            self.emit(Op::SetLocal(res_slot), arm.span.line);
-                            self.emit(Op::Pop, arm.span.line);
-                            let j = self.emit(Op::Jump(0), arm.span.line);
-                            end_jumps.push(j);
+                            if let Some(guard) = &arm.guard {
+                                self.compile_expr(guard)?;
+                                let guard_fail = self.emit(Op::JumpIfFalsePop(0), arm.span.line);
+                                self.compile_expr(&arm.body)?;
+                                self.emit(Op::SetLocal(res_slot), arm.span.line);
+                                self.emit(Op::Pop, arm.span.line);
+                                let j = self.emit(Op::Jump(0), arm.span.line);
+                                end_jumps.push(j);
+                                self.patch_jump(guard_fail);
+                            } else {
+                                self.compile_expr(&arm.body)?;
+                                self.emit(Op::SetLocal(res_slot), arm.span.line);
+                                self.emit(Op::Pop, arm.span.line);
+                                let j = self.emit(Op::Jump(0), arm.span.line);
+                                end_jumps.push(j);
+                            }
 
                             self.patch_jump(next_arm);
                         }
@@ -723,6 +770,20 @@ impl Compiler {
                 self.emit(Op::GetAttr(idx), span.line);
                 Ok(())
             }
+            Expr::OptGetAttr { object, name, span } => {
+                self.compile_expr(object)?;
+                let idx = self.current().chunk.add_string_constant(name);
+                self.emit(Op::OptGetAttr(idx), span.line);
+                Ok(())
+            }
+            Expr::NullCoalesce { left, right, span } => {
+                self.compile_expr(left)?;
+                let end_jump = self.emit(Op::JumpIfNotUnitPeek(0), span.line);
+                self.emit(Op::Pop, span.line);
+                self.compile_expr(right)?;
+                self.patch_jump(end_jump);
+                Ok(())
+            }
         }
     }
 
@@ -761,7 +822,8 @@ impl Compiler {
             chunk: compiled.chunk,
         });
         let idx = self.current().chunk.add_constant(Constant::Function(proto));
-        self.emit(Op::Closure(idx, upvalues), span.line);
+        let uv_idx = self.current().chunk.add_upvalue_list(upvalues);
+        self.emit(Op::Closure(idx, uv_idx), span.line);
         Ok(())
     }
 }

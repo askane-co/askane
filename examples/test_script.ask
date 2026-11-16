@@ -1,4 +1,5 @@
-// Askane Test Script 2.0: pipelines, match, closures, dicts, math, and json
+// Askane Test Script 2.0 (v0.10.2-fix)
+// Showcases: ??, ?., match guards, ${...} interpolation, short lambdas |x|, dot-assign, json, math
 
 import math;
 import json;
@@ -6,21 +7,21 @@ import sys;
 
 let t_start = clock();
 
-// 1. Expression blocks + match
 fn rank(score) {
     match score {
         100 => "S",
         0 => "F",
-        s => if s >= 80 { "A" } else if s >= 50 { "B" } else { "C" },
+        s if s >= 80 => "A",
+        s if s >= 50 => "B",
+        _ => "C",
     }
 }
 
-// 2. Closures + dictionaries
 fn make_hero(name, hp) {
     let state = #{ name: name, hp: hp, hits: 0 };
-    fn(dmg) {
-        state["hp"] = math.max(0, state.hp - dmg);
-        state["hits"] = state.hits + 1;
+    |dmg| {
+        state.hp = math.max(0, state.hp - dmg);
+        state.hits = state.hits + 1;
         state
     }
 }
@@ -28,18 +29,17 @@ fn make_hero(name, hp) {
 let hit = make_hero("Askane", 100);
 hit(15);
 let hero = hit(20);
+let mana = hero?.mana ?? 50;
 
-// 3. Pipelines
-let scores = [35, 55, 82, 100, 48];
-let passed = scores
-    |> filter(fn(s) { s >= 50 })
-    |> map(fn(s) { #{ score: s, grade: rank(s) } });
+let passed = [35, 55, 82, 100, 48]
+    |> filter(|s| s >= 50)
+    |> map(|s| #{ score: s, grade: rank(s) });
 
-// 4. JSON serialization & parsing roundtrip
 let report = #{
     os: sys.os(),
     arch: sys.arch(),
     hero: hero,
+    mana: mana,
     passed: passed,
     elapsed_ms: math.round((clock() - t_start) * 1000.0),
 };
@@ -47,11 +47,11 @@ let report = #{
 let encoded = json.stringify(report);
 let decoded = json.parse(encoded);
 
-println("=== Askane Test Script 2.0 ===");
-println("Hero:", decoded.hero.name, "| HP:", decoded.hero.hp, "| Hits:", decoded.hero.hits);
-println("Passed count:", len(decoded.passed));
+println("=== Askane v0.10.2-fix Showcase ===");
+println("Hero: ${decoded.hero.name} | HP: ${decoded.hero.hp} | Mana: ${decoded.mana} | Hits: ${decoded.hero.hits}");
+println("Passed: ${len(decoded.passed)}");
 for item in decoded.passed {
-    println("  score:", item.score, "-> grade:", item.grade);
+    println("  score: ${item.score} -> grade: ${item.grade}");
 }
-println("JSON:", encoded);
-println("Done in", decoded.elapsed_ms, "ms");
+println("JSON: ${encoded}");
+println("Done in ${decoded.elapsed_ms} ms");

@@ -33,7 +33,7 @@ pub struct FunctionProto {
     pub chunk: Chunk,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Op {
     Constant(u16),
     Unit,
@@ -70,15 +70,18 @@ pub enum Op {
     JumpIfFalsePop(usize),
     JumpIfFalsePeek(usize),
     JumpIfTruePeek(usize),
+    JumpIfNotUnitPeek(usize),
 
     Call(u8),
-    Closure(u16, Vec<UpvalueDesc>),
+    Closure(u16, u16),
 
     MakeList(u16),
     MakeDict(u16),
     GetIndex,
     SetIndex,
     GetAttr(u16),
+    SetAttr(u16),
+    OptGetAttr(u16),
     Import(u16, bool),
     MakeModule(u16, u16),
 
@@ -90,6 +93,7 @@ pub struct Chunk {
     pub code: Vec<Op>,
     pub constants: Vec<Constant>,
     pub lines: Vec<usize>,
+    pub upvalue_lists: Vec<Vec<UpvalueDesc>>,
 }
 
 impl Chunk {
@@ -116,12 +120,18 @@ impl Chunk {
         self.add_constant(Constant::Str(s.to_string()))
     }
 
+    pub fn add_upvalue_list(&mut self, list: Vec<UpvalueDesc>) -> u16 {
+        self.upvalue_lists.push(list);
+        (self.upvalue_lists.len() - 1) as u16
+    }
+
     pub fn patch_jump(&mut self, op_idx: usize, target_ip: usize) {
         match &mut self.code[op_idx] {
             Op::Jump(target)
             | Op::JumpIfFalsePop(target)
             | Op::JumpIfFalsePeek(target)
-            | Op::JumpIfTruePeek(target) => {
+            | Op::JumpIfTruePeek(target)
+            | Op::JumpIfNotUnitPeek(target) => {
                 *target = target_ip;
             }
             other => panic!("Cannot patch non-jump op: {:?}", other),
@@ -142,17 +152,20 @@ impl Chunk {
                 | Op::DefineGlobal(idx)
                 | Op::SetGlobal(idx)
                 | Op::GetAttr(idx)
+                | Op::SetAttr(idx)
+                | Op::OptGetAttr(idx)
                 | Op::Import(idx, _) => {
                     format!("{:?} ; {}", op, self.constants[*idx as usize])
                 }
-                Op::Closure(idx, upvals) => {
+                Op::Closure(idx, uv_idx) => {
                     if let Constant::Function(proto) = &self.constants[*idx as usize] {
                         nested.push(proto.clone());
                     }
+                    let upval_len = self.upvalue_lists[*uv_idx as usize].len();
                     format!(
                         "Closure({}, {} upvalues) ; {}",
                         idx,
-                        upvals.len(),
+                        upval_len,
                         self.constants[*idx as usize]
                     )
                 }

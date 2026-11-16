@@ -47,6 +47,7 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Unit => false,
             Value::Int(0) => false,
+            Value::Float(f) => *f != 0.0 && !f.is_nan(),
             Value::Str(s) => !s.is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
             Value::Dict(d) => !d.borrow().is_empty(),

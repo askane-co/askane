@@ -78,7 +78,7 @@ impl VM {
         }
         let root =
             fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
-        let existing = if candidate.exists() {
+        let existing = if candidate.symlink_metadata().is_ok() {
             fs::canonicalize(&candidate).map_err(|e| format!("path '{}': {}", input, e))?
         } else {
             let parent = candidate
@@ -134,14 +134,48 @@ impl VM {
             upvalues: Vec::new(),
         });
         let base_depth = self.frames.len();
+        let stack_base = self.stack.len();
         self.stack.push(Value::Closure(closure.clone()));
         self.frames.push(CallFrame {
             closure,
             ip: 0,
-            base: self.stack.len() - 1,
+            base: stack_base,
         });
 
-        self.execute(base_depth)
+        match self.execute(base_depth) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let msg = if base_depth == 0 {
+                    self.format_stack_trace(&e)
+                } else {
+                    e
+                };
+                self.close_upvalues_from(stack_base);
+                self.frames.truncate(base_depth);
+                self.stack.truncate(stack_base);
+                Err(msg)
+            }
+        }
+    }
+
+    fn format_stack_trace(&self, err: &str) -> String {
+        let mut out = err.to_string();
+        for frame in self.frames.iter().rev() {
+            let line = if frame.ip > 0 {
+                frame
+                    .closure
+                    .proto
+                    .chunk
+                    .lines
+                    .get(frame.ip - 1)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            out.push_str(&format!("\n  at {} (line {})", frame.closure.proto.name, line));
+        }
+        out
     }
 
     pub fn call_value(&mut self, callee: Value, args: &[Value]) -> Result<Value, String> {
@@ -181,7 +215,7 @@ impl VM {
         loop {
             let (op, line) = {
                 let frame = self.frames.last_mut().unwrap();
-                let op = frame.closure.proto.chunk.code[frame.ip].clone();
+                let op = frame.closure.proto.chunk.code[frame.ip];
                 let line = frame.closure.proto.chunk.lines[frame.ip];
                 frame.ip += 1;
                 (op, line)
@@ -231,11 +265,14 @@ impl VM {
                     self.stack.pop();
                 }
                 Op::GetGlobal(idx) => {
-                    let name = self.read_string(idx);
-                    let val =
-                        self.globals.get(&name).cloned().ok_or_else(|| {
-                            format!("[line {}] Undefined variable '{}'", line, name)
-                        })?;
+                    let frame = self.frames.last().unwrap();
+                    let name = match &frame.closure.proto.chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.as_str(),
+                        _ => unreachable!(),
+                    };
+                    let val = self.globals.get(name).cloned().ok_or_else(|| {
+                        format!("[line {}] Undefined variable '{}'", line, name)
+                    })?;
                     self.stack.push(val);
                 }
                 Op::DefineGlobal(idx) => {
@@ -244,12 +281,18 @@ impl VM {
                     self.globals.insert(name, val);
                 }
                 Op::SetGlobal(idx) => {
-                    let name = self.read_string(idx);
-                    if !self.globals.contains_key(&name) {
-                        return Err(format!("[line {}] Undefined variable '{}'", line, name));
-                    }
+                    let frame = self.frames.last().unwrap();
+                    let name = match &frame.closure.proto.chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.as_str(),
+                        _ => unreachable!(),
+                    };
                     let val = self.stack.last().unwrap().clone();
-                    self.globals.insert(name, val);
+                    match self.globals.get_mut(name) {
+                        Some(slot) => *slot = val,
+                        None => {
+                            return Err(format!("[line {}] Undefined variable '{}'", line, name));
+                        }
+                    }
                 }
                 Op::Add => {
                     let b = self.stack.pop().unwrap();
@@ -389,6 +432,11 @@ impl VM {
                         self.frames.last_mut().unwrap().ip = target;
                     }
                 }
+                Op::JumpIfNotUnitPeek(target) => {
+                    if !matches!(self.stack.last().unwrap(), Value::Unit) {
+                        self.frames.last_mut().unwrap().ip = target;
+                    }
+                }
                 Op::Call(argc) => {
                     let argc = argc as usize;
                     let callee_idx = self.stack.len() - 1 - argc;
@@ -429,13 +477,15 @@ impl VM {
                         }
                     }
                 }
-                Op::Closure(idx, upvalue_descs) => {
-                    let proto = {
+                Op::Closure(idx, uv_idx) => {
+                    let (proto, upvalue_descs) = {
                         let frame = self.frames.last().unwrap();
-                        match &frame.closure.proto.chunk.constants[idx as usize] {
+                        let proto = match &frame.closure.proto.chunk.constants[idx as usize] {
                             Constant::Function(p) => p.clone(),
                             _ => unreachable!(),
-                        }
+                        };
+                        let descs = frame.closure.proto.chunk.upvalue_lists[uv_idx as usize].clone();
+                        (proto, descs)
                     };
                     let mut upvalues = Vec::with_capacity(upvalue_descs.len());
                     for desc in upvalue_descs {
@@ -572,6 +622,56 @@ impl VM {
                         other => {
                             return Err(format!(
                                 "[line {}] Cannot access '.{}' on '{}'",
+                                line,
+                                attr,
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+                Op::OptGetAttr(idx) => {
+                    let obj = self.stack.pop().unwrap();
+                    if matches!(obj, Value::Unit) {
+                        self.stack.push(Value::Unit);
+                    } else {
+                        let attr = self.read_string(idx);
+                        match obj {
+                            Value::Module { name, exports } => {
+                                let val = exports.borrow().get(&attr).cloned().ok_or_else(|| {
+                                    format!(
+                                        "[line {}] Module '{}' has no export '{}'",
+                                        line, name, attr
+                                    )
+                                })?;
+                                self.stack.push(val);
+                            }
+                            Value::Dict(dict) => {
+                                let val = dict.borrow().get(&attr).cloned().unwrap_or(Value::Unit);
+                                self.stack.push(val);
+                            }
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Cannot access '?.{}' on '{}'",
+                                    line,
+                                    attr,
+                                    other.type_name()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Op::SetAttr(idx) => {
+                    let attr = self.read_string(idx);
+                    let val = self.stack.pop().unwrap();
+                    let obj = self.stack.pop().unwrap();
+                    match obj {
+                        Value::Dict(dict) => {
+                            dict.borrow_mut().insert(attr, val.clone());
+                            self.stack.push(val);
+                        }
+                        other => {
+                            return Err(format!(
+                                "[line {}] Cannot assign '.{}' on '{}'",
                                 line,
                                 attr,
                                 other.type_name()
