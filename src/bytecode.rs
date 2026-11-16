@@ -67,6 +67,7 @@ pub enum Op {
     Le,
     Gt,
     Ge,
+    In,
 
     Jump(usize),
     JumpIfFalsePop(usize),
@@ -80,6 +81,7 @@ pub enum Op {
     MakeList(u16),
     MakeDict(u16),
     GetIndex,
+    Slice(bool),
     SetIndex,
     GetAttr(u16),
     SetAttr(u16),

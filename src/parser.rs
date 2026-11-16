@@ -74,6 +74,7 @@ impl Parser {
             TokenKind::Let
             | TokenKind::Import
             | TokenKind::While
+            | TokenKind::Loop
             | TokenKind::For
             | TokenKind::Return
             | TokenKind::Break
@@ -206,18 +207,41 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Stmt::While { cond, body, span })
             }
-            TokenKind::For => {
+            TokenKind::Loop => {
                 self.advance();
-                let var = self.expect_ident("Expected loop variable name after 'for'")?;
-                self.expect(&TokenKind::In, "Expected 'in' after loop variable")?;
-                let iter = self.parse_expr()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::For {
-                    var,
-                    iter,
+                Ok(Stmt::While {
+                    cond: Expr::Bool(true, span),
                     body,
                     span,
                 })
+            }
+            TokenKind::For => {
+                self.advance();
+                let var1 = self.expect_ident("Expected loop variable name after 'for'")?;
+                if self.match_kind(&TokenKind::Comma) {
+                    let var2 = self.expect_ident("Expected second loop variable name")?;
+                    self.expect(&TokenKind::In, "Expected 'in' after loop variables")?;
+                    let iter = self.parse_expr()?;
+                    let body = self.parse_block()?;
+                    Ok(Stmt::ForPair {
+                        var1,
+                        var2,
+                        iter,
+                        body,
+                        span,
+                    })
+                } else {
+                    self.expect(&TokenKind::In, "Expected 'in' after loop variable")?;
+                    let iter = self.parse_expr()?;
+                    let body = self.parse_block()?;
+                    Ok(Stmt::For {
+                        var: var1,
+                        iter,
+                        body,
+                        span,
+                    })
+                }
             }
             TokenKind::Return => {
                 self.advance();
@@ -259,19 +283,46 @@ impl Parser {
 
     fn parse_assign(&mut self) -> Result<Expr, String> {
         let expr = self.parse_coalesce()?;
-        if self.match_kind(&TokenKind::Assign) {
+        let compound_op = if self.match_kind(&TokenKind::PlusAssign) {
+            Some(BinaryOp::Add)
+        } else if self.match_kind(&TokenKind::MinusAssign) {
+            Some(BinaryOp::Sub)
+        } else if self.match_kind(&TokenKind::StarAssign) {
+            Some(BinaryOp::Mul)
+        } else if self.match_kind(&TokenKind::SlashAssign) {
+            Some(BinaryOp::Div)
+        } else {
+            None
+        };
+        if compound_op.is_some() || self.match_kind(&TokenKind::Assign) {
             let span = expr.span();
-            let value = self.parse_expr()?;
-            let target = match expr {
-                Expr::Ident(name, _) => AssignTarget::Var(name),
-                Expr::Index { object, index, .. } => AssignTarget::Index { object, index },
-                Expr::GetAttr { object, name, .. } => AssignTarget::Attr { object, name },
+            let rhs = self.parse_expr()?;
+            let target = match &expr {
+                Expr::Ident(name, _) => AssignTarget::Var(name.clone()),
+                Expr::Index { object, index, .. } => AssignTarget::Index {
+                    object: object.clone(),
+                    index: index.clone(),
+                },
+                Expr::GetAttr { object, name, .. } => AssignTarget::Attr {
+                    object: object.clone(),
+                    name: name.clone(),
+                },
                 _ => {
                     return Err(format!(
                         "[{}:{}] Invalid assignment target",
                         span.line, span.col
                     ));
                 }
+            };
+            let value = if let Some(op) = compound_op {
+                Expr::Binary {
+                    left: Box::new(expr),
+                    op,
+                    right: Box::new(rhs),
+                    span,
+                }
+            } else {
+                rhs
             };
             return Ok(Expr::Assign {
                 target,
@@ -369,6 +420,8 @@ impl Parser {
                 BinaryOp::Gt
             } else if self.match_kind(&TokenKind::Ge) {
                 BinaryOp::Ge
+            } else if self.match_kind(&TokenKind::In) {
+                BinaryOp::In
             } else {
                 break;
             };
@@ -534,16 +587,56 @@ impl Parser {
                 };
             } else if self.match_kind(&TokenKind::LBracket) {
                 let span = expr.span();
-                let index = self.parse_expr()?;
-                self.expect(&TokenKind::RBracket, "Expected ']' after index")?;
-                expr = Expr::Index {
-                    object: Box::new(expr),
-                    index: Box::new(index),
-                    span,
-                };
+                if self.check(&TokenKind::DotDot) || self.check(&TokenKind::DotDotEq) {
+                    let inclusive = self.match_kind(&TokenKind::DotDotEq);
+                    if !inclusive {
+                        self.advance();
+                    }
+                    let end = if self.check(&TokenKind::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()?))
+                    };
+                    self.expect(&TokenKind::RBracket, "Expected ']' after slice")?;
+                    expr = Expr::Slice {
+                        object: Box::new(expr),
+                        start: None,
+                        end,
+                        inclusive,
+                        span,
+                    };
+                } else {
+                    let first = self.parse_expr()?;
+                    if self.check(&TokenKind::DotDot) || self.check(&TokenKind::DotDotEq) {
+                        let inclusive = self.match_kind(&TokenKind::DotDotEq);
+                        if !inclusive {
+                            self.advance();
+                        }
+                        let end = if self.check(&TokenKind::RBracket) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        self.expect(&TokenKind::RBracket, "Expected ']' after slice")?;
+                        expr = Expr::Slice {
+                            object: Box::new(expr),
+                            start: Some(Box::new(first)),
+                            end,
+                            inclusive,
+                            span,
+                        };
+                    } else {
+                        self.expect(&TokenKind::RBracket, "Expected ']' after index")?;
+                        expr = Expr::Index {
+                            object: Box::new(expr),
+                            index: Box::new(first),
+                            span,
+                        };
+                    }
+                }
             } else if self.match_kind(&TokenKind::Dot) {
                 let span = expr.span();
-                let name = self.expect_ident("Expected property or method name after '.'")?;
+                let name = self.expect_attr_name("Expected property or method name after '.'")?;
                 expr = Expr::GetAttr {
                     object: Box::new(expr),
                     name,
@@ -551,7 +644,7 @@ impl Parser {
                 };
             } else if self.match_kind(&TokenKind::QuestionDot) {
                 let span = expr.span();
-                let name = self.expect_ident("Expected property or method name after '?.'")?;
+                let name = self.expect_attr_name("Expected property or method name after '?.'")?;
                 expr = Expr::OptGetAttr {
                     object: Box::new(expr),
                     name,
@@ -655,17 +748,39 @@ impl Parser {
             }
             TokenKind::LBracket => {
                 self.advance();
-                let mut items = Vec::new();
-                if !self.check(&TokenKind::RBracket) {
-                    loop {
-                        items.push(self.parse_expr()?);
-                        if !self.match_kind(&TokenKind::Comma) {
-                            break;
-                        }
-                        if self.check(&TokenKind::RBracket) {
-                            break;
-                        }
+                if self.check(&TokenKind::RBracket) {
+                    self.advance();
+                    return Ok(Expr::List(Vec::new(), span));
+                }
+                let first = self.parse_expr()?;
+                if self.match_kind(&TokenKind::For) {
+                    let var =
+                        self.expect_ident("Expected variable name after 'for' in comprehension")?;
+                    self.expect(&TokenKind::In, "Expected 'in' in list comprehension")?;
+                    let iter = self.parse_expr()?;
+                    let cond = if self.match_kind(&TokenKind::If) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(
+                        &TokenKind::RBracket,
+                        "Expected ']' after list comprehension",
+                    )?;
+                    return Ok(Expr::ListComp {
+                        expr: Box::new(first),
+                        var,
+                        iter: Box::new(iter),
+                        cond,
+                        span,
+                    });
+                }
+                let mut items = vec![first];
+                while self.match_kind(&TokenKind::Comma) {
+                    if self.check(&TokenKind::RBracket) {
+                        break;
                     }
+                    items.push(self.parse_expr()?);
                 }
                 self.expect(&TokenKind::RBracket, "Expected ']' after list elements")?;
                 Ok(Expr::List(items, span))
@@ -878,7 +993,7 @@ impl Parser {
                 match self.peek_kind().clone() {
                     TokenKind::Int(v) => {
                         self.advance();
-                        Ok(Pattern::Int(-v))
+                        self.maybe_range_pattern(-v)
                     }
                     TokenKind::Float(v) => {
                         self.advance();
@@ -892,7 +1007,7 @@ impl Parser {
             }
             TokenKind::Int(v) => {
                 self.advance();
-                Ok(Pattern::Int(v))
+                self.maybe_range_pattern(v)
             }
             TokenKind::Float(v) => {
                 self.advance();
@@ -930,6 +1045,35 @@ impl Parser {
         }
     }
 
+    fn maybe_range_pattern(&mut self, start: i64) -> Result<Pattern, String> {
+        let inclusive = if self.match_kind(&TokenKind::DotDotEq) {
+            true
+        } else if self.match_kind(&TokenKind::DotDot) {
+            false
+        } else {
+            return Ok(Pattern::Int(start));
+        };
+        let span = self.current_span();
+        let neg = self.match_kind(&TokenKind::Minus);
+        let end = match self.peek_kind().clone() {
+            TokenKind::Int(v) => {
+                self.advance();
+                if neg { -v } else { v }
+            }
+            _ => {
+                return Err(format!(
+                    "[{}:{}] Expected integer end bound in match range",
+                    span.line, span.col
+                ));
+            }
+        };
+        Ok(Pattern::Range {
+            start,
+            end,
+            inclusive,
+        })
+    }
+
     fn parse_param_list(&mut self) -> Result<Vec<String>, String> {
         self.expect(&TokenKind::LParen, "Expected '(' for parameter list")?;
         let mut params = Vec::new();
@@ -957,6 +1101,23 @@ impl Parser {
             }
             _ => Err(format!("[{}:{}] {}", span.line, span.col, msg)),
         }
+    }
+
+    fn expect_attr_name(&mut self, msg: &str) -> Result<String, String> {
+        let span = self.current_span();
+        let name = match self.peek_kind().clone() {
+            TokenKind::Ident(s) => s,
+            TokenKind::Match => "match".to_string(),
+            TokenKind::In => "in".to_string(),
+            TokenKind::For => "for".to_string(),
+            TokenKind::Try => "try".to_string(),
+            TokenKind::Catch => "catch".to_string(),
+            TokenKind::Loop => "loop".to_string(),
+            TokenKind::As => "as".to_string(),
+            _ => return Err(format!("[{}:{}] {}", span.line, span.col, msg)),
+        };
+        self.advance();
+        Ok(name)
     }
 
     fn expect(&mut self, kind: &TokenKind, msg: &str) -> Result<(), String> {

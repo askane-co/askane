@@ -18,6 +18,10 @@ pub fn module() -> Value {
             ("round", m_round),
             ("min", m_min),
             ("max", m_max),
+            ("clamp", m_clamp),
+            ("lerp", m_lerp),
+            ("dist", m_dist),
+            ("atan2", m_atan2),
         ],
         &[("pi", Value::Float(PI)), ("e", Value::Float(E))],
     )
@@ -122,4 +126,47 @@ fn m_max(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             to_f64(&args[0], "max")?.max(to_f64(&args[1], "max")?),
         )),
     }
+}
+
+fn m_clamp(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("math.clamp() expects 3 arguments (val, min, max)".to_string());
+    }
+    let v = to_f64(&args[0], "clamp")?;
+    let lo = to_f64(&args[1], "clamp")?;
+    let hi = to_f64(&args[2], "clamp")?;
+    if lo > hi {
+        return Err("math.clamp() requires min <= max".to_string());
+    }
+    Ok(Value::Float(v.clamp(lo, hi)))
+}
+
+fn m_lerp(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("math.lerp() expects 3 arguments (a, b, t)".to_string());
+    }
+    let a = to_f64(&args[0], "lerp")?;
+    let b = to_f64(&args[1], "lerp")?;
+    let t = to_f64(&args[2], "lerp")?;
+    Ok(Value::Float(a + (b - a) * t))
+}
+
+fn m_dist(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err("math.dist() expects 4 arguments (x1, y1, x2, y2)".to_string());
+    }
+    let x1 = to_f64(&args[0], "dist")?;
+    let y1 = to_f64(&args[1], "dist")?;
+    let x2 = to_f64(&args[2], "dist")?;
+    let y2 = to_f64(&args[3], "dist")?;
+    Ok(Value::Float(((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt()))
+}
+
+fn m_atan2(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("math.atan2() expects 2 arguments (y, x)".to_string());
+    }
+    Ok(Value::Float(
+        to_f64(&args[0], "atan2")?.atan2(to_f64(&args[1], "atan2")?),
+    ))
 }

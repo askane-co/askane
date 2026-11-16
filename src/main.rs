@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.13.0";
+const VERSION: &str = "0.14.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -426,7 +426,7 @@ fn run_repl() {
                 }
                 ":modules" => {
                     println!(
-                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, csv, log, test, hash, ini, datetime, clipboard, http, gfx, mem"
+                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, csv, log, test, hash, ini, datetime, clipboard, audio, url, hex, uuid, term, glob, regex, dialog, process, http, gfx, mem"
                     );
                     continue;
                 }
@@ -477,6 +477,8 @@ fn print_help() {
     println!("  askane -e \"<code>\"           Evaluate inline code");
     println!("  askane check [--json] <path> Syntax & compile check for file or directory");
     println!("  askane permissions <file>    Inspect capabilities imported by a script");
+    println!("  askane fmt [--check] <file>  Format an Askane source file");
+    println!("  askane init [dir]            Create a starter Askane project");
     println!("  askane test <file_or_dir>    Run .ask test files");
     println!("  askane -b <file.ask>         Disassemble compiled bytecode");
     println!("  askane -h | --help           Show help");
@@ -531,6 +533,68 @@ fn append_csv_paths(target: &mut Option<Vec<std::path::PathBuf>>, value: Option<
     }
 }
 
+fn format_askane_source(src: &str) -> String {
+    let mut out = Vec::new();
+    let mut indent: usize = 0;
+    for raw in src.replace("\r\n", "\n").lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let leading_closes = trimmed.chars().take_while(|&c| c == '}').count();
+        let line_indent = indent.saturating_sub(leading_closes);
+        out.push(format!("{}{}", "    ".repeat(line_indent), trimmed));
+
+        let mut in_str = false;
+        let mut esc = false;
+        let chars: Vec<char> = trimmed.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+                break;
+            } else if c == '"' {
+                in_str = true;
+            } else if c == '{' {
+                indent += 1;
+            } else if c == '}' {
+                indent = indent.saturating_sub(1);
+            }
+            i += 1;
+        }
+    }
+    let mut joined = out.join("\n");
+    if src.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn run_fmt(path: &str, check_only: bool) -> Result<(), String> {
+    let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
+        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
+    let formatted = format_askane_source(&source);
+    if check_only {
+        if formatted != source {
+            return Err(format!("File '{}' is not formatted", path));
+        }
+        println!("OK (formatted): {}", path);
+    } else {
+        fs::write(path, formatted).map_err(|e| format!("Could not write '{}': {}", path, e))?;
+        println!("Formatted {}", path);
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() == 1 {
@@ -569,6 +633,74 @@ fn main() {
                 eprintln!("Check failed: {}", e);
             }
             process::exit(1);
+        }
+        return;
+    }
+
+    if args[1] == "fmt" {
+        let mut check_only = false;
+        let mut target: Option<String> = None;
+        for arg in &args[2..] {
+            if arg == "--check" {
+                check_only = true;
+            } else if target.is_none() {
+                target = Some(arg.clone());
+            } else {
+                eprintln!("Usage: askane fmt [--check] <file.ask>");
+                process::exit(1);
+            }
+        }
+        let Some(path) = target else {
+            eprintln!("Usage: askane fmt [--check] <file.ask>");
+            process::exit(1);
+        };
+        if let Err(e) = run_fmt(&path, check_only) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
+    if args[1] == "init" {
+        let dir = args.get(2).map(String::as_str).unwrap_or(".");
+        let root = std::path::Path::new(dir);
+        if let Err(e) = fs::create_dir_all(root.join("tests")) {
+            eprintln!("init failed: {}", e);
+            process::exit(1);
+        }
+        let files = [
+            (
+                root.join("askane.toml"),
+                "name = \"my-askane-app\"\nversion = \"0.1.0\"\nentry = \"main.ask\"\nsandbox = true\n",
+            ),
+            (root.join("main.ask"), "println(\"Hello from Askane!\");\n"),
+            (
+                root.join("tests").join("basic_test.ask"),
+                "import test;\ntest.assert_eq(1 + 1, 2);\n",
+            ),
+        ];
+        for (path, content) in files {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    if let Err(e) = f.write_all(content.as_bytes()) {
+                        eprintln!("Failed to write {}: {}", path.display(), e);
+                        process::exit(1);
+                    }
+                    println!("Created {}", path.display());
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    println!("Skipped existing {}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("Failed to create {}: {}", path.display(), e);
+                    process::exit(1);
+                }
+            }
         }
         return;
     }
@@ -652,6 +784,10 @@ fn main() {
             perms.allow_sys_args = true;
         } else if arg == "--allow-clipboard" {
             perms.allow_clipboard = true;
+        } else if arg == "--allow-exec" {
+            append_csv(&mut perms.allow_exec, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-exec=") {
+            append_csv(&mut perms.allow_exec, Some(val));
         } else if let Some(val) = arg.strip_prefix("--max-steps=") {
             match val.parse::<u64>() {
                 Ok(n) => perms.max_instructions = Some(n),
@@ -1413,6 +1549,16 @@ mod tests {
     }
 
     #[test]
+    fn audit_process_limits_and_denial() {
+        let source = "import process; process.run(\"cmd\", [])";
+        let err = VM::new().run(compile_source(source).unwrap()).unwrap_err();
+        assert!(err.contains("allow-exec"));
+        let huge = format!("import process; process.run(\"{}\", [])", "x".repeat(4097));
+        let err = VM::new().run(compile_source(&huge).unwrap()).unwrap_err();
+        assert!(err.contains("4096"));
+    }
+
+    #[test]
     fn test_v013_sequences_destructuring_and_verifier() {
         let val = eval(
             r#"
@@ -1463,5 +1609,189 @@ mod tests {
         let mut vm = VM::new();
         let err = vm.run(bad_proto).unwrap_err();
         assert!(err.contains("Bytecode verification failed"), "err: {}", err);
+    }
+
+    #[test]
+    fn test_v014_syntax_and_stdlib() {
+        let val = eval(
+            r#"
+            import url;
+            import hex;
+            import uuid;
+            import term;
+            import math;
+            import audio;
+            import fs;
+            import test;
+
+            // Compound assignments
+            let x = 10;
+            x += 5;
+            x -= 3;
+            x *= 2;
+            x /= 4;
+            test.assert_eq(x, 6);
+
+            let arr = [10, 20];
+            arr[1] += 5;
+            let obj = #{ hp: 100 };
+            obj.hp -= 25;
+            test.assert_eq(arr[1], 25);
+            test.assert_eq(obj.hp, 75);
+
+            // 'in' operator
+            test.assert("hp" in obj);
+            test.assert(!("mp" in obj));
+            test.assert(25 in arr);
+            test.assert(5 in range(0, 10));
+            test.assert(!(10 in range(0, 10)));
+            test.assert("ask" in "askane");
+
+            // loop { break; continue; }
+            let acc = 0;
+            let n = 0;
+            loop {
+                n += 1;
+                if n == 2 { continue; }
+                if n > 4 { break; }
+                acc += n;
+            }
+            test.assert_eq(acc, 1 + 3 + 4);
+
+            // Raw and multiline strings
+            let raw = r"C:\Users\New\test.ask";
+            let ml = """
+line1
+line2""";
+            test.assert("\\" in raw);
+            test.assert("line1\nline2" == ml);
+
+            // List helpers
+            test.assert_eq(unique([1, 2, 1, 3, 2]), [1, 2, 3]);
+            test.assert_eq(flatten([[1, 2], [3], 4]), [1, 2, 3, 4]);
+            test.assert_eq(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
+            test.assert_eq(sum(range(1, 5)), 10);
+
+            // url, hex, uuid, term, math extensions, audio export
+            let parsed = url.parse("https://example.com:8443/api?a=1&b=hello%20world#top");
+            test.assert_eq(parsed.host, "example.com");
+            test.assert_eq(parsed.port, 8443);
+            let q = url.query_parse(parsed.query);
+            test.assert_eq(q.b, "hello world");
+            test.assert_eq(url.encode("a b"), "a%20b");
+
+            let hx = hex.encode("Hi");
+            test.assert_eq(hx, "4869");
+            test.assert_eq(hex.decode(hx), [72, 105]);
+
+            let id = uuid.v4();
+            test.assert_eq(len(id), 36);
+            test.assert("m" in term.green("ok") || len(term.green("ok")) > 2);
+
+            test.assert_eq(math.clamp(15, 0, 10), 10.0);
+            test.assert_eq(math.lerp(0, 10, 0.5), 5.0);
+            test.assert_eq(math.dist(0, 0, 3, 4), 5.0);
+
+            // fs binary + audio loaded
+            test.assert_eq(type_of(fs.read_bytes), "fn");
+            test.assert_eq(type_of(fs.write_bytes), "fn");
+            test.assert_eq(type_of(audio.play), "fn");
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_v014_part2_syntax_modules_and_fmt() {
+        let val = eval(
+            r#"
+            import glob;
+            import regex;
+            import dialog;
+            import process;
+            import gfx;
+            import fs;
+            import test;
+
+            // 1. for a, b in dict & enumerate
+            let scores = #{ bob: 20, alice: 10 };
+            let names = "";
+            let total = 0;
+            for k, v in scores {
+                names += k + ",";
+                total += v;
+            }
+            test.assert_eq(names, "alice,bob,");
+            test.assert_eq(total, 30);
+
+            let idx_sum = 0;
+            for i, x in enumerate([10, 20, 30]) {
+                idx_sum += i * x;
+            }
+            test.assert_eq(idx_sum, 0 + 20 + 60);
+
+            // 2. Slices
+            let nums = [10, 20, 30, 40, 50];
+            test.assert_eq(nums[1..3], [20, 30]);
+            test.assert_eq(nums[1..=3], [20, 30, 40]);
+            test.assert_eq(nums[..2], [10, 20]);
+            test.assert_eq(nums[3..], [40, 50]);
+            test.assert_eq("Askane"[0..3], "Ask");
+
+            // 3. List comprehensions
+            let sq = [x * x for x in range(1, 6) if x % 2 == 1];
+            test.assert_eq(sq, [1, 9, 25]);
+
+            // 4. Match ranges
+            let grade = fn(s) {
+                match s {
+                    0..50 => "fail",
+                    50..80 => "ok",
+                    80..=100 => "great",
+                    _ => "unknown",
+                }
+            };
+            test.assert_eq(grade(30), "fail");
+            test.assert_eq(grade(50), "ok");
+            test.assert_eq(grade(100), "great");
+
+            // 5. glob & regex
+            test.assert(glob.match("src/**/*.rs", "src/modules/fs.rs"));
+            test.assert(!glob.match("*.ask", "main.rs"));
+            test.assert(regex.is_match("^ask\\w+$", "askane14"));
+            test.assert_eq(regex.find_all("\\d+", "a1 b22 c333"), ["1", "22", "333"]);
+            test.assert_eq(regex.replace("\\s+", "a   b\tc", "-"), "a-b-c");
+
+            // 6. fs.glob & new gfx/dialog exports
+            let found = fs.glob("src/modules/*.rs");
+            test.assert(len(found) > 5);
+            test.assert_eq(type_of(gfx.load_image), "fn");
+            test.assert_eq(type_of(gfx.draw_image_keyed), "fn");
+            test.assert_eq(type_of(gfx.delta), "fn");
+            test.assert_eq(type_of(dialog.info), "fn");
+            test.assert_eq(type_of(process.run), "fn");
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // process.run is blocked in default sandbox
+        let proto_proc = compile_source(
+            r#"
+            import process;
+            process.run("cmd", ["/c", "echo", "hi"])
+            "#,
+        )
+        .unwrap();
+        let mut vm_sb = VM::new_with_sandbox(true);
+        let err = vm_sb.run(proto_proc).unwrap_err();
+        assert!(err.contains("allow-exec"), "err: {}", err);
+
+        // askane fmt preserves comments and indents blocks cleanly
+        let raw = "fn f() {\n// comment\nlet x = 1;\n}\n";
+        let formatted = format_askane_source(raw);
+        assert_eq!(formatted, "fn f() {\n    // comment\n    let x = 1;\n}\n");
+        assert_eq!(format_askane_source(&formatted), formatted);
     }
 }

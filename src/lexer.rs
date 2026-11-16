@@ -21,6 +21,7 @@ pub enum TokenKind {
     Else,
     Match,
     While,
+    Loop,
     For,
     In,
     Import,
@@ -41,6 +42,8 @@ pub enum TokenKind {
     RBracket,
     Comma,
     Dot,
+    DotDot,
+    DotDotEq,
     Colon,
     Hash,
     Semicolon,
@@ -51,6 +54,10 @@ pub enum TokenKind {
     Slash,
     Percent,
     Assign,
+    PlusAssign,
+    MinusAssign,
+    StarAssign,
+    SlashAssign,
     Eq,
     Ne,
     Lt,
@@ -143,14 +150,30 @@ impl Lexer {
                 continue;
             }
 
+            if ch == 'r' && self.peek_next() == Some('"') {
+                self.advance(); // 'r'
+                self.advance(); // '"'
+                tokens.push(self.lex_raw_string(span)?);
+                continue;
+            }
+
             if ch.is_ascii_alphabetic() || ch == '_' {
                 tokens.push(self.lex_ident_or_keyword(span));
                 continue;
             }
 
             if ch == '"' {
-                self.advance(); // opening quote
-                tokens.push(self.lex_string_part(span, false)?);
+                if self.peek_next() == Some('"')
+                    && self.chars.get(self.pos + 2).copied() == Some('"')
+                {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    tokens.push(self.lex_multiline_string(span)?);
+                } else {
+                    self.advance(); // opening quote
+                    tokens.push(self.lex_string_part(span, false)?);
+                }
                 continue;
             }
 
@@ -197,7 +220,17 @@ impl Lexer {
                 }
                 '.' => {
                     self.advance();
-                    TokenKind::Dot
+                    if self.peek() == Some('.') {
+                        self.advance();
+                        if self.peek() == Some('=') {
+                            self.advance();
+                            TokenKind::DotDotEq
+                        } else {
+                            TokenKind::DotDot
+                        }
+                    } else {
+                        TokenKind::Dot
+                    }
                 }
                 ':' => {
                     self.advance();
@@ -213,19 +246,39 @@ impl Lexer {
                 }
                 '+' => {
                     self.advance();
-                    TokenKind::Plus
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        TokenKind::PlusAssign
+                    } else {
+                        TokenKind::Plus
+                    }
                 }
                 '-' => {
                     self.advance();
-                    TokenKind::Minus
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        TokenKind::MinusAssign
+                    } else {
+                        TokenKind::Minus
+                    }
                 }
                 '*' => {
                     self.advance();
-                    TokenKind::Star
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        TokenKind::StarAssign
+                    } else {
+                        TokenKind::Star
+                    }
                 }
                 '/' => {
                     self.advance();
-                    TokenKind::Slash
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        TokenKind::SlashAssign
+                    } else {
+                        TokenKind::Slash
+                    }
                 }
                 '%' => {
                     self.advance();
@@ -387,6 +440,7 @@ impl Lexer {
             "else" => TokenKind::Else,
             "match" => TokenKind::Match,
             "while" => TokenKind::While,
+            "loop" => TokenKind::Loop,
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "import" => TokenKind::Import,
@@ -463,6 +517,54 @@ impl Lexer {
 
         Err(format!(
             "[{}:{}] Unterminated string literal",
+            span.line, span.col
+        ))
+    }
+
+    fn lex_raw_string(&mut self, span: Span) -> Result<Token, String> {
+        let mut out = String::new();
+        while let Some(c) = self.peek() {
+            self.advance();
+            if c == '"' {
+                return Ok(Token {
+                    kind: TokenKind::Str(out),
+                    span,
+                });
+            }
+            out.push(c);
+        }
+        Err(format!(
+            "[{}:{}] Unterminated raw string literal",
+            span.line, span.col
+        ))
+    }
+
+    fn lex_multiline_string(&mut self, span: Span) -> Result<Token, String> {
+        if self.peek() == Some('\r') && self.peek_next() == Some('\n') {
+            self.advance();
+            self.advance();
+        } else if self.peek() == Some('\n') {
+            self.advance();
+        }
+        let mut out = String::new();
+        while let Some(c) = self.peek() {
+            if c == '"'
+                && self.peek_next() == Some('"')
+                && self.chars.get(self.pos + 2).copied() == Some('"')
+            {
+                self.advance();
+                self.advance();
+                self.advance();
+                return Ok(Token {
+                    kind: TokenKind::Str(out),
+                    span,
+                });
+            }
+            self.advance();
+            out.push(c);
+        }
+        Err(format!(
+            "[{}:{}] Unterminated multiline string literal",
             span.line, span.col
         ))
     }

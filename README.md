@@ -86,12 +86,12 @@ let parsed = try {
 
 Global functions:
 - I/O: `print(...)`, `println(...)`, `read_line()`
-- Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `has(dict, key)`
+- Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `unique(list)`, `flatten(list)`, `chunk(list, size)`, `sum(seq)`, `has(dict, key)`
 - Higher-order & Sequences: `map(seq, fn)`, `filter(seq, fn)`, `reduce(seq, init, fn)`, `enumerate(seq)`, `zip(a, b)`, `take(seq, n)`, `skip(seq, n)`, `any(seq, fn)`, `all(seq, fn)`, `find(seq, fn)`
 - Conversions & Utils: `str(x)`, `int(x)`, `float(x)`, `type_of(x)`, `clock()`
 
 Built-in standard modules (`import <name>;`):
-- `math`: `pi`, `e`, `sqrt`, `abs`, `pow`, `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`
+- `math`: `pi`, `e`, `sqrt`, `abs`, `pow`, `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`, `clamp`, `lerp`, `dist`, `atan2`
 - `strings`: `split`, `trim`, `trim_start`, `trim_end`, `replace`, `contains`, `starts_with`, `ends_with`, `upper`, `lower`, `find`, `repeat`, `lines`, `pad_start`, `pad_end`, `slice`, `join`
 - `path`: `join`, `parent`, `name`, `stem`, `extension`, `is_absolute`, `normalize`
 - `time`: `now_ms`, `now_sec`, `elapsed_ms`, `sleep_ms`
@@ -104,7 +104,17 @@ Built-in standard modules (`import <name>;`):
 - `ini`: `parse`, `stringify`
 - `datetime`: `utc_now`, `from_timestamp`, `format`, `parse_iso`
 - `clipboard` (Windows): `get_text`, `set_text` (requires `--allow-clipboard` or `--unsafe`)
-- `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`
+- `audio` (Windows): `play(wav_path)`, `stop()` (sandbox-checked)
+- `url`: `parse`, `encode`, `decode`, `query_parse`, `query_stringify`
+- `hex`: `encode`, `decode`
+- `uuid`: `v4`
+- `term`: `red`, `green`, `yellow`, `cyan`, `bold`, `clear`
+- `glob`: `match(pattern, text)`
+- `regex`: `is_match`, `find`, `find_all`, `replace` (step-bounded against ReDoS)
+- `dialog` (Windows): `info`, `confirm`, `open_file`, `save_file`
+- `process`: `run(cmd, [args])` (requires `--allow-exec[=cmd]` or `--unsafe`)
+- `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`, `read_bytes`, `write_bytes`, `copy`, `move`, `size`, `glob`
+- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `rect_outline`, `circle`, `circle_outline`, `line`, `pixel`, `text`, `load_image`, `draw_image`, `draw_image_keyed`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
 - `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`
 - `json`: `parse`, `stringify`
 - `http` (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
@@ -116,7 +126,9 @@ CLI tools:
 - `askane -e "<code>"` — evaluate inline Askane code
 - `askane --gui [file.ask]` — Askane Studio GUI editor & runner (Windows, Job Object isolation, F5/Ctrl+S/Ctrl+O/Ctrl+A)
 - `askane check [--json] <file_or_dir>` — syntax/compile check without execution
+- `askane fmt [--check] <file.ask>` — format Askane source code
 - `askane permissions <file.ask>` — inspect capabilities imported by a script
+- `askane init [dir]` — create a starter Askane project (`askane.toml`, `main.ask`, `tests/basic_test.ask`)
 - `askane test <file_or_dir>` — run `.ask` test files in isolated VMs
 
 ## Security model
@@ -134,6 +146,7 @@ Granular permission flags are supported in addition to `--unsafe`:
 - `--max-steps=N`: override the 10-million sandbox instruction budget
 - `--timeout=MS`: override the 30-second sandbox wall-clock deadline
 - `--allow-clipboard`: allow `clipboard.get_text()` and `clipboard.set_text()`
+- `--allow-exec[=cmd,...]`: allow `process.run()` for specific executables or any command
 
 `askane --unsafe script.ask` enables unrestricted files, HTTPS network requests and
 system functions. Memory access additionally requires `ASKANE_ENABLE_UNSAFE_MEM=1`.

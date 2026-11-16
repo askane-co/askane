@@ -67,7 +67,11 @@ mod win32_gui {
     const ID_EDIT_CODE: usize = 107;
     const ID_EDIT_OUT: usize = 108;
     const ID_BTN_CLEAR: usize = 109;
+    const ID_BTN_CHECK: usize = 110;
+    const ID_CHK_DARK: usize = 111;
     const WM_KEYDOWN: u32 = 0x0100;
+    const WM_CTLCOLOREDIT: u32 = 0x0133;
+    const WM_CTLCOLORSTATIC: u32 = 0x0138;
     const VK_CONTROL: i32 = 0x11;
     const VK_F5: usize = 0x74;
 
@@ -197,6 +201,7 @@ mod win32_gui {
         fn GetWindowLongPtrW(hwnd: Hwnd, nIndex: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: Hwnd, nIndex: i32, dwNewLong: isize) -> isize;
         fn GetKeyState(nVirtKey: i32) -> i16;
+        fn InvalidateRect(hwnd: Hwnd, lpRect: *const c_void, bErase: i32) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -218,6 +223,9 @@ mod win32_gui {
             pszFaceName: *const u16,
         ) -> Hfont;
         fn DeleteObject(ho: *mut c_void) -> i32;
+        fn SetTextColor(hdc: *mut c_void, color: u32) -> u32;
+        fn SetBkColor(hdc: *mut c_void, color: u32) -> u32;
+        fn CreateSolidBrush(color: u32) -> Hbrush;
     }
 
     #[link(name = "kernel32")]
@@ -276,6 +284,8 @@ mod win32_gui {
         hwnd_flags: Hwnd,
         mono_font: Hfont,
         ui_font: Hfont,
+        dark_brush: Hbrush,
+        dark_mode: bool,
         current_file: Option<PathBuf>,
         child_proc: Arc<Mutex<Option<isize>>>,
         child_job: Arc<Mutex<Option<isize>>>,
@@ -362,11 +372,13 @@ mod win32_gui {
             })
             && (flag == "--allow-args"
                 || flag == "--allow-clipboard"
+                || flag == "--allow-exec"
                 || flag == "--unsafe"
                 || flag.starts_with("--allow-net=")
                 || flag.starts_with("--allow-read=")
                 || flag.starts_with("--allow-write=")
                 || flag.starts_with("--allow-env=")
+                || flag.starts_with("--allow-exec=")
                 || flag.starts_with("--max-steps=")
                 || flag.starts_with("--timeout="))
     }
@@ -742,10 +754,48 @@ mod win32_gui {
                             append_out(state.hwnd_out, "\n[Stopped by user]\n");
                         }
                         ID_BTN_CLEAR => set_text(state.hwnd_out, ""),
+                        ID_BTN_CHECK => {
+                            let code = get_text(state.hwnd_code).replace("\r\n", "\n");
+                            match crate::compile_source(&code) {
+                                Ok(_) => set_text(
+                                    state.hwnd_out,
+                                    "Check OK: no syntax/compile errors.\n",
+                                ),
+                                Err(e) => set_text(
+                                    state.hwnd_out,
+                                    &format!(
+                                        "Check failed:\n{}\n",
+                                        crate::format_error_with_source(&code, &e)
+                                    ),
+                                ),
+                            }
+                        }
+                        ID_CHK_DARK => {
+                            state.dark_mode = !state.dark_mode;
+                            unsafe {
+                                InvalidateRect(state.hwnd_code, null(), 1);
+                                InvalidateRect(state.hwnd_out, null(), 1);
+                            }
+                        }
                         _ => {}
                     }
                 }
                 0
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
+                if !state_ptr.is_null() {
+                    let state = unsafe { &*state_ptr };
+                    let ctrl = lparam as Hwnd;
+                    if state.dark_mode && (ctrl == state.hwnd_code || ctrl == state.hwnd_out) {
+                        let hdc = wparam as *mut c_void;
+                        unsafe {
+                            SetTextColor(hdc, 0x00DC_DCDC);
+                            SetBkColor(hdc, 0x001E_1E1E);
+                        }
+                        return state.dark_brush as Lresult;
+                    }
+                }
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
             WM_APP_OUT => {
                 let text_box = unsafe { Box::from_raw(lparam as *mut String) };
@@ -772,6 +822,7 @@ mod win32_gui {
                     unsafe {
                         DeleteObject(state.mono_font);
                         DeleteObject(state.ui_font);
+                        DeleteObject(state.dark_brush);
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     }
                 }
@@ -888,12 +939,14 @@ mod win32_gui {
             h
         };
 
-        mk_btn("Open", 8, 68, ID_BTN_OPEN, BS_PUSHBUTTON);
-        mk_btn("Save", 82, 68, ID_BTN_SAVE, BS_PUSHBUTTON);
-        mk_btn("Run", 156, 68, ID_BTN_RUN, BS_PUSHBUTTON);
-        mk_btn("Stop", 230, 68, ID_BTN_STOP, BS_PUSHBUTTON);
-        mk_btn("Clear", 304, 68, ID_BTN_CLEAR, BS_PUSHBUTTON);
-        let hwnd_chk_unsafe = mk_btn("Unsafe", 380, 74, ID_CHK_UNSAFE, BS_AUTOCHECKBOX);
+        mk_btn("Open", 8, 56, ID_BTN_OPEN, BS_PUSHBUTTON);
+        mk_btn("Save", 68, 56, ID_BTN_SAVE, BS_PUSHBUTTON);
+        mk_btn("Run", 128, 56, ID_BTN_RUN, BS_PUSHBUTTON);
+        mk_btn("Stop", 188, 56, ID_BTN_STOP, BS_PUSHBUTTON);
+        mk_btn("Check", 248, 58, ID_BTN_CHECK, BS_PUSHBUTTON);
+        mk_btn("Clear", 310, 56, ID_BTN_CLEAR, BS_PUSHBUTTON);
+        mk_btn("Dark", 370, 56, ID_CHK_DARK, BS_AUTOCHECKBOX);
+        let hwnd_chk_unsafe = mk_btn("Unsafe", 430, 68, ID_CHK_UNSAFE, BS_AUTOCHECKBOX);
 
         let flags_hint = to_wide("");
         let hwnd_flags = unsafe {
@@ -902,9 +955,9 @@ mod win32_gui {
                 edit_cls.as_ptr(),
                 flags_hint.as_ptr(),
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                460,
+                504,
                 10,
-                356,
+                312,
                 24,
                 hwnd,
                 ID_EDIT_FLAGS as Hmenu,
@@ -988,6 +1041,7 @@ mod win32_gui {
             );
         }
 
+        let dark_brush = unsafe { CreateSolidBrush(0x001E_1E1E) };
         let state = Box::new(GuiState {
             hwnd_code,
             hwnd_out,
@@ -995,6 +1049,8 @@ mod win32_gui {
             hwnd_flags,
             mono_font,
             ui_font,
+            dark_brush,
+            dark_mode: false,
             current_file,
             child_proc: Arc::new(Mutex::new(None)),
             child_job: Arc::new(Mutex::new(None)),

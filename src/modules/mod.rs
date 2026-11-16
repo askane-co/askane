@@ -1,10 +1,14 @@
+mod audio;
 mod base64;
 mod clipboard;
 mod csv;
 mod datetime;
+mod dialog;
 mod fs;
 mod gfx;
+mod glob;
 mod hash;
+mod hex;
 mod http;
 mod ini;
 mod json;
@@ -12,11 +16,16 @@ mod log;
 mod math;
 mod mem;
 mod path;
+mod process;
 mod random;
+mod regex;
 mod strings;
 mod sys;
+mod term;
 mod test;
 mod time;
+mod url;
+mod uuid;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -72,6 +81,15 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "ini" => Some(ini::module()),
         "datetime" => Some(datetime::module()),
         "clipboard" => Some(clipboard::module()),
+        "audio" => Some(audio::module()),
+        "url" => Some(url::module()),
+        "hex" => Some(hex::module()),
+        "uuid" => Some(uuid::module()),
+        "term" => Some(term::module()),
+        "glob" => Some(glob::module()),
+        "regex" => Some(regex::module()),
+        "dialog" => Some(dialog::module()),
+        "process" => Some(process::module()),
         _ => None,
     }
 }

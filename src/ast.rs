@@ -51,6 +51,13 @@ pub enum Stmt {
         body: Expr,
         span: Span,
     },
+    ForPair {
+        var1: String,
+        var2: String,
+        iter: Expr,
+        body: Expr,
+        span: Span,
+    },
     Return {
         value: Option<Expr>,
         span: Span,
@@ -117,6 +124,20 @@ pub enum Expr {
         index: Box<Expr>,
         span: Span,
     },
+    Slice {
+        object: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
+        span: Span,
+    },
+    ListComp {
+        expr: Box<Expr>,
+        var: String,
+        iter: Box<Expr>,
+        cond: Option<Box<Expr>>,
+        span: Span,
+    },
     GetAttr {
         object: Box<Expr>,
         name: String,
@@ -164,6 +185,8 @@ impl Expr {
             | Expr::Fn { span, .. }
             | Expr::Call { span, .. }
             | Expr::Index { span, .. }
+            | Expr::Slice { span, .. }
+            | Expr::ListComp { span, .. }
             | Expr::GetAttr { span, .. }
             | Expr::OptGetAttr { span, .. }
             | Expr::NullCoalesce { span, .. }
@@ -199,6 +222,7 @@ pub enum BinaryOp {
     Le,
     Gt,
     Ge,
+    In,
     And,
     Or,
 }
@@ -220,4 +244,9 @@ pub enum Pattern {
     Bool(bool),
     Str(String),
     Unit,
+    Range {
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    },
 }

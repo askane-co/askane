@@ -37,6 +37,7 @@ pub struct Permissions {
     pub allow_env: Option<Vec<String>>,
     pub allow_sys_args: bool,
     pub allow_clipboard: bool,
+    pub allow_exec: Option<Vec<String>>,
     pub max_instructions: Option<u64>,
     pub max_duration_ms: Option<u64>,
 }
@@ -51,6 +52,7 @@ impl Permissions {
             allow_env: None,
             allow_sys_args: false,
             allow_clipboard: false,
+            allow_exec: None,
             max_instructions: Some(10_000_000),
             max_duration_ms: Some(30_000),
         }
@@ -65,6 +67,7 @@ impl Permissions {
             allow_env: Some(Vec::new()),
             allow_sys_args: true,
             allow_clipboard: true,
+            allow_exec: Some(Vec::new()),
             max_instructions: None,
             max_duration_ms: None,
         }
@@ -223,6 +226,30 @@ impl VM {
         }
     }
 
+    pub fn check_exec(&self, cmd: &str) -> Result<(), String> {
+        if self.permissions.allow_all {
+            return Ok(());
+        }
+        let Some(allowed) = &self.permissions.allow_exec else {
+            return Err(
+                "process execution is disabled in sandbox mode (pass --allow-exec or --unsafe)"
+                    .to_string(),
+            );
+        };
+        if allowed.is_empty() || allowed.iter().any(|c| c.eq_ignore_ascii_case(cmd)) {
+            Ok(())
+        } else {
+            Err(format!(
+                "process.run('{}') is not allowed (pass --allow-exec={})",
+                cmd, cmd
+            ))
+        }
+    }
+
+    pub fn sandbox_root(&self) -> &PathBuf {
+        &self.sandbox_root
+    }
+
     pub fn resolve_read_path(&self, input: &str) -> Result<PathBuf, String> {
         self.resolve_path_with_roots(input, &self.permissions.allow_read)
     }
@@ -333,6 +360,11 @@ impl VM {
             ("any", native_any),
             ("all", native_all),
             ("find", native_find),
+            ("__pairs", native_pairs),
+            ("unique", native_unique),
+            ("flatten", native_flatten),
+            ("chunk", native_chunk),
+            ("sum", native_sum),
             ("has", native_has),
             ("read_line", native_read_line),
             ("clock", native_clock),
@@ -687,6 +719,25 @@ impl VM {
             Op::Le => self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?,
             Op::Gt => self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?,
             Op::Ge => self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?,
+            Op::In => {
+                let container = self.stack.pop().unwrap();
+                let needle = self.stack.pop().unwrap();
+                let found = match (needle, container) {
+                    (Value::Str(sub), Value::Str(s)) => s.contains(&sub),
+                    (val, Value::List(l)) => l.borrow().iter().any(|item| item.equals(&val)),
+                    (Value::Str(k), Value::Dict(d)) => d.borrow().contains_key(&k),
+                    (Value::Int(n), Value::Range { start, end }) => n >= start && n < end,
+                    (n, c) => {
+                        return Err(format!(
+                            "[line {}] Cannot check '{}' in '{}'",
+                            line,
+                            n.type_name(),
+                            c.type_name()
+                        ));
+                    }
+                };
+                self.stack.push(Value::Bool(found));
+            }
             Op::Jump(target) => {
                 self.frames.last_mut().unwrap().ip = target;
             }
@@ -854,6 +905,87 @@ impl VM {
                             line,
                             o.type_name(),
                             i.type_name()
+                        ));
+                    }
+                };
+                self.stack.push(res);
+            }
+            Op::Slice(inclusive) => {
+                let end_val = self.stack.pop().unwrap();
+                let start_val = self.stack.pop().unwrap();
+                let obj_val = self.stack.pop().unwrap();
+                let resolve_bounds = |len: i64| -> Result<(usize, usize), String> {
+                    let s = match &start_val {
+                        Value::Unit => 0,
+                        Value::Int(v) => {
+                            let r = if *v < 0 { len + *v } else { *v };
+                            r.clamp(0, len) as usize
+                        }
+                        other => {
+                            return Err(format!(
+                                "[line {}] Slice start must be int, got '{}'",
+                                line,
+                                other.type_name()
+                            ));
+                        }
+                    };
+                    let e = match &end_val {
+                        Value::Unit => len as usize,
+                        Value::Int(v) => {
+                            let r = if *v < 0 { len + *v } else { *v };
+                            let r = if inclusive { r + 1 } else { r };
+                            r.clamp(0, len) as usize
+                        }
+                        other => {
+                            return Err(format!(
+                                "[line {}] Slice end must be int, got '{}'",
+                                line,
+                                other.type_name()
+                            ));
+                        }
+                    };
+                    Ok((s, e))
+                };
+                let res = match obj_val {
+                    Value::List(list) => {
+                        let borrowed = list.borrow();
+                        let (s, e) = resolve_bounds(borrowed.len() as i64)?;
+                        let sliced = if s < e {
+                            borrowed[s..e].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        Value::List(Rc::new(RefCell::new(sliced)))
+                    }
+                    Value::Str(text) => {
+                        let chars: Vec<char> = text.chars().collect();
+                        let (s, e) = resolve_bounds(chars.len() as i64)?;
+                        let sliced: String = if s < e {
+                            chars[s..e].iter().collect()
+                        } else {
+                            String::new()
+                        };
+                        Value::Str(sliced)
+                    }
+                    Value::Range { start, end } => {
+                        let len = if end > start {
+                            (end - start).min(i64::MAX)
+                        } else {
+                            0
+                        };
+                        let (s, e) = resolve_bounds(len)?;
+                        let ns = start.saturating_add(s as i64);
+                        let ne = start.saturating_add(e as i64).min(end);
+                        Value::Range {
+                            start: ns,
+                            end: ne.max(ns),
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "[line {}] Cannot slice '{}'",
+                            line,
+                            other.type_name()
                         ));
                     }
                 };
@@ -1720,4 +1852,102 @@ fn native_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     }
     Ok(Value::Unit)
+}
+
+fn native_pairs(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("for a, b expects 1 iterable".to_string());
+    }
+    match &args[0] {
+        Value::Dict(_) => native_entries(vm, args),
+        Value::List(_) => Ok(args[0].clone()),
+        other => Err(format!(
+            "for a, b requires a list of pairs or dict, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn native_unique(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("unique() expects 1 argument, got {}", args.len()));
+    }
+    let items = collect_iterable(&args[0], "unique")?;
+    let mut out: Vec<Value> = Vec::new();
+    for item in items {
+        if !out.iter().any(|existing| existing.equals(&item)) {
+            out.push(item);
+        }
+    }
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+fn native_flatten(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("flatten() expects 1 argument, got {}", args.len()));
+    }
+    let items = collect_iterable(&args[0], "flatten")?;
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            Value::List(inner) => out.extend(inner.borrow().iter().cloned()),
+            other => out.push(other),
+        }
+    }
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+fn native_chunk(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("chunk() expects 2 arguments, got {}", args.len()));
+    }
+    let items = collect_iterable(&args[0], "chunk")?;
+    let size = match &args[1] {
+        Value::Int(n) if *n > 0 => *n as usize,
+        _ => return Err("chunk() size must be a positive integer".to_string()),
+    };
+    let out: Vec<Value> = items
+        .chunks(size)
+        .map(|c| Value::List(Rc::new(RefCell::new(c.to_vec()))))
+        .collect();
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+fn native_sum(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("sum() expects 1 argument, got {}", args.len()));
+    }
+    let items = collect_iterable(&args[0], "sum")?;
+    let mut int_acc: i64 = 0;
+    let mut float_acc: f64 = 0.0;
+    let mut is_float = false;
+    for item in items {
+        match item {
+            Value::Int(v) => {
+                if is_float {
+                    float_acc += v as f64;
+                } else {
+                    int_acc = int_acc.wrapping_add(v);
+                }
+            }
+            Value::Float(v) => {
+                if !is_float {
+                    is_float = true;
+                    float_acc = int_acc as f64;
+                }
+                float_acc += v;
+            }
+            other => {
+                return Err(format!(
+                    "sum() expects numeric elements, got '{}'",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    Ok(if is_float {
+        Value::Float(float_acc)
+    } else {
+        Value::Int(int_acc)
+    })
 }
