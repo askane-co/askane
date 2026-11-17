@@ -163,6 +163,10 @@ environment without sensitive files. HTTPS is encryption, not anonymity: a conta
 server can see your public IP address. See [SECURITY_AUDIT.md](SECURITY_AUDIT.md)
 for findings and [ROADMAP.md](ROADMAP.md) for proposed next releases.
 
+## Roadmap
+
+![Askane Roadmap](docs/roadmap.jpg)
+
 ## License
 
 MIT
