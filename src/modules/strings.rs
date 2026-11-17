@@ -88,7 +88,31 @@ fn str_replace(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let text = expect_str(&args[0], "replace")?;
     let from = expect_str(&args[1], "replace")?;
     let to = expect_str(&args[2], "replace")?;
-    Ok(Value::Str(text.replace(from, to)))
+    const MAX_OUT: usize = 64 * 1024 * 1024;
+    if from.is_empty() {
+        let count = text.chars().count() + 1;
+        if text.len().saturating_add(count.saturating_mul(to.len())) > MAX_OUT {
+            return Err("strings.replace() output exceeds 64 MiB limit".to_string());
+        }
+        return Ok(Value::Str(text.replace(from, to)));
+    }
+    let mut out = String::new();
+    let mut last = 0;
+    for (idx, _) in text.match_indices(from) {
+        let seg = &text[last..idx];
+        if out.len().saturating_add(seg.len()).saturating_add(to.len()) > MAX_OUT {
+            return Err("strings.replace() output exceeds 64 MiB limit".to_string());
+        }
+        out.push_str(seg);
+        out.push_str(to);
+        last = idx + from.len();
+    }
+    let tail = &text[last..];
+    if out.len().saturating_add(tail.len()) > MAX_OUT {
+        return Err("strings.replace() output exceeds 64 MiB limit".to_string());
+    }
+    out.push_str(tail);
+    Ok(Value::Str(out))
 }
 
 fn str_contains(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -265,6 +289,20 @@ fn str_join(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     };
     let sep = expect_str(&args[1], "join")?;
-    let parts: Vec<String> = list.borrow().iter().map(|v| format!("{}", v)).collect();
-    Ok(Value::Str(parts.join(sep)))
+    const MAX_OUT: usize = 64 * 1024 * 1024;
+    let mut out = String::new();
+    for (i, v) in list.borrow().iter().enumerate() {
+        if i > 0 {
+            if out.len().saturating_add(sep.len()) > MAX_OUT {
+                return Err("strings.join() output exceeds 64 MiB limit".to_string());
+            }
+            out.push_str(sep);
+        }
+        let s = format!("{}", v);
+        if out.len().saturating_add(s.len()) > MAX_OUT {
+            return Err("strings.join() output exceeds 64 MiB limit".to_string());
+        }
+        out.push_str(&s);
+    }
+    Ok(Value::Str(out))
 }

@@ -332,6 +332,7 @@ fn http_get(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("Only https:// URLs are allowed".to_string());
     }
     vm.check_net(url)?;
+    vm.check_timeout()?;
     let headers = if args.len() == 2 {
         Some(format_headers_dict(&args[1], "get")?)
     } else {
@@ -361,6 +362,7 @@ fn http_post(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("Only https:// URLs are allowed".to_string());
     }
     vm.check_net(url)?;
+    vm.check_timeout()?;
     let body = match &args[1] {
         Value::Str(s) => s.as_bytes(),
         other => {

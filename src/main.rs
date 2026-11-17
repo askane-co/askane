@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.14.1";
+const VERSION: &str = "0.14.2";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -177,9 +177,175 @@ fn run_check(path: &str, json_out: bool) -> Result<(), String> {
     }
 }
 
-fn inspect_permissions(path: &str) -> Result<Vec<String>, String> {
-    let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
-        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
+fn push_unique(out: &mut Vec<String>, item: String) {
+    if !out.contains(&item) {
+        out.push(item);
+    }
+}
+
+fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) {
+    match expr {
+        ast::Expr::Int(_, _)
+        | ast::Expr::Float(_, _)
+        | ast::Expr::Str(_, _)
+        | ast::Expr::Bool(_, _)
+        | ast::Expr::Unit(_)
+        | ast::Expr::Ident(_, _) => {}
+        ast::Expr::List(items, _) => {
+            for item in items {
+                collect_imports_expr(item, imports);
+            }
+        }
+        ast::Expr::Dict(entries, _) => {
+            for (k, v) in entries {
+                collect_imports_expr(k, imports);
+                collect_imports_expr(v, imports);
+            }
+        }
+        ast::Expr::Unary { expr: inner, .. } | ast::Expr::Throw { value: inner, .. } => {
+            collect_imports_expr(inner, imports);
+        }
+        ast::Expr::Binary { left, right, .. } | ast::Expr::NullCoalesce { left, right, .. } => {
+            collect_imports_expr(left, imports);
+            collect_imports_expr(right, imports);
+        }
+        ast::Expr::Assign { target, value, .. } => {
+            match target {
+                ast::AssignTarget::Var(_) => {}
+                ast::AssignTarget::Index { object, index } => {
+                    collect_imports_expr(object, imports);
+                    collect_imports_expr(index, imports);
+                }
+                ast::AssignTarget::Attr { object, .. } => {
+                    collect_imports_expr(object, imports);
+                }
+            }
+            collect_imports_expr(value, imports);
+        }
+        ast::Expr::Block { stmts, tail, .. } => {
+            for s in stmts {
+                collect_imports_stmt(s, imports);
+            }
+            if let Some(t) = tail {
+                collect_imports_expr(t, imports);
+            }
+        }
+        ast::Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_imports_expr(cond, imports);
+            collect_imports_expr(then_branch, imports);
+            if let Some(e) = else_branch {
+                collect_imports_expr(e, imports);
+            }
+        }
+        ast::Expr::TryCatch {
+            try_body,
+            catch_body,
+            ..
+        } => {
+            collect_imports_expr(try_body, imports);
+            collect_imports_expr(catch_body, imports);
+        }
+        ast::Expr::Match { subject, arms, .. } => {
+            collect_imports_expr(subject, imports);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_imports_expr(g, imports);
+                }
+                collect_imports_expr(&arm.body, imports);
+            }
+        }
+        ast::Expr::Fn { body, .. } => {
+            collect_imports_expr(body, imports);
+        }
+        ast::Expr::Call { callee, args, .. } => {
+            collect_imports_expr(callee, imports);
+            for a in args {
+                collect_imports_expr(a, imports);
+            }
+        }
+        ast::Expr::Index { object, index, .. } => {
+            collect_imports_expr(object, imports);
+            collect_imports_expr(index, imports);
+        }
+        ast::Expr::Slice {
+            object, start, end, ..
+        } => {
+            collect_imports_expr(object, imports);
+            if let Some(s) = start {
+                collect_imports_expr(s, imports);
+            }
+            if let Some(e) = end {
+                collect_imports_expr(e, imports);
+            }
+        }
+        ast::Expr::ListComp {
+            expr: item,
+            iter,
+            cond,
+            ..
+        } => {
+            collect_imports_expr(iter, imports);
+            if let Some(c) = cond {
+                collect_imports_expr(c, imports);
+            }
+            collect_imports_expr(item, imports);
+        }
+        ast::Expr::GetAttr { object, .. } | ast::Expr::OptGetAttr { object, .. } => {
+            collect_imports_expr(object, imports);
+        }
+    }
+}
+
+fn collect_imports_stmt(stmt: &ast::Stmt, imports: &mut Vec<ast::ImportSource>) {
+    match stmt {
+        ast::Stmt::Import { source, .. } => {
+            imports.push(source.clone());
+        }
+        ast::Stmt::Let { value, .. }
+        | ast::Stmt::LetList { value, .. }
+        | ast::Stmt::LetDict { value, .. } => {
+            collect_imports_expr(value, imports);
+        }
+        ast::Stmt::FnDecl { body, .. } => {
+            collect_imports_expr(body, imports);
+        }
+        ast::Stmt::While { cond, body, .. } => {
+            collect_imports_expr(cond, imports);
+            collect_imports_expr(body, imports);
+        }
+        ast::Stmt::For { iter, body, .. } | ast::Stmt::ForPair { iter, body, .. } => {
+            collect_imports_expr(iter, imports);
+            collect_imports_expr(body, imports);
+        }
+        ast::Stmt::Return { value, .. } => {
+            if let Some(v) = value {
+                collect_imports_expr(v, imports);
+            }
+        }
+        ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
+        ast::Stmt::Expr(e) => {
+            collect_imports_expr(e, imports);
+        }
+    }
+}
+
+fn inspect_permissions_file(
+    path: &std::path::Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    capabilities: &mut Vec<String>,
+) -> Result<(), String> {
+    if let Ok(canon) = fs::canonicalize(path) {
+        if !visited.insert(canon) {
+            return Ok(());
+        }
+    }
+    let source = read_text_limited(path, MAX_SOURCE_BYTES)
+        .map_err(|e| format!("Could not read '{}': {}", path.display(), e))?;
     if source.len() > MAX_SOURCE_BYTES {
         return Err("Source size limit exceeded".to_string());
     }
@@ -188,41 +354,63 @@ fn inspect_permissions(path: &str) -> Result<Vec<String>, String> {
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
 
-    let mut capabilities = Vec::new();
+    let mut imports = Vec::new();
     for stmt in &program.stmts {
-        if let ast::Stmt::Import { source, .. } = stmt {
-            match source {
-                ast::ImportSource::Name(name) => {
-                    let desc = match name.as_str() {
-                        "fs" => Some(
-                            "fs (sandboxed to script dir; --allow-read / --allow-write for external dirs)",
-                        ),
-                        "http" => Some("http (blocked by default; requires --allow-net[=host])"),
-                        "sys" => Some(
-                            "sys (sys.env requires --allow-env, sys.args requires --allow-args)",
-                        ),
-                        "clipboard" => {
-                            Some("clipboard (blocked by default; requires --allow-clipboard)")
-                        }
-                        "mem" => Some("mem (requires --unsafe and ASKANE_ENABLE_UNSAFE_MEM=1)"),
-                        "gfx" => Some("gfx (Win32 GUI window)"),
-                        _ => None,
-                    };
-                    if let Some(d) = desc {
-                        if !capabilities.contains(&d.to_string()) {
-                            capabilities.push(d.to_string());
-                        }
+        collect_imports_stmt(stmt, &mut imports);
+    }
+    if let Some(tail) = &program.tail {
+        collect_imports_expr(tail, &mut imports);
+    }
+
+    for source in imports {
+        match source {
+            ast::ImportSource::Name(name) => {
+                let desc = match name.as_str() {
+                    "fs" => Some(
+                        "fs (sandboxed to script dir; --allow-read / --allow-write for external dirs)",
+                    ),
+                    "http" => Some("http (blocked by default; requires --allow-net[=host])"),
+                    "sys" => {
+                        Some("sys (sys.env requires --allow-env, sys.args requires --allow-args)")
                     }
+                    "clipboard" => {
+                        Some("clipboard (blocked by default; requires --allow-clipboard)")
+                    }
+                    "process" => Some("process (blocked by default; requires --allow-exec[=cmd])"),
+                    "dialog" => Some("dialog (Win32 modal message/file dialogs)"),
+                    "audio" => Some("audio (Win32 WAV playback, sandbox-checked)"),
+                    "mem" => Some("mem (requires --unsafe and ASKANE_ENABLE_UNSAFE_MEM=1)"),
+                    "gfx" => Some("gfx (Win32 GUI window)"),
+                    _ => None,
+                };
+                if let Some(d) = desc {
+                    push_unique(capabilities, d.to_string());
                 }
-                ast::ImportSource::Path(p) => {
-                    let d = format!("file import '{}' (inherits caller permissions)", p);
-                    if !capabilities.contains(&d) {
-                        capabilities.push(d);
+            }
+            ast::ImportSource::Path(p) => {
+                let d = format!("file import '{}' (inherits caller permissions)", p);
+                push_unique(capabilities, d);
+                if visited.len() < 32 {
+                    if let Some(parent) = path.parent() {
+                        let mut sub = parent.join(&p);
+                        if sub.extension().is_none() {
+                            sub.set_extension("ask");
+                        }
+                        if sub.is_file() {
+                            let _ = inspect_permissions_file(&sub, visited, capabilities);
+                        }
                     }
                 }
             }
         }
     }
+    Ok(())
+}
+
+fn inspect_permissions(path: &str) -> Result<Vec<String>, String> {
+    let mut visited = std::collections::HashSet::new();
+    let mut capabilities = Vec::new();
+    inspect_permissions_file(std::path::Path::new(path), &mut visited, &mut capabilities)?;
     Ok(capabilities)
 }
 
@@ -498,7 +686,13 @@ fn print_help() {
     println!("  --allow-args                 Allow sys.args()");
     println!("  --allow-clipboard            Allow clipboard.get_text() / set_text()");
     println!(
+        "  --allow-exec[=cmds]          Allow process.run() (optionally comma-separated commands)"
+    );
+    println!(
         "  --max-steps=N                Override sandbox instruction budget (default 10000000)"
+    );
+    println!(
+        "  --timeout=MS                 Override sandbox execution timeout in ms (default 30000)"
     );
     println!(
         "  --unsafe                     Allow unrestricted files, network, env and process access"
@@ -1801,5 +1995,313 @@ line2""";
         let formatted = format_askane_source(raw);
         assert_eq!(formatted, "fn f() {\n    // comment\n    let x = 1;\n}\n");
         assert_eq!(format_askane_source(&formatted), formatted);
+    }
+
+    #[test]
+    fn test_v0142_compiler_temp_stack_slots() {
+        let val = eval(
+            r#"
+            import test;
+
+            fn add2(a, b) {
+                a + len(b)
+            }
+
+            let state = #{ bullets: [-2, 1, -1, 3, 5] };
+            state.bullets = [b for b in state.bullets if b > 0];
+            test.assert_eq(state.bullets, [1, 3, 5]);
+
+            let rows = [[1, 2], [3, 4]];
+            rows[1] = [x * 10 for x in rows[1]];
+            test.assert_eq(rows, [[1, 2], [30, 40]]);
+
+            let nested = [[y * 10 for y in row] for row in [[1, 2], [3]]];
+            test.assert_eq(nested, [[10, 20], [30]]);
+
+            let res_call = add2(10, [x * 2 for x in [1, 2, 3]]);
+            test.assert_eq(res_call, 13);
+
+            let res_block = 100 + {
+                let a = 7;
+                a + 3
+            };
+            test.assert_eq(res_block, 110);
+
+            let res_match = 100 + match 3 {
+                x if x > 1 => {
+                    let z = x * 10;
+                    z + 5
+                },
+                _ => 0,
+            };
+            test.assert_eq(res_match, 135);
+
+            let res_try = 100 + try {
+                let x = 5;
+                throw "boom";
+                x
+            } catch e {
+                test.assert_eq(e, "boom");
+                23
+            };
+            test.assert_eq(res_try, 123);
+
+            let make_closure = 100 + ({
+                let secret = 42;
+                let f = fn() { secret };
+                f()
+            });
+            test.assert_eq(make_closure, 142);
+
+            let pair_sum = 0;
+            for k, v in ({ let d = #{ a: 10, b: 20 }; d }) {
+                pair_sum += v;
+            }
+            test.assert_eq(pair_sum, 30);
+
+            let loop_acc = 0;
+            let i = 0;
+            while i < 5 {
+                let v = 10 + {
+                    if i == 2 {
+                        break;
+                    };
+                    1
+                };
+                loop_acc += v;
+                i += 1;
+            }
+            test.assert_eq(loop_acc, 22);
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_v0142_process_job_and_timeout() {
+        #[cfg(windows)]
+        let (ok_cmd, ok_args, sleep_cmd, sleep_args) = (
+            "cmd",
+            "[\"/c\", \"echo\", \"job-ok\"]",
+            "cmd",
+            "[\"/c\", \"for /L %i in (1,0,2) do @rem\"]",
+        );
+        #[cfg(not(windows))]
+        let (ok_cmd, ok_args, sleep_cmd, sleep_args) = (
+            "sh",
+            "[\"-c\", \"echo job-ok\"]",
+            "sh",
+            "[\"-c\", \"sleep 5\"]",
+        );
+
+        let src_ok = format!(
+            "import process; import strings;\nlet r = process.run({:?}, {});\nstrings.trim(r.stdout)",
+            ok_cmd, ok_args
+        );
+        let proto_ok = compile_source(&src_ok).expect("compile ok");
+        let mut perms_ok = Permissions::sandboxed();
+        perms_ok.allow_exec = Some(vec![]);
+        perms_ok.max_duration_ms = Some(5_000);
+        let mut vm_ok = VM::new_with_sandbox(true);
+        vm_ok.set_permissions(perms_ok);
+        let out = vm_ok.run(proto_ok).expect("process.run should succeed");
+        assert!(
+            out.equals(&Value::Str("job-ok".to_string())),
+            "got: {:?}",
+            out
+        );
+
+        // Even with --unsafe (allow_all), explicit --timeout must interrupt process.run()
+        let src_timeout = format!(
+            "import process;\nprocess.run({:?}, {})",
+            sleep_cmd, sleep_args
+        );
+        let proto_timeout = compile_source(&src_timeout).expect("compile timeout");
+        let mut perms_to = Permissions::unrestricted();
+        perms_to.max_duration_ms = Some(250);
+        let mut vm_to = VM::new_with_sandbox(false);
+        vm_to.set_permissions(perms_to);
+        let start = std::time::Instant::now();
+        let err = vm_to
+            .run(proto_timeout)
+            .expect_err("sleeping child should time out");
+        assert!(err.contains("timeout"), "unexpected err: {}", err);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "process.run timeout took too long: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_v0142_security_audit_regressions() {
+        // 1. VM::call_value properly unwinds failed closure frame so code after error never executes
+        let val = eval(
+            r#"
+            import test;
+            let pwned = false;
+            test.assert_err(|| {
+                let _ = 1 / 0;
+                pwned = true;
+            }, "Division by zero");
+            !pwned
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // 2. Sandbox instruction limit and timeout cannot be caught by try/catch or test.assert_err
+        let proto_catch_budget = compile_source(
+            r#"
+            loop {
+                try {
+                    map([1], |_| { while true {} });
+                } catch e {
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let mut perms_small = Permissions::sandboxed();
+        perms_small.max_instructions = Some(10_000);
+        let mut vm_budget = VM::new();
+        vm_budget.set_permissions(perms_small);
+        let err_budget = vm_budget.run(proto_catch_budget).unwrap_err();
+        assert!(
+            err_budget.contains("Sandbox instruction limit exceeded"),
+            "err: {}",
+            err_budget
+        );
+
+        let proto_sleep_timeout = compile_source(
+            r#"
+            import time;
+            try {
+                for i in range(100) {
+                    time.sleep_ms(200);
+                }
+            } catch e {
+                "swallowed"
+            }
+            "#,
+        )
+        .unwrap();
+        let mut perms_sleep = Permissions::sandboxed();
+        perms_sleep.max_duration_ms = Some(100);
+        let mut vm_sleep = VM::new();
+        vm_sleep.set_permissions(perms_sleep);
+        let t0 = std::time::Instant::now();
+        let err_sleep = vm_sleep.run(proto_sleep_timeout).unwrap_err();
+        assert!(
+            err_sleep.contains("Execution timeout"),
+            "err: {}",
+            err_sleep
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+
+        // 3. UNC paths, device namespaces, and outside existence oracle are blocked in sandbox
+        let vm_sb = VM::new();
+        for bad_path in [
+            "\\\\192.0.2.1\\share\\secret.txt",
+            "//192.0.2.1/share/secret.txt",
+            "\\\\.\\NUL",
+            "\\\\?\\C:\\Windows\\win.ini",
+            "CLOCK$",
+            "COM1",
+            "C:relative.txt",
+        ] {
+            assert!(
+                vm_sb.resolve_read_path(bad_path).is_err(),
+                "accepted bad path: {}",
+                bad_path
+            );
+        }
+        let e1 = vm_sb
+            .resolve_read_path("../definitely_nonexistent_dir_12345/secret.txt")
+            .unwrap_err();
+        let e2 = vm_sb.resolve_read_path("../outside.txt").unwrap_err();
+        assert!(e1.contains("outside the sandbox"), "e1: {}", e1);
+        assert!(e2.contains("outside the sandbox"), "e2: {}", e2);
+
+        // 4. fs.write blocks executable/script extensions in sandbox mode
+        for ext in ["exe", "dll", "bat", "cmd", "ps1", "vbs"] {
+            let src = format!("import fs; fs.write(\"drop.{}\", \"echo hi\")", ext);
+            let err = VM::new().run(compile_source(&src).unwrap()).unwrap_err();
+            assert!(err.contains("blocked in sandbox"), "ext {}: {}", ext, err);
+        }
+
+        // 5. --allow-exec=git rejects path separators when bare command is allowlisted
+        let mut perms_exec = Permissions::sandboxed();
+        perms_exec.allow_exec = Some(vec!["git".to_string()]);
+        let mut vm_exec = VM::new();
+        vm_exec.set_permissions(perms_exec);
+        assert!(vm_exec.check_exec("git").is_ok());
+        assert!(vm_exec.check_exec("./git").is_err());
+        assert!(vm_exec.check_exec("sub\\git").is_err());
+
+        // 6. Glob handles >64 char paths and resists exponential backtracking
+        let t_glob = std::time::Instant::now();
+        let val_glob = eval(
+            r#"
+            import glob;
+            let long_ok = glob.match(
+                "src/**/*.rs",
+                "src/modules/some_very_long_directory_name_exceeding_sixty_four_chars/file.rs"
+            );
+            let redos_ok = !glob.match(
+                "*a*a*a*a*a*a*a*a*a*a*b",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"
+            );
+            long_ok && redos_ok
+            "#,
+        );
+        assert!(val_glob.equals(&Value::Bool(true)));
+        assert!(t_glob.elapsed() < std::time::Duration::from_millis(500));
+
+        // 7. Upvalue-only local is counted in local_count and passes verify_proto
+        let val_uv = eval(
+            r#"
+            fn outer() {
+                let only_captured = 77;
+                (|| only_captured)()
+            }
+            outer()
+            "#,
+        );
+        assert!(val_uv.equals(&Value::Int(77)));
+
+        // 8. Bytecode verifier rejects mismatched upvalue list lengths
+        let child_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            name: "child".to_string(),
+            arity: 0,
+            local_count: 1,
+            upvalue_count: 1,
+            chunk: bytecode::Chunk {
+                code: vec![bytecode::Op::GetUpvalue(0), bytecode::Op::Return],
+                constants: vec![],
+                lines: vec![1, 1],
+                upvalue_lists: vec![],
+                limit_exceeded: false,
+            },
+        });
+        let bad_uv_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            name: "parent".to_string(),
+            arity: 0,
+            local_count: 1,
+            upvalue_count: 0,
+            chunk: bytecode::Chunk {
+                code: vec![bytecode::Op::Closure(0, 0), bytecode::Op::Return],
+                constants: vec![bytecode::Constant::Function(child_proto)],
+                lines: vec![1, 1],
+                upvalue_lists: vec![vec![]],
+                limit_exceeded: false,
+            },
+        });
+        assert!(
+            VM::new()
+                .run(bad_uv_proto)
+                .unwrap_err()
+                .contains("upvalue count mismatch")
+        );
     }
 }

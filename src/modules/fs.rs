@@ -41,13 +41,53 @@ fn expect_str<'a>(v: &'a Value, fn_name: &str) -> Result<&'a str, String> {
     }
 }
 
+const MAX_FS_BYTES: usize = 32 * 1024 * 1024;
+
+fn check_safe_write_target(vm: &VM, path_buf: &std::path::Path, raw: &str) -> Result<(), String> {
+    if vm.is_sandboxed() {
+        if let Ok(meta) = fs::symlink_metadata(path_buf) {
+            if meta.file_type().is_symlink() {
+                return Err(format!("Refusing to overwrite symlink '{}'", raw));
+            }
+        }
+        if let Some(ext) = path_buf.extension().and_then(|e| e.to_str()) {
+            let lower = ext.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "exe"
+                    | "dll"
+                    | "bat"
+                    | "cmd"
+                    | "ps1"
+                    | "vbs"
+                    | "vbe"
+                    | "js"
+                    | "jse"
+                    | "wsf"
+                    | "wsh"
+                    | "scr"
+                    | "com"
+                    | "msi"
+                    | "hta"
+                    | "pif"
+            ) {
+                return Err(format!(
+                    "Writing executable or script extension '.{}' is blocked in sandbox mode",
+                    lower
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn fs_read(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("fs.read() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "read")?;
     let path_buf = vm.resolve_read_path(path)?;
-    let content = crate::read_text_limited(&path_buf, 32 * 1024 * 1024)
+    let content = crate::read_text_limited(&path_buf, MAX_FS_BYTES)
         .map_err(|e| format!("fs.read('{}'): {}", path, e))?;
     Ok(Value::Str(content))
 }
@@ -58,7 +98,11 @@ fn fs_write(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let path = expect_str(&args[0], "write")?;
     let content = expect_str(&args[1], "write")?;
+    if content.len() > MAX_FS_BYTES {
+        return Err("fs.write() exceeds 32 MiB limit".to_string());
+    }
     let path_buf = vm.resolve_write_path(path)?;
+    check_safe_write_target(vm, &path_buf, path)?;
     fs::write(&path_buf, content).map_err(|e| format!("fs.write('{}'): {}", path, e))?;
     Ok(Value::Unit)
 }
@@ -69,7 +113,16 @@ fn fs_append(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let path = expect_str(&args[0], "append")?;
     let content = expect_str(&args[1], "append")?;
+    if content.len() > MAX_FS_BYTES {
+        return Err("fs.append() exceeds 32 MiB limit".to_string());
+    }
     let path_buf = vm.resolve_write_path(path)?;
+    check_safe_write_target(vm, &path_buf, path)?;
+    if let Ok(meta) = fs::metadata(&path_buf) {
+        if meta.len().saturating_add(content.len() as u64) > MAX_FS_BYTES as u64 {
+            return Err("fs.append() target file exceeds 32 MiB limit".to_string());
+        }
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -136,14 +189,7 @@ fn fs_is_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn check_not_symlink(vm: &VM, path_buf: &std::path::Path, raw: &str) -> Result<(), String> {
-    if vm.is_sandboxed() {
-        if let Ok(meta) = fs::symlink_metadata(path_buf) {
-            if meta.file_type().is_symlink() {
-                return Err(format!("Refusing to overwrite symlink '{}'", raw));
-            }
-        }
-    }
-    Ok(())
+    check_safe_write_target(vm, path_buf, raw)
 }
 
 fn fs_read_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

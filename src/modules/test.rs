@@ -68,6 +68,9 @@ fn test_assert_err(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     match vm.call_value(func, &[]) {
         Ok(v) => Err(format!("assert_err failed: expected error, got {}", v)),
         Err(err) => {
+            if VM::is_unrecoverable_error(&err) {
+                return Err(err);
+            }
             if args.len() == 2 {
                 let needle = format!("{}", args[1]);
                 if !err.contains(&needle) {

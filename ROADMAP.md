@@ -12,8 +12,8 @@ Release roadmap for Askane, separated into completed milestones, immediate fixes
 | `0.12.0` | **Done** | Askane Studio GUI, multiline REPL, `check`/`test`, core stdlib (8 modules) |
 | `0.13.0` | **Done** | Destructuring, lazy sequences, GUI Job Object, `verify_proto`, `--timeout`, `hash`/`ini`/`datetime`/`clipboard` |
 | `0.14.0 - 0.14.1` | **Done** | Extended syntax (`+=`, `in`, `loop`, slices, list comprehensions, `match` ranges), 9 modules, BMP sprites, `fmt`/`init`, interactive stdin |
-| `0.14.2-fix` | **Next** | Compiler stack-slot offset fix (`compiler.rs`) and Job Object isolation for CLI `process.run()` |
-| `0.15.0` | **Planned** | First-class `bytes`, unified `ResourceBudget`, working `askane.toml`, multi-file `.ask` projects, AST `fmt`, `struct` & `set` |
+| `0.14.2-fix` | **Done** | Compiler stack-slot offset fix (`compiler.rs`), Job Object isolation for CLI `process.run()`, and sandbox security hardening |
+| `0.15.0` | **Next** | First-class `bytes`, unified `ResourceBudget`, working `askane.toml`, multi-file `.ask` projects, AST `fmt`, `struct` & `set` |
 | `0.16.0` | **Exploratory** | 2D Desktop UI (`ui`) module before 3D, signature pipelines (`|?>`, `|*>`, `recover`), `needs`/`sandbox`, `with`/`defer` |
 | `0.17 - 0.22` | **Exploratory** | Storage/networking (`kv`, `ws`, `crypto`), diagnostics/LSP & Studio v2, cross-platform backends, fuzzing, experimental 3D (`0.22`) |
 
@@ -51,11 +51,10 @@ Askane targets a single compact binary (~1.6 MB) without pulling dozens of third
 
 ---
 
-## Next Up (`Next`)
-
-### `0.14.2-fix` - Hotfix [Next]
-- **Compiler (`compiler.rs`):** fix stack-slot calculation in `Expr::ListComp` (and `Block` / `Match` / `TryCatch`) when compiled inside compound expressions where temporary operands (such as a field receiver or call arguments) already sit on the VM stack.
-- **`process.run()` in CLI:** execute child processes inside a shared Windows Job Object / worker with enforced `--timeout` and output-size limits, matching Studio GUI behavior.
+### `0.14.2-fix` - Hotfix & Security Hardening [Done]
+- **Compiler & Verifier (`compiler.rs`, `bytecode.rs`):** fix stack-slot calculation in `Expr::ListComp` (and `Block` / `Match` / `TryCatch`) when compiled inside compound expressions with temporary operands on the VM stack; count upvalue-only locals in `local_count`; validate `upvalue_lists` bounds in `verify_proto`.
+- **`process.run()` in CLI (`process.rs`, `vm.rs`):** execute child processes inside a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with enforced `--timeout` and output-size limits, and block path-separator bypasses on bare `--allow-exec=cmd` allowlists.
+- **Sandbox & Runtime Hardening (`vm.rs`, `fs.rs`, `glob.rs`, `main.rs`):** unwind failed closures in `VM::call_value`, prevent `try`/`catch` and `test.assert_err` from swallowing sandbox limits/timeouts, block UNC/device paths and outside-sandbox existence probing, block writing executable extensions in sandbox mode, bound `glob.match` backtracking, and make `askane permissions` inspect the full AST and transitive file imports.
 
 ---
 

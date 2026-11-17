@@ -146,7 +146,54 @@ impl VM {
         self.start_time.elapsed().as_millis() as i64
     }
 
+    pub fn check_timeout(&self) -> Result<(), String> {
+        if let Some(limit_ms) = self.permissions.max_duration_ms {
+            if self.run_start.elapsed().as_millis() as u64 > limit_ms {
+                return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_unrecoverable_error(err: &str) -> bool {
+        err.contains("Sandbox instruction limit exceeded") || err.contains("Execution timeout (")
+    }
+
+    pub fn sleep_bounded(&self, ms: u64) -> Result<(), String> {
+        self.check_timeout()?;
+        if self.is_sandboxed() && ms > 1000 {
+            return Err("Sandbox sleep limit is 1000 ms per call".to_string());
+        }
+        if let Some(limit_ms) = self.permissions.max_duration_ms {
+            let elapsed = self.run_start.elapsed().as_millis() as u64;
+            if elapsed.saturating_add(ms) > limit_ms {
+                let rem = limit_ms.saturating_sub(elapsed);
+                if rem > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(rem));
+                }
+                return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        Ok(())
+    }
+
     pub fn check_net(&self, url: &str) -> Result<(), String> {
+        if url.is_empty()
+            || url.len() > 8192
+            || url
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+        {
+            return Err("Invalid URL characters or URL size".to_string());
+        }
+        let rest = url
+            .strip_prefix("https://")
+            .ok_or_else(|| "Only https:// URLs are allowed".to_string())?;
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.is_empty() || authority.contains('@') {
+            return Err("Invalid or disallowed URL authority".to_string());
+        }
         if self.permissions.allow_all {
             return Ok(());
         }
@@ -158,11 +205,7 @@ impl VM {
         if allowed.is_empty() {
             return Ok(());
         }
-        let rest = url
-            .strip_prefix("https://")
-            .ok_or_else(|| "Only https:// URLs are allowed".to_string())?;
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host_port = authority;
         let host_only = if host_port.starts_with('[') {
             host_port
                 .find(']')
@@ -227,6 +270,9 @@ impl VM {
     }
 
     pub fn check_exec(&self, cmd: &str) -> Result<(), String> {
+        if cmd.chars().any(char::is_control) {
+            return Err("process.run() command cannot contain control characters".to_string());
+        }
         if self.permissions.allow_all {
             return Ok(());
         }
@@ -236,7 +282,16 @@ impl VM {
                     .to_string(),
             );
         };
-        if allowed.is_empty() || allowed.iter().any(|c| c.eq_ignore_ascii_case(cmd)) {
+        if allowed.is_empty() {
+            return Ok(());
+        }
+        if allowed.iter().any(|c| {
+            let has_sep = c.contains('/') || c.contains('\\');
+            if !has_sep && (cmd.contains('/') || cmd.contains('\\') || cmd.contains(':')) {
+                return false;
+            }
+            c.eq_ignore_ascii_case(cmd)
+        }) {
             Ok(())
         } else {
             Err(format!(
@@ -263,6 +318,9 @@ impl VM {
         input: &str,
         extra_roots: &Option<Vec<PathBuf>>,
     ) -> Result<PathBuf, String> {
+        if input.is_empty() || input.contains('\0') {
+            return Err("invalid path".to_string());
+        }
         let raw = Path::new(input);
         let candidate = if raw.is_absolute() {
             raw.to_path_buf()
@@ -272,27 +330,45 @@ impl VM {
         if self.permissions.allow_all {
             return Ok(candidate);
         }
-        // Reject Windows device names, alternate data streams and ambiguous names
-        // before Win32 can reinterpret them. The drive prefix is handled separately.
+        if input.starts_with("\\\\") || input.starts_with("//") {
+            return Err("path is outside the sandbox policy (UNC or device namespace)".to_string());
+        }
+        // Reject Windows device names, alternate data streams, drive-relative paths,
+        // and ambiguous names before Win32 can reinterpret them.
         for component in raw.components() {
-            if let std::path::Component::Normal(name) = component {
-                let name = name.to_string_lossy();
-                let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-                if name.contains(':')
-                    || name.contains('\0')
-                    || name.ends_with(['.', ' '])
-                    || matches!(
-                        stem.as_str(),
-                        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-                    )
-                    || (stem.len() == 4
-                        && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                        && stem.as_bytes()[3].is_ascii_digit())
-                {
-                    return Err(
-                        "path is outside the sandbox policy (device or ambiguous name)".to_string(),
-                    );
+            match component {
+                std::path::Component::Prefix(prefix) => {
+                    let s = prefix.as_os_str().to_string_lossy();
+                    if !raw.is_absolute() || s.starts_with("\\\\") || s.starts_with("//") {
+                        return Err(
+                            "path is outside the sandbox policy (device or UNC prefix)".to_string()
+                        );
+                    }
                 }
+                std::path::Component::Normal(name) => {
+                    let name = name.to_string_lossy();
+                    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+                    let is_com_lpt = (stem.starts_with("COM") || stem.starts_with("LPT"))
+                        && stem.len() >= 4
+                        && stem[3..].chars().all(|c| {
+                            c.is_ascii_digit() || matches!(c, '\u{00B9}' | '\u{00B2}' | '\u{00B3}')
+                        });
+                    if name.contains(':')
+                        || name.contains('\0')
+                        || name.ends_with(['.', ' '])
+                        || matches!(
+                            stem.as_str(),
+                            "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+                        )
+                        || is_com_lpt
+                    {
+                        return Err(
+                            "path is outside the sandbox policy (device or ambiguous name)"
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(dirs) = extra_roots {
@@ -300,35 +376,87 @@ impl VM {
                 return Ok(candidate);
             }
         }
-        let existing = if candidate.symlink_metadata().is_ok() {
-            fs::canonicalize(&candidate).map_err(|e| format!("path '{}': {}", input, e))?
-        } else {
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| "invalid path".to_string())?;
-            let parent =
-                fs::canonicalize(parent).map_err(|e| format!("path '{}': {}", input, e))?;
-            parent.join(
-                candidate
-                    .file_name()
-                    .ok_or_else(|| "invalid path".to_string())?,
-            )
+        let normalize_lexical = |p: &Path, base: &Path| -> Option<PathBuf> {
+            let full = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            };
+            let mut out = PathBuf::new();
+            for comp in full.components() {
+                match comp {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        if !out.pop() {
+                            return None;
+                        }
+                    }
+                    other => out.push(other.as_os_str()),
+                }
+            }
+            Some(out)
         };
-        let root =
-            fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
-        if existing == root || existing.starts_with(&root) {
-            return Ok(existing);
+
+        let Some(lexical) = normalize_lexical(raw, &self.current_dir) else {
+            return Err(format!("path '{}' is outside the sandbox", input));
+        };
+        let mut lexical_roots = Vec::new();
+        if let Some(r) = normalize_lexical(&self.sandbox_root, &self.current_dir) {
+            lexical_roots.push(r);
         }
         if let Some(dirs) = extra_roots {
             for dir in dirs {
-                if let Ok(allowed_root) = fs::canonicalize(dir) {
-                    if existing == allowed_root || existing.starts_with(&allowed_root) {
-                        return Ok(existing);
-                    }
+                if let Some(r) = normalize_lexical(dir, &self.current_dir) {
+                    lexical_roots.push(r);
                 }
             }
         }
-        Err(format!("path '{}' is outside the sandbox", input))
+        if !lexical_roots
+            .iter()
+            .any(|r| lexical == *r || lexical.starts_with(r))
+        {
+            return Err(format!("path '{}' is outside the sandbox", input));
+        }
+
+        let root =
+            fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
+        let mut allowed_roots = vec![root];
+        if let Some(dirs) = extra_roots {
+            for dir in dirs {
+                if let Ok(allowed_root) = fs::canonicalize(dir) {
+                    allowed_roots.push(allowed_root);
+                }
+            }
+        }
+
+        // Canonicalize the deepest existing ancestor to catch symlinks/junctions inside the root.
+        let mut cur = candidate.as_path();
+        let mut tail_parts = Vec::new();
+        let canonical_base = loop {
+            if cur.symlink_metadata().is_ok() {
+                break fs::canonicalize(cur).map_err(|e| format!("path '{}': {}", input, e))?;
+            }
+            let Some(name) = cur.file_name() else {
+                return Err(format!("path '{}' is outside the sandbox", input));
+            };
+            tail_parts.push(name.to_os_string());
+            let Some(parent) = cur.parent() else {
+                return Err(format!("path '{}' is outside the sandbox", input));
+            };
+            cur = parent;
+        };
+        let mut existing = canonical_base;
+        for part in tail_parts.into_iter().rev() {
+            existing.push(part);
+        }
+        if allowed_roots
+            .iter()
+            .any(|r| existing == *r || existing.starts_with(r))
+        {
+            Ok(existing)
+        } else {
+            Err(format!("path '{}' is outside the sandbox", input))
+        }
     }
 
     fn register_natives(&mut self) {
@@ -474,7 +602,22 @@ impl VM {
                     ip: 0,
                     base,
                 });
-                self.execute(base_depth)
+                match self.execute(base_depth) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        self.close_upvalues_from(base);
+                        self.frames.truncate(base_depth);
+                        self.stack.truncate(base);
+                        while self
+                            .try_handlers
+                            .last()
+                            .is_some_and(|h| h.frame_depth > base_depth)
+                        {
+                            self.try_handlers.pop();
+                        }
+                        Err(e)
+                    }
+                }
             }
             other => Err(format!("Cannot call value of type '{}'", other.type_name())),
         }
@@ -499,6 +642,9 @@ impl VM {
                 Ok(Some(val)) => return Ok(val),
                 Ok(None) => {}
                 Err(err) => {
+                    if Self::is_unrecoverable_error(&err) {
+                        return Err(err);
+                    }
                     if let Some(handler) = self.try_handlers.last().cloned() {
                         if handler.frame_depth > target_depth {
                             self.try_handlers.pop();
@@ -608,10 +754,26 @@ impl VM {
                     (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
                     (Value::Int(x), Value::Float(y)) => Value::Float((x as f64) + y),
                     (Value::Float(x), Value::Int(y)) => Value::Float(x + (y as f64)),
-                    (Value::Str(x), Value::Str(y)) => Value::Str(format!("{}{}", x, y)),
+                    (Value::Str(x), Value::Str(y)) => {
+                        if x.len().saturating_add(y.len()) > 64 * 1024 * 1024 {
+                            return Err(format!(
+                                "[line {}] String size limit (64 MiB) exceeded",
+                                line
+                            ));
+                        }
+                        Value::Str(format!("{}{}", x, y))
+                    }
                     (Value::List(x), Value::List(y)) => {
-                        let mut combined = x.borrow().clone();
-                        combined.extend(y.borrow().iter().cloned());
+                        let x_ref = x.borrow();
+                        let y_ref = y.borrow();
+                        if x_ref.len().saturating_add(y_ref.len()) > 10_000_000 {
+                            return Err(format!(
+                                "[line {}] List size limit (10,000,000) exceeded",
+                                line
+                            ));
+                        }
+                        let mut combined = x_ref.clone();
+                        combined.extend(y_ref.iter().cloned());
                         Value::List(Rc::new(RefCell::new(combined)))
                     }
                     (l, r) => {
@@ -1387,6 +1549,9 @@ fn native_push(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::List(l) => {
+            if l.borrow().len() >= 10_000_000 {
+                return Err("push() list size exceeds maximum limit of 10,000,000".to_string());
+            }
             l.borrow_mut().push(args[1].clone());
             Ok(args[0].clone())
         }
@@ -1890,8 +2055,23 @@ fn native_flatten(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let mut out = Vec::new();
     for item in items {
         match item {
-            Value::List(inner) => out.extend(inner.borrow().iter().cloned()),
-            other => out.push(other),
+            Value::List(inner) => {
+                let b = inner.borrow();
+                if out.len().saturating_add(b.len()) > 10_000_000 {
+                    return Err(
+                        "flatten() list size exceeds maximum limit of 10,000,000".to_string()
+                    );
+                }
+                out.extend(b.iter().cloned());
+            }
+            other => {
+                if out.len() >= 10_000_000 {
+                    return Err(
+                        "flatten() list size exceeds maximum limit of 10,000,000".to_string()
+                    );
+                }
+                out.push(other);
+            }
         }
     }
     Ok(Value::List(Rc::new(RefCell::new(out))))

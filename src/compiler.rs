@@ -7,12 +7,13 @@ use crate::lexer::Span;
 struct Local {
     name: String,
     depth: usize,
+    slot: u16,
     is_captured: bool,
 }
 
 struct LoopContext {
-    break_scope_depth: usize,
-    continue_scope_depth: usize,
+    break_stack_height: usize,
+    continue_stack_height: usize,
     try_depth: usize,
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
@@ -25,6 +26,7 @@ struct FunctionCompiler {
     locals: Vec<Local>,
     upvalues: Vec<UpvalueDesc>,
     scope_depth: usize,
+    temp_depth: usize,
     try_depth: usize,
     loops: Vec<LoopContext>,
 }
@@ -35,6 +37,7 @@ impl FunctionCompiler {
         locals.push(Local {
             name: String::new(),
             depth: 0,
+            slot: 0,
             is_captured: false,
         });
         Self {
@@ -44,9 +47,14 @@ impl FunctionCompiler {
             locals,
             upvalues: Vec::new(),
             scope_depth: 0,
+            temp_depth: 0,
             try_depth: 0,
             loops: Vec::new(),
         }
+    }
+
+    fn stack_height(&self) -> usize {
+        self.locals.len() + self.temp_depth
     }
 }
 
@@ -64,6 +72,13 @@ impl Compiler {
             };
             if let Some(slot) = slot {
                 max = max.max(slot);
+            }
+        }
+        for list in &chunk.upvalue_lists {
+            for uv in list {
+                if uv.is_local {
+                    max = max.max(uv.index);
+                }
             }
         }
         max.saturating_add(1)
@@ -124,10 +139,9 @@ impl Compiler {
             .current()
             .locals
             .iter()
-            .enumerate()
             .skip(1)
-            .filter(|(_, l)| l.depth == 1 && !l.name.is_empty())
-            .map(|(slot, l)| (l.name.clone(), slot as u16))
+            .filter(|l| l.depth == 1 && !l.name.is_empty())
+            .map(|l| (l.name.clone(), l.slot))
             .collect();
 
         let count = exports.len() as u16;
@@ -193,25 +207,35 @@ impl Compiler {
         }
     }
 
+    fn push_temps(&mut self, count: usize) {
+        self.current().temp_depth += count;
+    }
+
+    fn pop_temps(&mut self, count: usize) {
+        self.current().temp_depth -= count;
+    }
+
     fn add_local(&mut self, name: String) -> u16 {
-        if self.current().locals.len() > u16::MAX as usize {
+        let stack_idx = self.current().stack_height();
+        if stack_idx > u16::MAX as usize {
             self.current().chunk.limit_exceeded = true;
             return 0;
         }
         let depth = self.current().scope_depth;
-        let idx = self.current().locals.len() as u16;
+        let slot = stack_idx as u16;
         self.current().locals.push(Local {
             name,
             depth,
+            slot,
             is_captured: false,
         });
-        idx
+        slot
     }
 
-    fn resolve_local(frame: &FunctionCompiler, name: &str) -> Option<u16> {
+    fn resolve_local(frame: &FunctionCompiler, name: &str) -> Option<(usize, u16)> {
         for (i, local) in frame.locals.iter().enumerate().rev() {
             if local.name == name {
-                return Some(i as u16);
+                return Some((i, local.slot));
             }
         }
         None
@@ -222,9 +246,9 @@ impl Compiler {
             return None;
         }
         let parent_idx = frame_idx - 1;
-        if let Some(local_idx) = Self::resolve_local(&self.frames[parent_idx], name) {
-            self.frames[parent_idx].locals[local_idx as usize].is_captured = true;
-            return Some(self.add_upvalue(frame_idx, local_idx, true));
+        if let Some((local_idx, slot)) = Self::resolve_local(&self.frames[parent_idx], name) {
+            self.frames[parent_idx].locals[local_idx].is_captured = true;
+            return Some(self.add_upvalue(frame_idx, slot, true));
         }
         if let Some(upval_idx) = self.resolve_upvalue(parent_idx, name) {
             return Some(self.add_upvalue(frame_idx, upval_idx, false));
@@ -276,10 +300,10 @@ impl Compiler {
             }
             Stmt::LetList { names, value, span } => {
                 let top_level = self.current().scope_depth == 0;
+                self.compile_expr(value)?;
                 if top_level {
                     self.begin_scope();
                 }
-                self.compile_expr(value)?;
                 let tmp = self.add_local(String::new());
                 for (i, name) in names.iter().enumerate() {
                     self.emit(Op::GetLocal(tmp), span.line);
@@ -304,10 +328,10 @@ impl Compiler {
                 span,
             } => {
                 let top_level = self.current().scope_depth == 0;
+                self.compile_expr(value)?;
                 if top_level {
                     self.begin_scope();
                 }
-                self.compile_expr(value)?;
                 let tmp = self.add_local(String::new());
                 for field in fields {
                     self.emit(Op::GetLocal(tmp), span.line);
@@ -342,11 +366,11 @@ impl Compiler {
             }
             Stmt::While { cond, body, span } => {
                 let loop_start = self.current_ip();
-                let scope_depth = self.current().scope_depth;
+                let stack_height = self.current().stack_height();
                 let loop_try_depth = self.current().try_depth;
                 self.current().loops.push(LoopContext {
-                    break_scope_depth: scope_depth,
-                    continue_scope_depth: scope_depth,
+                    break_stack_height: stack_height,
+                    continue_stack_height: stack_height,
                     try_depth: loop_try_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
@@ -377,20 +401,20 @@ impl Compiler {
                 body,
                 span,
             } => {
-                let break_scope_depth = self.current().scope_depth;
+                let break_stack_height = self.current().stack_height();
                 self.begin_scope();
                 self.compile_expr(iter)?;
-                let iter_slot = self.add_local("__for_iter".to_string());
+                let iter_slot = self.add_local("$for_iter".to_string());
 
                 let idx_const = self.current().chunk.add_constant(Constant::Int(0));
                 self.emit(Op::Constant(idx_const), span.line);
-                let idx_slot = self.add_local("__for_idx".to_string());
+                let idx_slot = self.add_local("$for_idx".to_string());
 
                 let len_name = self.current().chunk.add_string_constant("len");
                 self.emit(Op::GetGlobal(len_name), span.line);
                 self.emit(Op::GetLocal(iter_slot), span.line);
                 self.emit(Op::Call(1), span.line);
-                let len_slot = self.add_local("__for_len".to_string());
+                let len_slot = self.add_local("$for_len".to_string());
 
                 let loop_start = self.current_ip();
                 self.emit(Op::GetLocal(idx_slot), span.line);
@@ -398,11 +422,11 @@ impl Compiler {
                 self.emit(Op::Lt, span.line);
                 let exit_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
 
-                let continue_scope_depth = self.current().scope_depth;
+                let continue_stack_height = self.current().stack_height();
                 let loop_try_depth = self.current().try_depth;
                 self.current().loops.push(LoopContext {
-                    break_scope_depth,
-                    continue_scope_depth,
+                    break_stack_height,
+                    continue_stack_height,
                     try_depth: loop_try_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
@@ -448,23 +472,25 @@ impl Compiler {
                 body,
                 span,
             } => {
-                let break_scope_depth = self.current().scope_depth;
+                let break_stack_height = self.current().stack_height();
                 self.begin_scope();
                 let pairs_fn = self.current().chunk.add_string_constant("__pairs");
                 self.emit(Op::GetGlobal(pairs_fn), span.line);
+                self.push_temps(1);
                 self.compile_expr(iter)?;
+                self.pop_temps(1);
                 self.emit(Op::Call(1), span.line);
-                let iter_slot = self.add_local("__for_iter".to_string());
+                let iter_slot = self.add_local("$for_iter".to_string());
 
                 let idx_const = self.current().chunk.add_constant(Constant::Int(0));
                 self.emit(Op::Constant(idx_const), span.line);
-                let idx_slot = self.add_local("__for_idx".to_string());
+                let idx_slot = self.add_local("$for_idx".to_string());
 
                 let len_name = self.current().chunk.add_string_constant("len");
                 self.emit(Op::GetGlobal(len_name), span.line);
                 self.emit(Op::GetLocal(iter_slot), span.line);
                 self.emit(Op::Call(1), span.line);
-                let len_slot = self.add_local("__for_len".to_string());
+                let len_slot = self.add_local("$for_len".to_string());
 
                 let loop_start = self.current_ip();
                 self.emit(Op::GetLocal(idx_slot), span.line);
@@ -472,11 +498,11 @@ impl Compiler {
                 self.emit(Op::Lt, span.line);
                 let exit_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
 
-                let continue_scope_depth = self.current().scope_depth;
+                let continue_stack_height = self.current().stack_height();
                 let loop_try_depth = self.current().try_depth;
                 self.current().loops.push(LoopContext {
-                    break_scope_depth,
-                    continue_scope_depth,
+                    break_stack_height,
+                    continue_stack_height,
                     try_depth: loop_try_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
@@ -549,14 +575,14 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let (target_depth, loop_try_depth) = {
+                let (target_height, loop_try_depth) = {
                     let l = self.current().loops.last().unwrap();
-                    (l.break_scope_depth, l.try_depth)
+                    (l.break_stack_height, l.try_depth)
                 };
                 for _ in loop_try_depth..self.current().try_depth {
                     self.emit(Op::PopTry, span.line);
                 }
-                self.pop_locals_to_depth(target_depth, span.line);
+                self.pop_stack_to_height(target_height, span.line);
                 let j = self.emit(Op::Jump(0), span.line);
                 self.current().loops.last_mut().unwrap().break_jumps.push(j);
                 Ok(())
@@ -568,14 +594,14 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let (target_depth, loop_try_depth) = {
+                let (target_height, loop_try_depth) = {
                     let l = self.current().loops.last().unwrap();
-                    (l.continue_scope_depth, l.try_depth)
+                    (l.continue_stack_height, l.try_depth)
                 };
                 for _ in loop_try_depth..self.current().try_depth {
                     self.emit(Op::PopTry, span.line);
                 }
-                self.pop_locals_to_depth(target_depth, span.line);
+                self.pop_stack_to_height(target_height, span.line);
                 let j = self.emit(Op::Jump(0), span.line);
                 self.current()
                     .loops
@@ -590,6 +616,28 @@ impl Compiler {
                 self.emit(Op::Pop, expr.span().line);
                 Ok(())
             }
+        }
+    }
+
+    fn pop_stack_to_height(&mut self, target_height: usize, line: usize) {
+        let frame = self.frames.last().unwrap();
+        let cur_height = frame.stack_height();
+        let mut ops = Vec::new();
+        for pos in (target_height..cur_height).rev() {
+            let captured = frame
+                .locals
+                .iter()
+                .rev()
+                .find(|l| l.slot as usize == pos)
+                .is_some_and(|l| l.is_captured);
+            if captured {
+                ops.push(Op::CloseUpvalue);
+            } else {
+                ops.push(Op::Pop);
+            }
+        }
+        for op in ops {
+            self.emit(op, line);
         }
     }
 
@@ -638,7 +686,7 @@ impl Compiler {
             }
             Expr::Ident(name, span) => {
                 let frame_idx = self.frames.len() - 1;
-                if let Some(slot) = Self::resolve_local(&self.frames[frame_idx], name) {
+                if let Some((_, slot)) = Self::resolve_local(&self.frames[frame_idx], name) {
                     self.emit(Op::GetLocal(slot), span.line);
                 } else if let Some(upval) = self.resolve_upvalue(frame_idx, name) {
                     self.emit(Op::GetUpvalue(upval), span.line);
@@ -654,7 +702,9 @@ impl Compiler {
                 }
                 for item in items {
                     self.compile_expr(item)?;
+                    self.push_temps(1);
                 }
+                self.pop_temps(items.len());
                 self.emit(Op::MakeList(items.len() as u16), span.line);
                 Ok(())
             }
@@ -664,8 +714,11 @@ impl Compiler {
                 }
                 for (k, v) in entries {
                     self.compile_expr(k)?;
+                    self.push_temps(1);
                     self.compile_expr(v)?;
+                    self.push_temps(1);
                 }
+                self.pop_temps(entries.len() * 2);
                 self.emit(Op::MakeDict(entries.len() as u16), span.line);
                 Ok(())
             }
@@ -701,7 +754,9 @@ impl Compiler {
                 }
 
                 self.compile_expr(left)?;
+                self.push_temps(1);
                 self.compile_expr(right)?;
+                self.pop_temps(1);
                 let op_code = match op {
                     BinaryOp::Add => Op::Add,
                     BinaryOp::Sub => Op::Sub,
@@ -728,7 +783,7 @@ impl Compiler {
                 AssignTarget::Var(name) => {
                     self.compile_expr(value)?;
                     let frame_idx = self.frames.len() - 1;
-                    if let Some(slot) = Self::resolve_local(&self.frames[frame_idx], name) {
+                    if let Some((_, slot)) = Self::resolve_local(&self.frames[frame_idx], name) {
                         self.emit(Op::SetLocal(slot), span.line);
                     } else if let Some(upval) = self.resolve_upvalue(frame_idx, name) {
                         self.emit(Op::SetUpvalue(upval), span.line);
@@ -740,14 +795,19 @@ impl Compiler {
                 }
                 AssignTarget::Index { object, index } => {
                     self.compile_expr(object)?;
+                    self.push_temps(1);
                     self.compile_expr(index)?;
+                    self.push_temps(1);
                     self.compile_expr(value)?;
+                    self.pop_temps(2);
                     self.emit(Op::SetIndex, span.line);
                     Ok(())
                 }
                 AssignTarget::Attr { object, name } => {
                     self.compile_expr(object)?;
+                    self.push_temps(1);
                     self.compile_expr(value)?;
+                    self.pop_temps(1);
                     let idx = self.current().chunk.add_string_constant(name);
                     self.emit(Op::SetAttr(idx), span.line);
                     Ok(())
@@ -818,7 +878,7 @@ impl Compiler {
 
                 self.patch_jump(setup_jump);
                 self.begin_scope();
-                let var_name = catch_var.clone().unwrap_or_else(|| "__err".to_string());
+                let var_name = catch_var.clone().unwrap_or_else(|| "$err".to_string());
                 self.add_local(var_name);
                 self.compile_expr(catch_body)?;
                 self.emit(Op::SetLocal(res_slot), span.line);
@@ -844,7 +904,7 @@ impl Compiler {
                 let res_slot = self.add_local(String::new());
 
                 self.compile_expr(subject)?;
-                let subj_slot = self.add_local("__match_subject".to_string());
+                let subj_slot = self.add_local("$match_subject".to_string());
 
                 let mut end_jumps = Vec::new();
                 let mut has_irrefutable = false;
@@ -1011,9 +1071,12 @@ impl Compiler {
                     ));
                 }
                 self.compile_expr(callee)?;
+                self.push_temps(1);
                 for arg in args {
                     self.compile_expr(arg)?;
+                    self.push_temps(1);
                 }
+                self.pop_temps(1 + args.len());
                 self.emit(Op::Call(args.len() as u8), span.line);
                 Ok(())
             }
@@ -1023,7 +1086,9 @@ impl Compiler {
                 span,
             } => {
                 self.compile_expr(object)?;
+                self.push_temps(1);
                 self.compile_expr(index)?;
+                self.pop_temps(1);
                 self.emit(Op::GetIndex, span.line);
                 Ok(())
             }
@@ -1035,16 +1100,19 @@ impl Compiler {
                 span,
             } => {
                 self.compile_expr(object)?;
+                self.push_temps(1);
                 if let Some(s) = start {
                     self.compile_expr(s)?;
                 } else {
                     self.emit(Op::Unit, span.line);
                 }
+                self.push_temps(1);
                 if let Some(e) = end {
                     self.compile_expr(e)?;
                 } else {
                     self.emit(Op::Unit, span.line);
                 }
+                self.pop_temps(2);
                 self.emit(Op::Slice(*inclusive), span.line);
                 Ok(())
             }
@@ -1060,17 +1128,17 @@ impl Compiler {
                 self.begin_scope();
 
                 self.compile_expr(iter)?;
-                let iter_slot = self.add_local("__comp_iter".to_string());
+                let iter_slot = self.add_local("$comp_iter".to_string());
 
                 let zero_c = self.current().chunk.add_constant(Constant::Int(0));
                 self.emit(Op::Constant(zero_c), span.line);
-                let idx_slot = self.add_local("__comp_idx".to_string());
+                let idx_slot = self.add_local("$comp_idx".to_string());
 
                 let len_name = self.current().chunk.add_string_constant("len");
                 self.emit(Op::GetGlobal(len_name), span.line);
                 self.emit(Op::GetLocal(iter_slot), span.line);
                 self.emit(Op::Call(1), span.line);
-                let len_slot = self.add_local("__comp_len".to_string());
+                let len_slot = self.add_local("$comp_len".to_string());
 
                 let loop_start = self.current_ip();
                 self.emit(Op::GetLocal(idx_slot), span.line);
@@ -1094,7 +1162,9 @@ impl Compiler {
                 let push_name = self.current().chunk.add_string_constant("push");
                 self.emit(Op::GetGlobal(push_name), span.line);
                 self.emit(Op::GetLocal(out_slot), span.line);
+                self.push_temps(2);
                 self.compile_expr(expr)?;
+                self.pop_temps(2);
                 self.emit(Op::Call(2), span.line);
                 self.emit(Op::Pop, span.line);
 
@@ -1155,10 +1225,11 @@ impl Compiler {
         }
         let mut func_compiler = FunctionCompiler::new(name, params.len() as u8);
         func_compiler.scope_depth = 1;
-        for p in params {
+        for (i, p) in params.iter().enumerate() {
             func_compiler.locals.push(Local {
                 name: p.clone(),
                 depth: 1,
+                slot: (i + 1) as u16,
                 is_captured: false,
             });
         }

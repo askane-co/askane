@@ -7,13 +7,18 @@ pub fn module() -> Value {
 }
 
 pub fn glob_matches(pattern: &str, text: &str) -> bool {
+    if pattern.len() > 1024 || text.len() > 65536 {
+        return false;
+    }
     let p: Vec<char> = pattern.replace('\\', "/").chars().collect();
     let t: Vec<char> = text.replace('\\', "/").chars().collect();
-    match_impl(&p, &t, 0)
+    let mut steps = 0usize;
+    match_impl(&p, &t, &mut steps)
 }
 
-fn match_impl(p: &[char], t: &[char], depth: usize) -> bool {
-    if depth > 64 {
+fn match_impl(p: &[char], t: &[char], steps: &mut usize) -> bool {
+    *steps += 1;
+    if *steps > 100_000 {
         return false;
     }
     if p.is_empty() {
@@ -22,19 +27,23 @@ fn match_impl(p: &[char], t: &[char], depth: usize) -> bool {
     if p[0] == '*' {
         let is_double = p.len() > 1 && p[1] == '*';
         let rest_p = if is_double {
-            if p.len() > 2 && p[2] == '/' {
-                &p[3..]
+            let mut k = 2;
+            while k < p.len() && p[k] == '*' {
+                k += 1;
+            }
+            if k < p.len() && p[k] == '/' {
+                &p[k + 1..]
             } else {
-                &p[2..]
+                &p[k..]
             }
         } else {
             &p[1..]
         };
-        if match_impl(rest_p, t, depth + 1) {
+        if match_impl(rest_p, t, steps) {
             return true;
         }
         if !t.is_empty() && (is_double || t[0] != '/') {
-            return match_impl(p, &t[1..], depth + 1);
+            return match_impl(p, &t[1..], steps);
         }
         return false;
     }
@@ -42,7 +51,7 @@ fn match_impl(p: &[char], t: &[char], depth: usize) -> bool {
         return false;
     }
     if p[0] == '?' || p[0] == t[0] {
-        return match_impl(&p[1..], &t[1..], depth + 1);
+        return match_impl(&p[1..], &t[1..], steps);
     }
     false
 }

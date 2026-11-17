@@ -274,20 +274,44 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
                 check_str(idx, "string-operand")?;
             }
             Op::Closure(fn_idx, uv_idx) => {
-                match chunk.constants.get(fn_idx as usize) {
-                    Some(Constant::Function(child)) => verify_proto_depth(child, depth + 1)?,
+                let child = match chunk.constants.get(fn_idx as usize) {
+                    Some(Constant::Function(child)) => {
+                        verify_proto_depth(child, depth + 1)?;
+                        child
+                    }
                     _ => {
                         return Err(format!(
                             "Bytecode verification failed in '{}': Closure({}) is not a function",
                             proto.name, fn_idx
                         ));
                     }
-                }
-                if (uv_idx as usize) >= chunk.upvalue_lists.len() {
+                };
+                let Some(uv_list) = chunk.upvalue_lists.get(uv_idx as usize) else {
                     return Err(format!(
                         "Bytecode verification failed in '{}': upvalue list {} out of bounds",
                         proto.name, uv_idx
                     ));
+                };
+                if uv_list.len() != child.upvalue_count as usize {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': upvalue count mismatch for '{}'",
+                        proto.name, child.name
+                    ));
+                }
+                for desc in uv_list {
+                    if desc.is_local {
+                        if desc.index >= proto.local_count {
+                            return Err(format!(
+                                "Bytecode verification failed in '{}': captured local {} out of bounds",
+                                proto.name, desc.index
+                            ));
+                        }
+                    } else if desc.index >= proto.upvalue_count {
+                        return Err(format!(
+                            "Bytecode verification failed in '{}': captured upvalue {} out of bounds",
+                            proto.name, desc.index
+                        ));
+                    }
                 }
             }
             Op::Jump(t)

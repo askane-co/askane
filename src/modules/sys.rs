@@ -2,8 +2,6 @@ use std::cell::RefCell;
 use std::env;
 use std::process;
 use std::rc::Rc;
-use std::thread;
-use std::time::Duration;
 
 use crate::modules::build_module;
 use crate::value::Value;
@@ -85,10 +83,7 @@ fn sys_sleep(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Int(ms) if *ms >= 0 => {
-            if vm.is_sandboxed() && *ms > 1000 {
-                return Err("Sandbox sleep limit is 1000 ms per call".to_string());
-            }
-            thread::sleep(Duration::from_millis(*ms as u64));
+            vm.sleep_bounded(*ms as u64)?;
             Ok(Value::Unit)
         }
         _ => Err("sys.sleep() expects a non-negative integer".to_string()),

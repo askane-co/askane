@@ -809,7 +809,10 @@ fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let x = as_int(&args[0], "text")? as i32;
     let y = as_int(&args[1], "text")? as i32;
-    let text = format!("{}", args[2]).encode_utf16().collect::<Vec<u16>>();
+    let mut text = format!("{}", args[2]).encode_utf16().collect::<Vec<u16>>();
+    if text.len() > 4096 {
+        text.truncate(4096);
+    }
     let r = as_int(&args[3], "text")?.clamp(0, 255) as u32;
     let g = as_int(&args[4], "text")?.clamp(0, 255) as u32;
     let b = as_int(&args[5], "text")?.clamp(0, 255) as u32;
@@ -819,6 +822,9 @@ fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         let state = borrow
             .as_mut()
             .ok_or_else(|| "No active gfx window".to_string())?;
+        if state.texts.len() >= 4096 {
+            return Err("gfx.text(): maximum per-frame text count (4096) exceeded".to_string());
+        }
         state.texts.push(win32_gfx::TextDraw {
             x,
             y,
@@ -1000,11 +1006,14 @@ fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("gfx.load_image(): BMP file exceeds 32 MiB limit".to_string());
     }
     let img = win32_gfx::parse_bmp_safe(&bytes)?;
-    let id = win32_gfx::IMAGES.with(|imgs| {
+    let id = win32_gfx::IMAGES.with(|imgs| -> Result<usize, String> {
         let mut list = imgs.borrow_mut();
+        if list.len() >= 256 {
+            return Err("gfx.load_image(): maximum loaded image limit (256) exceeded".to_string());
+        }
         list.push(img);
-        list.len() - 1
-    });
+        Ok(list.len() - 1)
+    })?;
     Ok(Value::Int(id as i64))
 }
 

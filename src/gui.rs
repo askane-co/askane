@@ -268,10 +268,7 @@ mod win32_gui {
             lpOverlapped: *mut c_void,
         ) -> i32;
         fn TerminateProcess(hProcess: Handle, uExitCode: u32) -> i32;
-        fn CreateJobObjectW(
-            lpJobAttributes: *const SecurityAttributes,
-            lpName: *const u16,
-        ) -> Handle;
+        fn CreateJobObjectW(lpJobAttributes: *const c_void, lpName: *const u16) -> Handle;
         fn AssignProcessToJobObject(hJob: Handle, hProcess: Handle) -> i32;
         fn TerminateJobObject(hJob: Handle, uExitCode: u32) -> i32;
         fn WaitForSingleObject(hHandle: Handle, dwMilliseconds: u32) -> u32;
@@ -669,7 +666,7 @@ mod win32_gui {
             n_max_file_title: 0,
             lpstr_initial_dir: null(),
             lpstr_title: null(),
-            flags: OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST,
+            flags: OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | 0x0000_0008,
             n_file_offset: 0,
             n_file_extension: 0,
             lpstr_def_ext: def_ext.as_ptr(),
@@ -706,7 +703,7 @@ mod win32_gui {
             n_max_file_title: 0,
             lpstr_initial_dir: null(),
             lpstr_title: null(),
-            flags: OFN_OVERWRITEPROMPT,
+            flags: OFN_OVERWRITEPROMPT | 0x0000_0008,
             n_file_offset: 0,
             n_file_extension: 0,
             lpstr_def_ext: def_ext.as_ptr(),
@@ -823,7 +820,10 @@ mod win32_gui {
                                     );
                                 }
                             } else {
-                                append_out(state.hwnd_out, "[No running process to receive input]\n");
+                                append_out(
+                                    state.hwnd_out,
+                                    "[No running process to receive input]\n",
+                                );
                             }
                         }
                         ID_BTN_CHECK => {
@@ -859,7 +859,9 @@ mod win32_gui {
                     let state = unsafe { &*state_ptr };
                     let ctrl = lparam as Hwnd;
                     if state.dark_mode
-                        && (ctrl == state.hwnd_code || ctrl == state.hwnd_out || ctrl == state.hwnd_in)
+                        && (ctrl == state.hwnd_code
+                            || ctrl == state.hwnd_out
+                            || ctrl == state.hwnd_in)
                     {
                         let hdc = wparam as *mut c_void;
                         unsafe {

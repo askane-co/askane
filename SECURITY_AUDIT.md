@@ -85,7 +85,30 @@ locals после ошибки, instruction budget, блокировки private
    - в `random.crypto_int` устранён modulo bias с помощью rejection sampling;
    - `cargo test` после правок 0.13.0: 30/30 passed.
 
-### Что остаётся открытым
+### Что остаётся открытым (после 0.13.0)
 - Файловая песочница по-прежнему является in-process политикой (TOCTOU, hard links).
 - Интерактивное GUI, Job Object и реальный clipboard требуют ручной проверки на Windows.
 - Замена числовых handles в `mem` на непрозрачные дескрипторы с `Drop` остаётся в плане.
+
+## Изменения и аудит 0.14.0 – 0.14.2
+
+1. **Исправление смещения локальных слотов и верификатора байткода (`compiler.rs`, `bytecode.rs`):**
+   - в `compiler.rs` добавлен учёт `temp_depth` (`stack_height()`), чтобы `Expr::ListComp`, `Expr::Block`, `Expr::Match` и `Expr::TryCatch` внутри составных выражений не затирали временные операнды на стеке VM;
+   - `Compiler::local_count` теперь учитывает локальные переменные, захваченные только через `UpvalueDesc` (`is_local: true`);
+   - внутренние переменные циклов и `match` переименованы с префиксом `$` (`$for_iter`, `$match_subject`, `$comp_iter` и др.), недоступным из пользовательского синтаксиса;
+   - в `verify_proto` добавлена проверка соответствия длины `upvalue_lists` и границ индексов `UpvalueDesc`.
+2. **Устранение zombie-фреймов в `VM::call_value` и перехвата лимитов песочницы (`vm.rs`, `test.rs`):**
+   - `VM::call_value` теперь корректно раскручивает `frames`, `stack`, `open_upvalues` и `try_handlers` при ошибке внутри вызываемого замыкания (ранее при вызове через `test.assert_err` код после ошибки мог продолжить выполнение);
+   - фатальные ошибки песочницы (`Sandbox instruction limit exceeded` и `Execution timeout`) больше не могут быть перехвачены или подавлены через `try / catch` или `test.assert_err`, в том числе внутри `map`/`filter`/`reduce` и `process.run()`.
+3. **Защита файловой песочницы от UNC/SMB-утечек, оракула существования файлов и дропа бинарников (`vm.rs`, `fs.rs`):**
+   - заблокированы UNC-пути (`\\server\share`, `//server/share`), пространства имён устройств (`\\.\`, `\\?\`), `CLOCK$` и drive-relative пути (`C:file`), что предотвращает исходящие SMB-обращения и утечку NTLMv2-хешей в режиме песочницы;
+   - добавлена лексическая проверка принадлежности пути к `sandbox_root` / `allow_read` / `allow_write` до обращения к файловой системе, устраняющая оракул проверки существования внешних файлов и папок по тексту ошибки ОС;
+   - в `fs.write` и `fs.append` добавлены проверка симлинков, лимит 32 MiB и запрет записи исполняемых/скриптовых расширений (`.exe`, `.dll`, `.bat`, `.cmd`, `.ps1`, `.vbs`, `.msi` и др.) в режиме песочницы;
+   - исправлена каноникализация многоуровневых новых путей для `fs.mkdir("a/b/c")`.
+4. **Изоляция `process.run()`, учёт `--timeout` в `sleep`/`http`/`dialog` и защита от DoS (`process.rs`, `sys.rs`, `time.rs`, `glob.rs`, `strings.rs`, `regex.rs`, `gfx.rs`, `dialog.rs`, `main.rs`):**
+   - `process.run()` на Windows изолирует дочерние процессы через Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), проверяет `--timeout` (даже с `--unsafe`) и запрещает обход `--allow-exec=cmd` через относительные пути с разделителями;
+   - `sys.sleep` и `time.sleep_ms` ограничены остатком времени `--timeout`;
+   - в `glob.match` устранён экспоненциальный backtracking $O(2^N)$ и снято искусственное ограничение глубины 64 символа на длину пути;
+   - добавлены лимиты размера результата для конкатенации строк (64 MiB), списков (`10_000_000` элементов), `strings.replace`, `strings.join`, `regex.replace`, а также лимиты объектов `gfx` (`IMAGES`, `texts`) и флаг `OFN_NOCHANGEDIR` в файловых диалогах;
+   - `askane permissions` теперь рекурсивно обходит всё AST (включая вложенные блоки и функции), учитывает `process`, `dialog`, `audio` и транзитивно проверяет локальные импорты `.ask`;
+   - `cargo test` после правок 0.14.2: 36/36 passed.

@@ -300,6 +300,7 @@ fn rx_replace(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let comp = compile_pattern(expect_str(&args[0], "replace")?)?;
     let chars: Vec<char> = expect_str(&args[1], "replace")?.chars().collect();
     let repl = expect_str(&args[2], "replace")?;
+    const MAX_OUT: usize = 64 * 1024 * 1024;
     let mut out = String::new();
     let mut pos = 0;
     let mut count = 0;
@@ -308,6 +309,9 @@ fn rx_replace(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             Some((s, e)) => {
                 for &c in &chars[pos..s] {
                     out.push(c);
+                }
+                if out.len().saturating_add(repl.len()) > MAX_OUT {
+                    return Err("regex.replace() output exceeds 64 MiB limit".to_string());
                 }
                 out.push_str(repl);
                 if e == s {

@@ -28,6 +28,7 @@ mod win32_dlg {
     const OFN_PATHMUSTEXIST: u32 = 0x0000_0800;
     const OFN_FILEMUSTEXIST: u32 = 0x0000_1000;
     const OFN_OVERWRITEPROMPT: u32 = 0x0000_0002;
+    const OFN_NOCHANGEDIR: u32 = 0x0000_0008;
 
     #[repr(C)]
     struct OpenFileNameW {
@@ -106,9 +107,9 @@ mod win32_dlg {
             lpstr_initial_dir: null(),
             lpstr_title: null(),
             flags: if save {
-                OFN_OVERWRITEPROMPT
+                OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR
             } else {
-                OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST
+                OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR
             },
             n_file_offset: 0,
             n_file_extension: 0,
@@ -136,7 +137,8 @@ mod win32_dlg {
     }
 }
 
-fn dlg_info(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn dlg_info(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    vm.check_timeout()?;
     if args.len() != 2 {
         return Err("dialog.info() expects 2 string arguments (title, message)".to_string());
     }
@@ -151,7 +153,8 @@ fn dlg_info(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn dlg_confirm(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn dlg_confirm(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    vm.check_timeout()?;
     if args.len() != 2 {
         return Err("dialog.confirm() expects 2 string arguments (title, message)".to_string());
     }
@@ -169,15 +172,20 @@ fn dlg_confirm(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn dlg_open_file(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn dlg_open_file(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    vm.check_timeout()?;
     if !args.is_empty() {
         return Err("dialog.open_file() expects 0 arguments".to_string());
     }
     #[cfg(windows)]
     {
-        Ok(win32_dlg::file_dialog(false)
-            .map(Value::Str)
-            .unwrap_or(Value::Unit))
+        match win32_dlg::file_dialog(false) {
+            Some(p) => {
+                vm.resolve_read_path(&p)?;
+                Ok(Value::Str(p))
+            }
+            None => Ok(Value::Unit),
+        }
     }
     #[cfg(not(windows))]
     {
@@ -185,15 +193,20 @@ fn dlg_open_file(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn dlg_save_file(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn dlg_save_file(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    vm.check_timeout()?;
     if !args.is_empty() {
         return Err("dialog.save_file() expects 0 arguments".to_string());
     }
     #[cfg(windows)]
     {
-        Ok(win32_dlg::file_dialog(true)
-            .map(Value::Str)
-            .unwrap_or(Value::Unit))
+        match win32_dlg::file_dialog(true) {
+            Some(p) => {
+                vm.resolve_write_path(&p)?;
+                Ok(Value::Str(p))
+            }
+            None => Ok(Value::Unit),
+        }
     }
     #[cfg(not(windows))]
     {
