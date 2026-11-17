@@ -1,0 +1,38 @@
+import strings;
+
+println("Askane Calculator. Examples: 12 + 5, 10 / 0. Type 'exit' to quit.");
+
+loop {
+    print("> ");
+    let line = strings.trim(read_line());
+    if line == "" { continue; }
+    if line == "exit" || line == "quit" { break; }
+
+    let parts = strings.split(line, " ");
+    if len(parts) != 3 {
+        println("Format: <num> <op> <num> (example: 12.5 * 4)");
+        continue;
+    }
+
+    let res = try {
+        let a = float(parts[0]);
+        let op = parts[1];
+        let b = float(parts[2]);
+
+        match op {
+            "+" => a + b,
+            "-" => a - b,
+            "*" => a * b,
+            "/" => {
+                if b == 0.0 { throw "Division by zero"; }
+                a / b
+            },
+            "%" => a % b,
+            _ => throw "Unknown operator: " + op,
+        }
+    } catch err {
+        "Error: " + err
+    };
+
+    println("= ${res}");
+}

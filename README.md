@@ -1,6 +1,8 @@
 # Askane (Open Beta)
 
-Askane is an experimental, bytecode-compiled scripting language written in Rust with zero external crate dependencies.
+[![CI](https://github.com/askane-co/askane/actions/workflows/ci.yml/badge.svg)](https://github.com/askane-co/askane/actions/workflows/ci.yml)
+
+Askane is an experimental, bytecode-compiled scripting language written in Rust with zero external crate dependencies. See [docs/SYNTAX.md](docs/SYNTAX.md) for the language specification.
 
 > **Transparency note**: This language and its runtime were designed and built in collaboration with **Gemini** (AI-assisted development). I am publishing it as an open beta so anyone can test it, inspect the code, break things, and suggest improvements.
 
