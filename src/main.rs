@@ -1210,13 +1210,17 @@ mod tests {
     #[test]
     fn test_security_sandbox_and_leaks() {
         // 1. Filesystem sandbox blocks path traversal and absolute paths
-        let proto_fs = compile_source(
-            r#"
+        #[cfg(windows)]
+        let trav_src = r#"
             import fs;
             fs.read("../../../Windows/System32/drivers/etc/hosts")
-            "#,
-        )
-        .unwrap();
+        "#;
+        #[cfg(not(windows))]
+        let trav_src = r#"
+            import fs;
+            fs.read("../../../../../../etc/hosts")
+        "#;
+        let proto_fs = compile_source(trav_src).unwrap();
         let mut vm_sb = VM::new_with_sandbox(true);
         let err_fs = vm_sb.run(proto_fs).unwrap_err();
         assert!(err_fs.contains("outside the sandbox"));
