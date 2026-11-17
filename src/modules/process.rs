@@ -11,7 +11,7 @@ use crate::value::Value;
 use crate::vm::VM;
 
 #[cfg(windows)]
-mod win_job {
+mod proc_job {
     use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
     use std::process::Child;
@@ -103,11 +103,13 @@ mod win_job {
             Ok(job)
         }
 
-        pub fn terminate(&self) {
+        pub fn terminate(&mut self) {
             unsafe {
                 TerminateJobObject(self.handle, 1);
             }
         }
+
+        pub fn disarm(&mut self) {}
     }
 
     impl Drop for ProcessJob {
@@ -119,8 +121,51 @@ mod win_job {
     }
 }
 
-#[cfg(not(windows))]
-mod win_job {
+#[cfg(unix)]
+mod proc_job {
+    use std::process::Child;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    const SIGKILL: i32 = 9;
+
+    pub struct ProcessJob {
+        pgid: i32,
+        active: bool,
+    }
+
+    impl ProcessJob {
+        pub fn assign(child: &Child) -> Result<Self, String> {
+            let pgid = i32::try_from(child.id())
+                .map_err(|_| "process.run(): child pid overflow".to_string())?;
+            Ok(Self { pgid, active: true })
+        }
+
+        pub fn terminate(&mut self) {
+            if self.active && self.pgid > 0 {
+                unsafe {
+                    kill(-self.pgid, SIGKILL);
+                }
+                self.active = false;
+            }
+        }
+
+        pub fn disarm(&mut self) {
+            self.active = false;
+        }
+    }
+
+    impl Drop for ProcessJob {
+        fn drop(&mut self) {
+            self.terminate();
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+mod proc_job {
     use std::process::Child;
 
     pub struct ProcessJob;
@@ -130,7 +175,9 @@ mod win_job {
             Ok(Self)
         }
 
-        pub fn terminate(&self) {}
+        pub fn terminate(&mut self) {}
+
+        pub fn disarm(&mut self) {}
     }
 }
 
@@ -191,10 +238,15 @@ fn proc_run(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             command.env(key, val);
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .map_err(|e| format!("process.run('{}'): {}", cmd, e))?;
-    let job = match win_job::ProcessJob::assign(&child) {
+    let mut job = match proc_job::ProcessJob::assign(&child) {
         Ok(job) => job,
         Err(e) => {
             let _ = child.kill();
@@ -242,6 +294,7 @@ fn proc_run(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         thread::sleep(Duration::from_millis(5));
     }
     let status = child.wait().map_err(|e| format!("process.run(): {}", e))?;
+    job.disarm();
     let stdout = out_thread
         .join()
         .map_err(|_| "process.run(): stdout reader failed".to_string())?
