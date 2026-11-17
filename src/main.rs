@@ -932,6 +932,7 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[cfg(windows)]
     #[test]
     fn audit_http_injection_and_network_policy() {
         let source = "import http; http.post(\"https://example.com\", \"\", \"text/plain\\r\\nX-Injected: yes\")";
@@ -1220,28 +1221,35 @@ mod tests {
         let err_fs = vm_sb.run(proto_fs).unwrap_err();
         assert!(err_fs.contains("outside the sandbox"));
 
-        let proto_abs = compile_source(
-            r#"
+        #[cfg(windows)]
+        let abs_src = r#"
             import fs;
             fs.write("C:\\askane_escape_test.txt", "x")
-            "#,
-        )
-        .unwrap();
+        "#;
+        #[cfg(not(windows))]
+        let abs_src = r#"
+            import fs;
+            fs.write("/askane_escape_test.txt", "x")
+        "#;
+        let proto_abs = compile_source(abs_src).unwrap();
         let mut vm_sb2 = VM::new_with_sandbox(true);
         let err_abs = vm_sb2.run(proto_abs).unwrap_err();
         assert!(err_abs.contains("outside the sandbox"));
 
         // 2. Plain HTTP is blocked (HTTPS required)
-        let proto_http = compile_source(
-            r#"
-            import http;
-            http.get("http://example.com")
-            "#,
-        )
-        .unwrap();
-        let mut vm_http = VM::new();
-        let err_http = vm_http.run(proto_http).unwrap_err();
-        assert!(err_http.contains("https://"));
+        #[cfg(windows)]
+        {
+            let proto_http = compile_source(
+                r#"
+                import http;
+                http.get("http://example.com")
+                "#,
+            )
+            .unwrap();
+            let mut vm_http = VM::new();
+            let err_http = vm_http.run(proto_http).unwrap_err();
+            assert!(err_http.contains("https://"));
+        }
 
         // 3. Deep parser nesting returns clean error instead of stack overflow
         let deep = "(".repeat(300) + "1" + &")".repeat(300);
