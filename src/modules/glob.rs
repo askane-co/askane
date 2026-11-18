@@ -6,54 +6,90 @@ pub fn module() -> Value {
     build_module("glob", &[("match", glob_match_fn)], &[])
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlobTok {
+    Literal(char),
+    AnyChar,
+    Star,
+    DoubleStar,
+    DoubleStarDir,
+}
+
 pub fn glob_matches(pattern: &str, text: &str) -> bool {
     if pattern.len() > 1024 || text.len() > 65536 {
         return false;
     }
     let p: Vec<char> = pattern.replace('\\', "/").chars().collect();
     let t: Vec<char> = text.replace('\\', "/").chars().collect();
-    let mut steps = 0usize;
-    match_impl(&p, &t, &mut steps)
-}
 
-fn match_impl(p: &[char], t: &[char], steps: &mut usize) -> bool {
-    *steps += 1;
-    if *steps > 100_000 {
-        return false;
-    }
-    if p.is_empty() {
-        return t.is_empty();
-    }
-    if p[0] == '*' {
-        let is_double = p.len() > 1 && p[1] == '*';
-        let rest_p = if is_double {
-            let mut k = 2;
-            while k < p.len() && p[k] == '*' {
-                k += 1;
-            }
-            if k < p.len() && p[k] == '/' {
-                &p[k + 1..]
+    let mut toks = Vec::with_capacity(p.len());
+    let mut idx = 0;
+    while idx < p.len() {
+        if p[idx] == '*' {
+            let is_double = idx + 1 < p.len() && p[idx + 1] == '*';
+            if is_double {
+                while idx < p.len() && p[idx] == '*' {
+                    idx += 1;
+                }
+                if idx < p.len() && p[idx] == '/' {
+                    idx += 1;
+                    if !matches!(toks.last(), Some(GlobTok::DoubleStarDir)) {
+                        toks.push(GlobTok::DoubleStarDir);
+                    }
+                } else if !matches!(toks.last(), Some(GlobTok::DoubleStar)) {
+                    toks.push(GlobTok::DoubleStar);
+                }
             } else {
-                &p[k..]
+                idx += 1;
+                if !matches!(toks.last(), Some(GlobTok::Star | GlobTok::DoubleStar)) {
+                    toks.push(GlobTok::Star);
+                }
             }
+        } else if p[idx] == '?' {
+            toks.push(GlobTok::AnyChar);
+            idx += 1;
         } else {
-            &p[1..]
-        };
-        if match_impl(rest_p, t, steps) {
-            return true;
+            toks.push(GlobTok::Literal(p[idx]));
+            idx += 1;
         }
-        if !t.is_empty() && (is_double || t[0] != '/') {
-            return match_impl(p, &t[1..], steps);
+    }
+
+    let n = toks.len();
+    let mut prev = vec![false; n + 1];
+    let mut cur = vec![false; n + 1];
+    let mut mid_prev = vec![false; n + 1];
+    let mut mid_cur = vec![false; n + 1];
+    prev[0] = true;
+    for j in 1..=n {
+        prev[j] = prev[j - 1]
+            && matches!(
+                toks[j - 1],
+                GlobTok::Star | GlobTok::DoubleStar | GlobTok::DoubleStarDir
+            );
+    }
+
+    for &ch in &t {
+        cur[0] = false;
+        mid_cur[0] = false;
+        for j in 1..=n {
+            mid_cur[j] = false;
+            cur[j] = match toks[j - 1] {
+                GlobTok::Literal(c) => prev[j - 1] && ch == c,
+                GlobTok::AnyChar => prev[j - 1],
+                GlobTok::Star => cur[j - 1] || (ch != '/' && prev[j]),
+                GlobTok::DoubleStar => cur[j - 1] || prev[j],
+                GlobTok::DoubleStarDir => {
+                    let entered = prev[j - 1] || prev[j] || mid_prev[j];
+                    mid_cur[j] = entered;
+                    cur[j - 1] || (ch == '/' && entered)
+                }
+            };
         }
-        return false;
+        std::mem::swap(&mut prev, &mut cur);
+        std::mem::swap(&mut mid_prev, &mut mid_cur);
     }
-    if t.is_empty() {
-        return false;
-    }
-    if p[0] == '?' || p[0] == t[0] {
-        return match_impl(&p[1..], &t[1..], steps);
-    }
-    false
+
+    prev[n]
 }
 
 fn glob_match_fn(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {

@@ -2,6 +2,11 @@ use crate::modules::build_module;
 use crate::value::Value;
 use crate::vm::VM;
 
+pub fn reset_state() {
+    #[cfg(windows)]
+    win32_gfx::close_window();
+}
+
 pub fn module() -> Value {
     build_module(
         "gfx",
@@ -385,6 +390,8 @@ mod win32_gfx {
                 }
             }
         });
+        IMAGES.with(|imgs| imgs.borrow_mut().clear());
+        LAST_FRAME.with(|lf| *lf.borrow_mut() = None);
     }
 
     pub fn pump_events() -> bool {

@@ -262,28 +262,35 @@ fn proc_run(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         .stderr
         .take()
         .ok_or_else(|| "process.run(): stderr pipe unavailable".to_string())?;
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
     let out_thread = thread::spawn(move || {
         let mut b = Vec::new();
-        stdout
+        let res = stdout
             .take((MAX_OUT + 1) as u64)
             .read_to_end(&mut b)
-            .map(|_| b)
+            .map(|_| b);
+        let _ = out_tx.send(res);
     });
     let err_thread = thread::spawn(move || {
         let mut b = Vec::new();
-        stderr
+        let res = stderr
             .take((MAX_OUT + 1) as u64)
             .read_to_end(&mut b)
-            .map(|_| b)
+            .map(|_| b);
+        let _ = err_tx.send(res);
     });
     let mut timeout_err: Option<String> = None;
     loop {
-        if child
-            .try_wait()
-            .map_err(|e| format!("process.run(): {}", e))?
-            .is_some()
-        {
-            break;
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => {
+                job.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("process.run(): {}", e));
+            }
         }
         if let Err(err) = vm.check_timeout() {
             job.terminate();
@@ -294,18 +301,58 @@ fn proc_run(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         thread::sleep(Duration::from_millis(5));
     }
     let status = child.wait().map_err(|e| format!("process.run(): {}", e))?;
-    job.disarm();
-    let stdout = out_thread
-        .join()
-        .map_err(|_| "process.run(): stdout reader failed".to_string())?
-        .map_err(|e| format!("process.run(): {}", e))?;
-    let stderr = err_thread
-        .join()
-        .map_err(|_| "process.run(): stderr reader failed".to_string())?
-        .map_err(|e| format!("process.run(): {}", e))?;
+
+    let mut out_res: Option<Result<Vec<u8>, std::io::Error>> = None;
+    let mut err_res: Option<Result<Vec<u8>, std::io::Error>> = None;
+    let mut kill_deadline: Option<std::time::Instant> = timeout_err
+        .as_ref()
+        .map(|_| std::time::Instant::now() + Duration::from_millis(250));
+    while out_res.is_none() || err_res.is_none() {
+        if out_res.is_none() {
+            match out_rx.try_recv() {
+                Ok(r) => out_res = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("process.run(): stdout reader failed".to_string());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if err_res.is_none() {
+            match err_rx.try_recv() {
+                Ok(r) => err_res = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("process.run(): stderr reader failed".to_string());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if out_res.is_some() && err_res.is_some() {
+            break;
+        }
+        if let Some(deadline) = kill_deadline {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        } else if let Err(err) = vm.check_timeout() {
+            job.terminate();
+            let _ = child.kill();
+            timeout_err = Some(err);
+            kill_deadline = Some(std::time::Instant::now() + Duration::from_millis(250));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
     if let Some(err) = timeout_err {
         return Err(format!("process.run(): {}", err));
     }
+    job.disarm();
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    let stdout = out_res
+        .ok_or_else(|| "process.run(): stdout reader failed".to_string())?
+        .map_err(|e| format!("process.run(): {}", e))?;
+    let stderr = err_res
+        .ok_or_else(|| "process.run(): stderr reader failed".to_string())?
+        .map_err(|e| format!("process.run(): {}", e))?;
     let stdout_bytes = &stdout[..stdout.len().min(MAX_OUT)];
     let stderr_bytes = &stderr[..stderr.len().min(MAX_OUT)];
 

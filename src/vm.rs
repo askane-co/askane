@@ -87,8 +87,15 @@ pub struct VM {
     module_cache: HashMap<String, Value>,
     loading_modules: HashSet<String>,
     instructions_left: u64,
+    step_counter: u64,
     run_start: Instant,
     try_handlers: Vec<TryHandler>,
+}
+
+impl Drop for VM {
+    fn drop(&mut self) {
+        modules::reset_runtime_state();
+    }
 }
 
 impl VM {
@@ -117,6 +124,7 @@ impl VM {
             module_cache: HashMap::new(),
             loading_modules: HashSet::new(),
             instructions_left,
+            step_counter: 0,
             run_start: Instant::now(),
             try_handlers: Vec::new(),
         };
@@ -306,17 +314,45 @@ impl VM {
     }
 
     pub fn resolve_read_path(&self, input: &str) -> Result<PathBuf, String> {
-        self.resolve_path_with_roots(input, &self.permissions.allow_read)
+        self.resolve_path_with_roots(input, &self.permissions.allow_read, false)
     }
 
     pub fn resolve_write_path(&self, input: &str) -> Result<PathBuf, String> {
-        self.resolve_path_with_roots(input, &self.permissions.allow_write)
+        self.resolve_path_with_roots(input, &self.permissions.allow_write, false)
+    }
+
+    pub fn resolve_write_link_or_path(&self, input: &str) -> Result<PathBuf, String> {
+        self.resolve_path_with_roots(input, &self.permissions.allow_write, true)
+    }
+
+    fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, String> {
+        let mut cur = path;
+        let mut tail_parts = Vec::new();
+        let canonical_base = loop {
+            if cur.symlink_metadata().is_ok() {
+                break fs::canonicalize(cur).map_err(|e| e.to_string())?;
+            }
+            let Some(name) = cur.file_name() else {
+                return Err("path has no existing ancestor".to_string());
+            };
+            tail_parts.push(name.to_os_string());
+            let Some(parent) = cur.parent() else {
+                return Err("path has no existing ancestor".to_string());
+            };
+            cur = parent;
+        };
+        let mut existing = canonical_base;
+        for part in tail_parts.into_iter().rev() {
+            existing.push(part);
+        }
+        Ok(existing)
     }
 
     fn resolve_path_with_roots(
         &self,
         input: &str,
         extra_roots: &Option<Vec<PathBuf>>,
+        preserve_leaf_symlink: bool,
     ) -> Result<PathBuf, String> {
         if input.is_empty() || input.contains('\0') {
             return Err("invalid path".to_string());
@@ -376,22 +412,44 @@ impl VM {
                 return Ok(candidate);
             }
         }
-        let normalize_lexical = |p: &Path, base: &Path| -> Option<PathBuf> {
+        let normalize_lexical = |p: &Path, base: &Path| -> Option<Vec<String>> {
             let full = if p.is_absolute() {
                 p.to_path_buf()
             } else {
                 base.join(p)
             };
-            let mut out = PathBuf::new();
+            let mut out: Vec<String> = Vec::new();
             for comp in full.components() {
                 match comp {
                     std::path::Component::CurDir => {}
                     std::path::Component::ParentDir => {
-                        if !out.pop() {
+                        if out.is_empty() {
                             return None;
                         }
+                        if out.last().is_some_and(|s| s == "/" || s.ends_with(':')) {
+                            return None;
+                        }
+                        out.pop();
                     }
-                    other => out.push(other.as_os_str()),
+                    std::path::Component::Prefix(prefix) => {
+                        let key = match prefix.kind() {
+                            std::path::Prefix::Disk(d) | std::path::Prefix::VerbatimDisk(d) => {
+                                format!("{}:", (d as char).to_ascii_lowercase())
+                            }
+                            _ => prefix.as_os_str().to_string_lossy().into_owned(),
+                        };
+                        out.push(key);
+                    }
+                    std::path::Component::RootDir => {
+                        out.push("/".to_string());
+                    }
+                    std::path::Component::Normal(s) => {
+                        let text = s.to_string_lossy();
+                        #[cfg(windows)]
+                        out.push(text.to_lowercase());
+                        #[cfg(not(windows))]
+                        out.push(text.into_owned());
+                    }
                 }
             }
             Some(out)
@@ -411,48 +469,70 @@ impl VM {
                 }
             }
         }
-        if !lexical_roots
-            .iter()
-            .any(|r| lexical == *r || lexical.starts_with(r))
-        {
+        if !lexical_roots.iter().any(|r| lexical.starts_with(r)) {
             return Err(format!("path '{}' is outside the sandbox", input));
         }
 
         let root =
             fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
-        let mut allowed_roots = vec![root];
+        let mut allowed_roots = Vec::new();
+        if let Some(r) = normalize_lexical(&root, &self.current_dir) {
+            allowed_roots.push(r);
+        }
         if let Some(dirs) = extra_roots {
             for dir in dirs {
-                if let Ok(allowed_root) = fs::canonicalize(dir) {
-                    allowed_roots.push(allowed_root);
+                let abs = if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    self.current_dir.join(dir)
+                };
+                if let Ok(allowed_root) = Self::canonicalize_existing_prefix(&abs) {
+                    if let Some(r) = normalize_lexical(&allowed_root, &self.current_dir) {
+                        allowed_roots.push(r);
+                    }
                 }
             }
         }
 
-        // Canonicalize the deepest existing ancestor to catch symlinks/junctions inside the root.
-        let mut cur = candidate.as_path();
-        let mut tail_parts = Vec::new();
-        let canonical_base = loop {
-            if cur.symlink_metadata().is_ok() {
-                break fs::canonicalize(cur).map_err(|e| format!("path '{}': {}", input, e))?;
-            }
-            let Some(name) = cur.file_name() else {
-                return Err(format!("path '{}' is outside the sandbox", input));
-            };
-            tail_parts.push(name.to_os_string());
-            let Some(parent) = cur.parent() else {
-                return Err(format!("path '{}' is outside the sandbox", input));
-            };
-            cur = parent;
-        };
-        let mut existing = canonical_base;
-        for part in tail_parts.into_iter().rev() {
-            existing.push(part);
-        }
-        if allowed_roots
-            .iter()
-            .any(|r| existing == *r || existing.starts_with(r))
+        if preserve_leaf_symlink
+            && candidate
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
         {
+            let Some(parent) = candidate.parent() else {
+                return Err(format!("path '{}' is outside the sandbox", input));
+            };
+            let Some(name) = candidate.file_name() else {
+                return Err(format!("path '{}' is outside the sandbox", input));
+            };
+            let parent_path = if parent.as_os_str().is_empty() {
+                self.current_dir.as_path()
+            } else {
+                parent
+            };
+            let canon_parent = Self::canonicalize_existing_prefix(parent_path)
+                .map_err(|e| format!("path '{}': {}", input, e))?;
+            let Some(parent_lex) = normalize_lexical(&canon_parent, &self.current_dir) else {
+                return Err(format!("path '{}' is outside the sandbox", input));
+            };
+            if allowed_roots.iter().any(|r| parent_lex.starts_with(r)) {
+                return Ok(canon_parent.join(name));
+            }
+            return Err(format!("path '{}' is outside the sandbox", input));
+        }
+
+        // Canonicalize the deepest existing ancestor to catch symlinks/junctions inside the root.
+        let existing = Self::canonicalize_existing_prefix(&candidate).map_err(|e| {
+            if e == "path has no existing ancestor" {
+                format!("path '{}' is outside the sandbox", input)
+            } else {
+                format!("path '{}': {}", input, e)
+            }
+        })?;
+        let Some(existing_lex) = normalize_lexical(&existing, &self.current_dir) else {
+            return Err(format!("path '{}' is outside the sandbox", input));
+        };
+        if allowed_roots.iter().any(|r| existing_lex.starts_with(r)) {
             Ok(existing)
         } else {
             Err(format!("path '{}' is outside the sandbox", input))
@@ -513,6 +593,7 @@ impl VM {
         }
         if self.frames.is_empty() {
             self.instructions_left = self.permissions.max_instructions.unwrap_or(u64::MAX);
+            self.step_counter = 0;
             self.run_start = Instant::now();
             self.try_handlers.clear();
         }
@@ -625,6 +706,7 @@ impl VM {
 
     fn execute(&mut self, target_depth: usize) -> Result<Value, String> {
         loop {
+            self.step_counter = self.step_counter.wrapping_add(1);
             if self.permissions.max_instructions.is_some() {
                 if self.instructions_left == 0 {
                     return Err("Sandbox instruction limit exceeded".to_string());
@@ -632,7 +714,7 @@ impl VM {
                 self.instructions_left -= 1;
             }
             if let Some(limit_ms) = self.permissions.max_duration_ms {
-                if (self.instructions_left & 4095) == 0
+                if (self.step_counter & 4095) == 0
                     && self.run_start.elapsed().as_millis() as u64 > limit_ms
                 {
                     return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
@@ -681,6 +763,17 @@ impl VM {
             Op::False => self.stack.push(Value::Bool(false)),
             Op::Pop => {
                 self.stack.pop();
+            }
+            Op::Dup => {
+                let v = self.stack.last().unwrap().clone();
+                self.stack.push(v);
+            }
+            Op::Dup2 => {
+                let len = self.stack.len();
+                let a = self.stack[len - 2].clone();
+                let b = self.stack[len - 1].clone();
+                self.stack.push(a);
+                self.stack.push(b);
             }
             Op::GetLocal(slot) => {
                 let base = self.frames.last().unwrap().base;
@@ -900,6 +993,11 @@ impl VM {
                 };
                 self.stack.push(Value::Bool(found));
             }
+            Op::IsNumeric => {
+                let val = self.stack.pop().unwrap();
+                self.stack
+                    .push(Value::Bool(matches!(val, Value::Int(_) | Value::Float(_))));
+            }
             Op::Jump(target) => {
                 self.frames.last_mut().unwrap().ip = target;
             }
@@ -1095,7 +1193,7 @@ impl VM {
                         Value::Unit => len as usize,
                         Value::Int(v) => {
                             let r = if *v < 0 { len + *v } else { *v };
-                            let r = if inclusive { r + 1 } else { r };
+                            let r = if inclusive { r.saturating_add(1) } else { r };
                             r.clamp(0, len) as usize
                         }
                         other => {
@@ -1131,13 +1229,13 @@ impl VM {
                     }
                     Value::Range { start, end } => {
                         let len = if end > start {
-                            (end - start).min(i64::MAX)
+                            ((end as i128) - (start as i128)).min(i64::MAX as i128) as i64
                         } else {
                             0
                         };
                         let (s, e) = resolve_bounds(len)?;
-                        let ns = start.saturating_add(s as i64);
-                        let ne = start.saturating_add(e as i64).min(end);
+                        let ns = (start as i128 + s as i128).min(end as i128) as i64;
+                        let ne = (start as i128 + e as i128).min(end as i128) as i64;
                         Value::Range {
                             start: ns,
                             end: ne.max(ns),
@@ -1611,7 +1709,10 @@ fn native_map(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let items = collect_iterable(&args[0], "map")?;
     let func = args[1].clone();
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         out.push(vm.call_value(func.clone(), &[item])?);
     }
     Ok(Value::List(Rc::new(RefCell::new(out))))
@@ -1624,7 +1725,10 @@ fn native_filter(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let items = collect_iterable(&args[0], "filter")?;
     let func = args[1].clone();
     let mut out = Vec::new();
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         let keep = vm.call_value(func.clone(), std::slice::from_ref(&item))?;
         if keep.is_truthy() {
             out.push(item);
@@ -1640,7 +1744,10 @@ fn native_reduce(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let items = collect_iterable(&args[0], "reduce")?;
     let mut acc = args[1].clone();
     let func = args[2].clone();
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         acc = vm.call_value(func.clone(), &[acc, item])?;
     }
     Ok(acc)
@@ -1787,10 +1894,11 @@ fn native_remove(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn native_sort(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_sort(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(format!("sort() expects 1 argument, got {}", args.len()));
     }
+    vm.check_timeout()?;
     let list = match &args[0] {
         Value::List(l) => l,
         other => {
@@ -1802,9 +1910,17 @@ fn native_sort(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
     let mut items = list.borrow().clone();
     let mut err: Option<String> = None;
+    let mut cmp_count = 0usize;
     items.sort_by(|a, b| {
         if err.is_some() {
             return std::cmp::Ordering::Equal;
+        }
+        cmp_count += 1;
+        if (cmp_count & 4095) == 0 {
+            if let Err(e) = vm.check_timeout() {
+                err = Some(e);
+                return std::cmp::Ordering::Equal;
+            }
         }
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
@@ -1980,7 +2096,10 @@ fn native_any(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let items = collect_iterable(&args[0], "any")?;
     let func = args[1].clone();
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         if vm.call_value(func.clone(), &[item])?.is_truthy() {
             return Ok(Value::Bool(true));
         }
@@ -1994,7 +2113,10 @@ fn native_all(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let items = collect_iterable(&args[0], "all")?;
     let func = args[1].clone();
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         if !vm.call_value(func.clone(), &[item])?.is_truthy() {
             return Ok(Value::Bool(false));
         }
@@ -2008,7 +2130,10 @@ fn native_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let items = collect_iterable(&args[0], "find")?;
     let func = args[1].clone();
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         if vm
             .call_value(func.clone(), std::slice::from_ref(&item))?
             .is_truthy()
@@ -2033,27 +2158,47 @@ fn native_pairs(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn native_unique(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_unique(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(format!("unique() expects 1 argument, got {}", args.len()));
     }
+    vm.check_timeout()?;
     let items = collect_iterable(&args[0], "unique")?;
     let mut out: Vec<Value> = Vec::new();
-    for item in items {
-        if !out.iter().any(|existing| existing.equals(&item)) {
+    let mut cmp_count = 0usize;
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        let mut seen = false;
+        for existing in &out {
+            cmp_count += 1;
+            if (cmp_count & 4095) == 0 {
+                vm.check_timeout()?;
+            }
+            if existing.equals(&item) {
+                seen = true;
+                break;
+            }
+        }
+        if !seen {
             out.push(item);
         }
     }
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
-fn native_flatten(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_flatten(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(format!("flatten() expects 1 argument, got {}", args.len()));
     }
+    vm.check_timeout()?;
     let items = collect_iterable(&args[0], "flatten")?;
     let mut out = Vec::new();
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         match item {
             Value::List(inner) => {
                 let b = inner.borrow();

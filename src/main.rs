@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.14.2";
+const VERSION: &str = "0.14.3";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -210,7 +210,7 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
             collect_imports_expr(right, imports);
         }
         ast::Expr::Assign { target, value, .. } => {
-            match target {
+            match target.as_ref() {
                 ast::AssignTarget::Var(_) => {}
                 ast::AssignTarget::Index { object, index } => {
                     collect_imports_expr(object, imports);
@@ -338,7 +338,14 @@ fn inspect_permissions_file(
     path: &std::path::Path,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
     capabilities: &mut Vec<String>,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth >= 32 {
+        return Err(format!(
+            "Maximum import inspection depth (32) exceeded at '{}'",
+            path.display()
+        ));
+    }
     if let Ok(canon) = fs::canonicalize(path) {
         if !visited.insert(canon) {
             return Ok(());
@@ -390,16 +397,26 @@ fn inspect_permissions_file(
             ast::ImportSource::Path(p) => {
                 let d = format!("file import '{}' (inherits caller permissions)", p);
                 push_unique(capabilities, d);
-                if visited.len() < 32 {
-                    if let Some(parent) = path.parent() {
-                        let mut sub = parent.join(&p);
-                        if sub.extension().is_none() {
-                            sub.set_extension("ask");
-                        }
-                        if sub.is_file() {
-                            let _ = inspect_permissions_file(&sub, visited, capabilities);
-                        }
-                    }
+                let base_dir = match path.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent,
+                    _ => std::path::Path::new("."),
+                };
+                let mut sub = base_dir.join(&p);
+                if sub.extension().is_none() {
+                    sub.set_extension("ask");
+                }
+                if sub.is_file() {
+                    inspect_permissions_file(&sub, visited, capabilities, depth + 1)?;
+                } else if sub.exists() {
+                    return Err(format!(
+                        "Imported path '{}' is not a regular file",
+                        sub.display()
+                    ));
+                } else {
+                    push_unique(
+                        capabilities,
+                        format!("file import '{}' (file not found; uninspected)", p),
+                    );
                 }
             }
         }
@@ -410,7 +427,12 @@ fn inspect_permissions_file(
 fn inspect_permissions(path: &str) -> Result<Vec<String>, String> {
     let mut visited = std::collections::HashSet::new();
     let mut capabilities = Vec::new();
-    inspect_permissions_file(std::path::Path::new(path), &mut visited, &mut capabilities)?;
+    inspect_permissions_file(
+        std::path::Path::new(path),
+        &mut visited,
+        &mut capabilities,
+        0,
+    )?;
     Ok(capabilities)
 }
 
@@ -431,12 +453,33 @@ fn collect_ask_files(
     path: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
 ) -> Result<(), String> {
+    let mut visited = std::collections::HashSet::new();
+    collect_ask_files_inner(path, out, &mut visited, 0)
+}
+
+fn collect_ask_files_inner(
+    path: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 64 {
+        return Err(format!(
+            "Directory nesting too deep while scanning '{}'",
+            path.display()
+        ));
+    }
     if path.is_file() {
         out.push(path.to_path_buf());
         return Ok(());
     }
     if !path.is_dir() {
         return Err(format!("Path '{}' not found", path.display()));
+    }
+    if let Ok(canon) = fs::canonicalize(path) {
+        if !visited.insert(canon) {
+            return Ok(());
+        }
     }
     let mut entries: Vec<_> = fs::read_dir(path)
         .map_err(|e| e.to_string())?
@@ -445,8 +488,11 @@ fn collect_ask_files(
         .collect();
     entries.sort();
     for entry in entries {
+        if fs::symlink_metadata(&entry).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
         if entry.is_dir() {
-            collect_ask_files(&entry, out)?;
+            collect_ask_files_inner(&entry, out, visited, depth + 1)?;
         } else if entry.extension().and_then(|s| s.to_str()) == Some("ask") {
             out.push(entry);
         }
@@ -484,9 +530,16 @@ fn run_tests_cmd(path: &str, perms: Permissions) -> Result<(), String> {
     }
 }
 
+fn is_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
 fn needs_more_input(buf: &str) -> bool {
     let mut depth: i32 = 0;
+    let mut interp_braces: Vec<i32> = Vec::new();
     let mut in_string = false;
+    let mut in_raw_string = false;
+    let mut in_multiline_string = false;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut escape = false;
@@ -513,15 +566,39 @@ fn needs_more_input(buf: &str) -> bool {
             }
             continue;
         }
+        if in_multiline_string {
+            if ch == '"' && next == Some('"') && chars.get(i + 2).copied() == Some('"') {
+                in_multiline_string = false;
+                i += 3;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_raw_string {
+            if ch == '"' {
+                in_raw_string = false;
+            }
+            i += 1;
+            continue;
+        }
         if in_string {
             if escape {
                 escape = false;
+                i += 1;
             } else if ch == '\\' {
                 escape = true;
+                i += 1;
+            } else if ch == '$' && next == Some('{') {
+                in_string = false;
+                interp_braces.push(0);
+                i += 2;
             } else if ch == '"' {
                 in_string = false;
+                i += 1;
+            } else {
+                i += 1;
             }
-            i += 1;
             continue;
         }
 
@@ -535,20 +612,54 @@ fn needs_more_input(buf: &str) -> bool {
             i += 2;
             continue;
         }
+        if ch == 'r' && next == Some('"') && (i == 0 || !is_ident_char(chars[i - 1])) {
+            in_raw_string = true;
+            i += 2;
+            continue;
+        }
         if ch == '"' {
-            in_string = true;
-            i += 1;
+            if next == Some('"') && chars.get(i + 2).copied() == Some('"') {
+                in_multiline_string = true;
+                i += 3;
+            } else {
+                in_string = true;
+                i += 1;
+            }
             continue;
         }
         match ch {
-            '{' | '(' | '[' => depth += 1,
-            '}' | ')' | ']' => depth -= 1,
+            '{' => {
+                if let Some(d) = interp_braces.last_mut() {
+                    *d += 1;
+                } else {
+                    depth += 1;
+                }
+            }
+            '}' => {
+                if let Some(&d) = interp_braces.last() {
+                    if d == 0 {
+                        interp_braces.pop();
+                        in_string = true;
+                    } else if let Some(top) = interp_braces.last_mut() {
+                        *top -= 1;
+                    }
+                } else {
+                    depth -= 1;
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
             _ => {}
         }
         i += 1;
     }
 
-    in_string || in_block_comment || depth > 0
+    in_string
+        || in_raw_string
+        || in_multiline_string
+        || in_block_comment
+        || !interp_braces.is_empty()
+        || depth > 0
 }
 
 fn run_repl() {
@@ -716,9 +827,18 @@ fn append_csv(target: &mut Option<Vec<String>>, value: Option<&str>) {
 fn append_csv_paths(target: &mut Option<Vec<std::path::PathBuf>>, value: Option<&str>) {
     match value {
         Some(list) if !list.is_empty() => {
+            let cwd = env::current_dir().ok();
             let items = target.get_or_insert_with(Vec::new);
             for part in list.split(',').filter(|s| !s.is_empty()) {
-                items.push(std::path::PathBuf::from(part));
+                let p = std::path::PathBuf::from(part);
+                let resolved = if p.is_absolute() {
+                    p
+                } else if let Some(ref base) = cwd {
+                    base.join(p)
+                } else {
+                    p
+                };
+                items.push(resolved);
             }
         }
         _ => {
@@ -730,40 +850,122 @@ fn append_csv_paths(target: &mut Option<Vec<std::path::PathBuf>>, value: Option<
 fn format_askane_source(src: &str) -> String {
     let mut out = Vec::new();
     let mut indent: usize = 0;
+    let mut in_multiline_str = false;
+    let mut in_block_comment = false;
+
     for raw in src.replace("\r\n", "\n").lines() {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let leading_closes = trimmed.chars().take_while(|&c| c == '}').count();
-        let line_indent = indent.saturating_sub(leading_closes);
-        out.push(format!("{}{}", "    ".repeat(line_indent), trimmed));
+        let started_in_multiline = in_multiline_str;
+        let scan_src = if started_in_multiline {
+            out.push(raw.to_string());
+            raw
+        } else {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                out.push(String::new());
+                continue;
+            }
+            let leading_closes = if in_block_comment {
+                0
+            } else {
+                trimmed.chars().take_while(|&c| c == '}').count()
+            };
+            let line_indent = indent.saturating_sub(leading_closes);
+            out.push(format!("{}{}", "    ".repeat(line_indent), trimmed));
+            trimmed
+        };
 
         let mut in_str = false;
+        let mut in_raw_str = false;
         let mut esc = false;
-        let chars: Vec<char> = trimmed.chars().collect();
+        let mut interp_braces: Vec<usize> = Vec::new();
+        let chars: Vec<char> = scan_src.chars().collect();
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if in_multiline_str {
+                if c == '"' && next == Some('"') && chars.get(i + 2).copied() == Some('"') {
+                    in_multiline_str = false;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if in_raw_str {
+                if c == '"' {
+                    in_raw_str = false;
+                }
+                i += 1;
+                continue;
+            }
             if in_str {
                 if esc {
                     esc = false;
+                    i += 1;
                 } else if c == '\\' {
                     esc = true;
+                    i += 1;
+                } else if c == '$' && next == Some('{') {
+                    in_str = false;
+                    interp_braces.push(0);
+                    i += 2;
                 } else if c == '"' {
                     in_str = false;
+                    i += 1;
+                } else {
+                    i += 1;
                 }
-            } else if c == '/' && chars.get(i + 1) == Some(&'/') {
-                break;
-            } else if c == '"' {
-                in_str = true;
-            } else if c == '{' {
-                indent += 1;
-            } else if c == '}' {
-                indent = indent.saturating_sub(1);
+                continue;
             }
-            i += 1;
+
+            if c == '/' && next == Some('/') {
+                break;
+            } else if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+            } else if c == 'r' && next == Some('"') && (i == 0 || !is_ident_char(chars[i - 1])) {
+                in_raw_str = true;
+                i += 2;
+            } else if c == '"' {
+                if next == Some('"') && chars.get(i + 2).copied() == Some('"') {
+                    in_multiline_str = true;
+                    i += 3;
+                } else {
+                    in_str = true;
+                    i += 1;
+                }
+            } else if c == '{' {
+                if let Some(d) = interp_braces.last_mut() {
+                    *d += 1;
+                } else {
+                    indent += 1;
+                }
+                i += 1;
+            } else if c == '}' {
+                if let Some(&d) = interp_braces.last() {
+                    if d == 0 {
+                        interp_braces.pop();
+                        in_str = true;
+                    } else if let Some(top) = interp_braces.last_mut() {
+                        *top -= 1;
+                    }
+                } else {
+                    indent = indent.saturating_sub(1);
+                }
+                i += 1;
+            } else {
+                i += 1;
+            }
         }
     }
     let mut joined = out.join("\n");
@@ -787,6 +989,115 @@ fn run_fmt(path: &str, check_only: bool) -> Result<(), String> {
         println!("Formatted {}", path);
     }
     Ok(())
+}
+
+enum CliParseOutcome {
+    ExitZero,
+    Run {
+        dump_bytecode: bool,
+        eval_code: Option<String>,
+        perms: Permissions,
+        script_path: Option<String>,
+    },
+}
+
+fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
+    let mut dump_bytecode = false;
+    let mut eval_code: Option<String> = None;
+    let mut perms = Permissions::sandboxed();
+    let mut explicit_max_steps: Option<u64> = None;
+    let mut explicit_timeout: Option<u64> = None;
+    let mut script_path: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-h" || arg == "--help" {
+            print_help();
+            return Ok(CliParseOutcome::ExitZero);
+        }
+        if arg == "-v" || arg == "--version" {
+            println!("askane {}", VERSION);
+            return Ok(CliParseOutcome::ExitZero);
+        }
+        if arg == "-b" || arg == "--bytecode" {
+            dump_bytecode = true;
+        } else if arg == "-e" || arg == "--eval" {
+            i += 1;
+            let Some(code) = args.get(i) else {
+                return Err(format!("Missing code after {}", arg));
+            };
+            eval_code = Some(code.clone());
+        } else if arg == "--unsafe" {
+            perms = Permissions::unrestricted();
+            if let Some(steps) = explicit_max_steps {
+                perms.max_instructions = Some(steps);
+            }
+            if let Some(ms) = explicit_timeout {
+                perms.max_duration_ms = Some(ms);
+            }
+        } else if arg == "--allow-net" {
+            append_csv(&mut perms.allow_net, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-net=") {
+            append_csv(&mut perms.allow_net, Some(val));
+        } else if arg == "--allow-read" {
+            append_csv_paths(&mut perms.allow_read, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-read=") {
+            append_csv_paths(&mut perms.allow_read, Some(val));
+        } else if arg == "--allow-write" {
+            append_csv_paths(&mut perms.allow_write, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-write=") {
+            append_csv_paths(&mut perms.allow_write, Some(val));
+        } else if arg == "--allow-env" {
+            append_csv(&mut perms.allow_env, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-env=") {
+            append_csv(&mut perms.allow_env, Some(val));
+        } else if arg == "--allow-args" {
+            perms.allow_sys_args = true;
+        } else if arg == "--allow-clipboard" {
+            perms.allow_clipboard = true;
+        } else if arg == "--allow-exec" {
+            append_csv(&mut perms.allow_exec, None);
+        } else if let Some(val) = arg.strip_prefix("--allow-exec=") {
+            append_csv(&mut perms.allow_exec, Some(val));
+        } else if let Some(val) = arg.strip_prefix("--max-steps=") {
+            match val.parse::<u64>() {
+                Ok(n) => {
+                    explicit_max_steps = Some(n);
+                    perms.max_instructions = Some(n);
+                }
+                Err(_) => return Err(format!("Invalid --max-steps value: {}", val)),
+            }
+        } else if let Some(val) = arg.strip_prefix("--timeout=") {
+            match val.parse::<u64>() {
+                Ok(n) => {
+                    explicit_timeout = Some(n);
+                    perms.max_duration_ms = Some(n);
+                }
+                Err(_) => return Err(format!("Invalid --timeout value: {}", val)),
+            }
+        } else if arg.starts_with('-') {
+            return Err(format!(
+                "Unknown option '{}'. Run 'askane --help' for usage.",
+                arg
+            ));
+        } else if script_path.is_none() {
+            script_path = Some(arg.clone());
+        } else {
+            return Err(format!(
+                "Unexpected extra argument '{}'. Run 'askane --help' for usage.",
+                arg
+            ));
+        }
+        i += 1;
+    }
+
+    Ok(CliParseOutcome::Run {
+        dump_bytecode,
+        eval_code,
+        perms,
+        script_path,
+    })
 }
 
 fn main() {
@@ -931,87 +1242,20 @@ fn main() {
         1
     };
 
-    let mut dump_bytecode = false;
-    let mut eval_code: Option<String> = None;
-    let mut perms = Permissions::sandboxed();
-    let mut script_path: Option<String> = None;
-
-    let mut i = slice_start;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "-h" || arg == "--help" {
-            print_help();
-            return;
-        }
-        if arg == "-v" || arg == "--version" {
-            println!("askane {}", VERSION);
-            return;
-        }
-        if arg == "-b" || arg == "--bytecode" {
-            dump_bytecode = true;
-        } else if arg == "-e" || arg == "--eval" {
-            i += 1;
-            let Some(code) = args.get(i) else {
-                eprintln!("Missing code after {}", arg);
-                process::exit(1);
-            };
-            eval_code = Some(code.clone());
-        } else if arg == "--unsafe" {
-            perms = Permissions::unrestricted();
-        } else if arg == "--allow-net" {
-            append_csv(&mut perms.allow_net, None);
-        } else if let Some(val) = arg.strip_prefix("--allow-net=") {
-            append_csv(&mut perms.allow_net, Some(val));
-        } else if arg == "--allow-read" {
-            append_csv_paths(&mut perms.allow_read, None);
-        } else if let Some(val) = arg.strip_prefix("--allow-read=") {
-            append_csv_paths(&mut perms.allow_read, Some(val));
-        } else if arg == "--allow-write" {
-            append_csv_paths(&mut perms.allow_write, None);
-        } else if let Some(val) = arg.strip_prefix("--allow-write=") {
-            append_csv_paths(&mut perms.allow_write, Some(val));
-        } else if arg == "--allow-env" {
-            append_csv(&mut perms.allow_env, None);
-        } else if let Some(val) = arg.strip_prefix("--allow-env=") {
-            append_csv(&mut perms.allow_env, Some(val));
-        } else if arg == "--allow-args" {
-            perms.allow_sys_args = true;
-        } else if arg == "--allow-clipboard" {
-            perms.allow_clipboard = true;
-        } else if arg == "--allow-exec" {
-            append_csv(&mut perms.allow_exec, None);
-        } else if let Some(val) = arg.strip_prefix("--allow-exec=") {
-            append_csv(&mut perms.allow_exec, Some(val));
-        } else if let Some(val) = arg.strip_prefix("--max-steps=") {
-            match val.parse::<u64>() {
-                Ok(n) => perms.max_instructions = Some(n),
-                Err(_) => {
-                    eprintln!("Invalid --max-steps value: {}", val);
-                    process::exit(1);
-                }
-            }
-        } else if let Some(val) = arg.strip_prefix("--timeout=") {
-            match val.parse::<u64>() {
-                Ok(n) => perms.max_duration_ms = Some(n),
-                Err(_) => {
-                    eprintln!("Invalid --timeout value: {}", val);
-                    process::exit(1);
-                }
-            }
-        } else if arg.starts_with('-') {
-            eprintln!("Unknown option '{}'. Run 'askane --help' for usage.", arg);
-            process::exit(1);
-        } else if script_path.is_none() {
-            script_path = Some(arg.clone());
-        } else {
-            eprintln!(
-                "Unexpected extra argument '{}'. Run 'askane --help' for usage.",
-                arg
-            );
+    let (dump_bytecode, eval_code, perms, script_path) = match parse_run_args(&args[slice_start..])
+    {
+        Ok(CliParseOutcome::ExitZero) => return,
+        Ok(CliParseOutcome::Run {
+            dump_bytecode,
+            eval_code,
+            perms,
+            script_path,
+        }) => (dump_bytecode, eval_code, perms, script_path),
+        Err(e) => {
+            eprintln!("{}", e);
             process::exit(1);
         }
-        i += 1;
-    }
+    };
 
     if let Some(code) = eval_code {
         if let Err(e) = run_eval(&code, perms) {
@@ -2303,5 +2547,363 @@ line2""";
                 .unwrap_err()
                 .contains("upvalue count mismatch")
         );
+
+        // 9. glob.match handles long patterns/inputs iteratively without stack overflow
+        let glob_val = eval(
+            r#"
+            import glob;
+            import strings;
+            let big = strings.repeat("a", 32768);
+            let evil_pat = strings.repeat("*a", 100) + "b";
+            let evil_txt = strings.repeat("a", 4096);
+            glob.match("*", big)
+                && !glob.match(evil_pat, evil_txt)
+                && glob.match("src/**/*.rs", "src/modules/fs.rs")
+                && glob.match("src/**/*.rs", "src/fs.rs")
+            "#,
+        );
+        assert!(glob_val.equals(&Value::Bool(true)));
+
+        // 10. Canonical Windows verbatim sandbox_root matches normal/case-varied paths inside sandbox
+        #[cfg(windows)]
+        {
+            let mut vm_win = VM::new();
+            let repo_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let canon = std::fs::canonicalize(&repo_dir).unwrap();
+            vm_win.set_current_dir(canon.clone());
+            vm_win.set_sandbox_root(canon);
+            let lower_toml = repo_dir
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            assert!(vm_win.resolve_read_path(&lower_toml).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_v0143_fixes() {
+        // 1. VM timeout works even with --unsafe (max_instructions == None) and CLI flag order is independent
+        for args_vec in [
+            vec![
+                "--unsafe".to_string(),
+                "--timeout=50".to_string(),
+                "--max-steps=5000".to_string(),
+                "a.ask".to_string(),
+            ],
+            vec![
+                "--timeout=50".to_string(),
+                "--max-steps=5000".to_string(),
+                "--unsafe".to_string(),
+                "a.ask".to_string(),
+            ],
+        ] {
+            match parse_run_args(&args_vec).unwrap() {
+                CliParseOutcome::Run { perms, .. } => {
+                    assert!(perms.allow_all);
+                    assert_eq!(perms.max_duration_ms, Some(50));
+                    assert_eq!(perms.max_instructions, Some(5000));
+                }
+                CliParseOutcome::ExitZero => panic!("expected Run"),
+            }
+        }
+        let mut perms_unsafe_to = Permissions::unrestricted();
+        perms_unsafe_to.max_duration_ms = Some(40);
+        let mut vm_to = VM::new_with_sandbox(false);
+        vm_to.set_permissions(perms_unsafe_to);
+        let err_to = vm_to
+            .run(compile_source("while true {}").unwrap())
+            .unwrap_err();
+        assert!(err_to.contains("Execution timeout"), "err: {}", err_to);
+
+        // 2. process.run() respects --timeout even when parent spawns a detached grandchild holding pipes
+        #[cfg(windows)]
+        let gc_src = r#"import process; process.run("cmd", ["/c", "start", "/b", "cmd", "/c", "for /L %i in (1,0,2) do @rem"])"#;
+        #[cfg(not(windows))]
+        let gc_src = r#"import process; process.run("sh", ["-c", "sleep 5 &"])"#;
+        let mut perms_gc = Permissions::sandboxed();
+        perms_gc.allow_exec = Some(vec![]);
+        perms_gc.max_duration_ms = Some(150);
+        let mut vm_gc = VM::new_with_sandbox(true);
+        vm_gc.set_permissions(perms_gc);
+        let t_gc = std::time::Instant::now();
+        let err_gc = vm_gc.run(compile_source(gc_src).unwrap()).unwrap_err();
+        assert!(err_gc.contains("timeout"), "err: {}", err_gc);
+        assert!(t_gc.elapsed() < std::time::Duration::from_secs(3));
+
+        // 3. Non-existent --allow-write subdir & relative CLI paths & symlink removal without following target
+        let tmp_root = std::env::temp_dir().join(format!(
+            "askane_0143_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let sb_dir = tmp_root.join("sb");
+        let ext_write_dir = tmp_root.join("ext_out").join("nested");
+        fs::create_dir_all(&sb_dir).unwrap();
+        fs::create_dir_all(tmp_root.join("ext_out")).unwrap();
+        let mut perms_ext = Permissions::sandboxed();
+        perms_ext.allow_write = Some(vec![ext_write_dir.clone()]);
+        let mut vm_ext = VM::new();
+        vm_ext.set_permissions(perms_ext);
+        vm_ext.set_current_dir(sb_dir.clone());
+        vm_ext.set_sandbox_root(sb_dir.clone());
+        let target_file = ext_write_dir.join("out.txt");
+        assert!(
+            vm_ext
+                .resolve_write_path(&target_file.to_string_lossy())
+                .is_ok()
+        );
+
+        // 4. askane permissions inspects >32 sibling file imports and propagates errors
+        let perm_dir = tmp_root.join("perms");
+        fs::create_dir_all(&perm_dir).unwrap();
+        let mut main_src = String::new();
+        for i in 1..=33 {
+            let p = perm_dir.join(format!("m{}.ask", i));
+            fs::write(&p, format!("let v{} = {};\n", i, i)).unwrap();
+            main_src.push_str(&format!("import \"m{}.ask\";\n", i));
+        }
+        fs::write(perm_dir.join("evil.ask"), "import process;\nlet z = 1;\n").unwrap();
+        main_src.push_str("import \"evil.ask\";\n");
+        let app_ask = perm_dir.join("app.ask");
+        fs::write(&app_ask, &main_src).unwrap();
+        let caps = inspect_permissions(&app_ask.to_string_lossy()).unwrap();
+        assert!(
+            caps.iter().any(|c| c.contains("process")),
+            "caps missed process after >32 imports: {:?}",
+            caps
+        );
+        fs::write(perm_dir.join("broken.ask"), "let = ;").unwrap();
+        fs::write(perm_dir.join("bad_app.ask"), "import \"broken.ask\";\n").unwrap();
+        assert!(inspect_permissions(&perm_dir.join("bad_app.ask").to_string_lossy()).is_err());
+
+        // 5. Local and module recursive functions work
+        let mod_file = sb_dir.join("recmod.ask");
+        fs::write(
+            &mod_file,
+            "fn fact(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }\n",
+        )
+        .unwrap();
+        let rec_src = format!(
+            r#"
+            import {:?} as m;
+            fn outer() {{
+                fn fib(n) {{
+                    if n <= 1 {{ n }} else {{ fib(n - 1) + fib(n - 2) }}
+                }}
+                fib(7) + m.fact(5)
+            }}
+            outer()
+            "#,
+            mod_file.file_name().unwrap().to_string_lossy()
+        );
+        let mut vm_rec = VM::new();
+        vm_rec.set_current_dir(sb_dir.clone());
+        vm_rec.set_sandbox_root(sb_dir.clone());
+        let rec_val = vm_rec.run(compile_source(&rec_src).unwrap()).unwrap();
+        assert!(rec_val.equals(&Value::Int(13 + 120)));
+
+        // 6. Overflow panics fixed in Op::Slice, math.abs, and datetime.parse_iso
+        let slice_ok = eval(
+            r#"
+            let r = range(-9223372036854775807, 9223372036854775807);
+            len(r[0..1]) == 1 && [1, 2, 3][0..=9223372036854775807] == [1, 2, 3]
+            "#,
+        );
+        assert!(slice_ok.equals(&Value::Bool(true)));
+        assert!(
+            VM::new()
+                .run(compile_source("import math; math.abs(-9223372036854775807 - 1)").unwrap())
+                .is_err()
+        );
+        assert!(
+            VM::new()
+                .run(
+                    compile_source(r#"import datetime; datetime.parse_iso("300000000000-01-01")"#)
+                        .unwrap()
+                )
+                .is_err()
+        );
+        assert!(
+            VM::new()
+                .run(
+                    compile_source(r#"import datetime; datetime.parse_iso("2023-02-29")"#).unwrap()
+                )
+                .is_err()
+        );
+
+        // 7. glob.match enforces **/ segment boundary and handles 65k input without stack overflow
+        let glob_seg = eval(
+            r#"
+            import glob;
+            import strings;
+            let big = strings.repeat("a", 65000);
+            !glob.match("**/secret.txt", "mysecret.txt")
+                && !glob.match("a/**/b", "a/xb")
+                && glob.match("**/secret.txt", "secret.txt")
+                && glob.match("**/secret.txt", "dir/secret.txt")
+                && glob.match("src/**/*.rs", "src/fs.rs")
+                && glob.match("src/**/*.rs", "src/modules/fs.rs")
+                && !glob.match("**b", big)
+            "#,
+        );
+        assert!(glob_seg.equals(&Value::Bool(true)));
+
+        // 8. DAG equality, str(dag), and unique() timeout protection
+        let t_dag = std::time::Instant::now();
+        let dag_ok = eval(
+            r#"
+            let a = [1];
+            let b = [1];
+            for i in range(0, 40) {
+                a = [a, a];
+                b = [b, b];
+            }
+            let s = str(a);
+            a == b && len(s) > 10
+            "#,
+        );
+        assert!(dag_ok.equals(&Value::Bool(true)));
+        assert!(t_dag.elapsed() < std::time::Duration::from_secs(2));
+
+        let mut perms_uniq = Permissions::sandboxed();
+        perms_uniq.max_duration_ms = Some(40);
+        let mut vm_uniq = VM::new();
+        vm_uniq.set_permissions(perms_uniq);
+        let err_uniq = vm_uniq
+            .run(compile_source("unique(range(0, 100000))").unwrap())
+            .unwrap_err();
+        assert!(err_uniq.contains("Execution timeout"), "err: {}", err_uniq);
+
+        // 9. regex per-start step budget, class escapes, and replace match limit error
+        let rx_ok = eval(
+            r#"
+            import regex;
+            import strings;
+            !regex.is_match("z", strings.repeat("a", 150000))
+                && regex.is_match("[\\]]", "]")
+                && regex.is_match("[\\d]+", "123")
+            "#,
+        );
+        assert!(rx_ok.equals(&Value::Bool(true)));
+        assert!(
+            VM::new()
+                .run(
+                    compile_source(
+                        r#"import regex; import strings; regex.replace("a", strings.repeat("a", 10001), "b")"#
+                    )
+                    .unwrap()
+                )
+                .is_err()
+        );
+
+        // 10. match range on non-numeric and single-eval compound assignment
+        let lang_ok = eval(
+            r#"
+            fn classify(v) {
+                match v {
+                    1..10 => "num",
+                    () => "unit",
+                    _ => "other",
+                }
+            }
+            let idx_calls = 0;
+            fn next_idx() { idx_calls += 1; 0 }
+            let arr = [10];
+            arr[next_idx()] += 5;
+
+            let obj_calls = 0;
+            let box_obj = #{ hp: 20 };
+            fn get_obj() { obj_calls += 1; box_obj }
+            get_obj().hp -= 7;
+
+            classify("hello") == "other"
+                && classify(unit) == "unit"
+                && classify(5) == "num"
+                && idx_calls == 1 && arr[0] == 15
+                && obj_calls == 1 && box_obj.hp == 13
+            "#,
+        );
+        assert!(lang_ok.equals(&Value::Bool(true)));
+
+        // 11. fs.copy enforces regular file + 32 MiB limit, and fs.glob works inside module subdir
+        let sub_mod_dir = sb_dir.join("sub");
+        fs::create_dir_all(&sub_mod_dir).unwrap();
+        fs::write(sub_mod_dir.join("item.txt"), "hi").unwrap();
+        fs::write(
+            sub_mod_dir.join("globmod.ask"),
+            "import fs;\nlet found = fs.glob(\"sub/*.txt\");\n",
+        )
+        .unwrap();
+        let mut vm_glob_sub = VM::new();
+        vm_glob_sub.set_current_dir(sb_dir.clone());
+        vm_glob_sub.set_sandbox_root(sb_dir.clone());
+        let glob_sub_ok = vm_glob_sub
+            .run(compile_source(r#"import "sub/globmod.ask" as g; len(g.found) == 1"#).unwrap())
+            .unwrap();
+        assert!(glob_sub_ok.equals(&Value::Bool(true)));
+        assert!(
+            vm_glob_sub
+                .run(compile_source(r#"import fs; fs.copy("sub", "sub_copy")"#).unwrap())
+                .is_err()
+        );
+
+        // 12. verify_proto rejects Constant(Function) and invalid MakeModule name
+        let fn_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            name: "inner".to_string(),
+            arity: 0,
+            local_count: 1,
+            upvalue_count: 0,
+            chunk: bytecode::Chunk {
+                code: vec![bytecode::Op::Unit, bytecode::Op::Return],
+                constants: vec![],
+                lines: vec![1, 1],
+                upvalue_lists: vec![],
+                limit_exceeded: false,
+            },
+        });
+        let bad_const_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            name: "bad_const".to_string(),
+            arity: 0,
+            local_count: 1,
+            upvalue_count: 0,
+            chunk: bytecode::Chunk {
+                code: vec![bytecode::Op::Constant(0), bytecode::Op::Return],
+                constants: vec![bytecode::Constant::Function(fn_proto)],
+                lines: vec![1, 1],
+                upvalue_lists: vec![],
+                limit_exceeded: false,
+            },
+        });
+        assert!(VM::new().run(bad_const_proto).is_err());
+
+        let bad_mod_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            name: "bad_mod".to_string(),
+            arity: 0,
+            local_count: 1,
+            upvalue_count: 0,
+            chunk: bytecode::Chunk {
+                code: vec![bytecode::Op::MakeModule(0, 0), bytecode::Op::Return],
+                constants: vec![bytecode::Constant::Int(123)],
+                lines: vec![1, 1],
+                upvalue_lists: vec![],
+                limit_exceeded: false,
+            },
+        });
+        assert!(VM::new().run(bad_mod_proto).is_err());
+
+        // 13. fmt and needs_more_input preserve multiline strings, raw strings, and block comments
+        let fmt_src = "let s = \"\"\"\n{\n    indented\n\"\"\";\nlet r = r\"C:\\dir\\\";\n/* { comment } */\nfn f() {\nreturn 1;\n}\n";
+        let fmt_expected = "let s = \"\"\"\n{\n    indented\n\"\"\";\nlet r = r\"C:\\dir\\\";\n/* { comment } */\nfn f() {\n    return 1;\n}\n";
+        assert_eq!(format_askane_source(fmt_src), fmt_expected);
+        assert_eq!(format_askane_source(fmt_expected), fmt_expected);
+        assert!(!needs_more_input("let r = r\"C:\\\";\n"));
+        assert!(!needs_more_input("let s = \"\"\"\na\"b\n\"\"\";\n"));
+        assert!(needs_more_input("let s = \"\"\"\nopen\n"));
+        assert!(needs_more_input("let s = \"${1 +\n"));
+
+        let _ = fs::remove_dir_all(&tmp_root);
     }
 }

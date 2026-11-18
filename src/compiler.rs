@@ -355,12 +355,16 @@ impl Compiler {
                 body,
                 span,
             } => {
-                self.compile_function(name.clone(), params, body, *span)?;
                 if self.current().scope_depth == 0 {
+                    self.compile_function(name.clone(), params, body, *span)?;
                     let idx = self.current().chunk.add_string_constant(name);
                     self.emit(Op::DefineGlobal(idx), span.line);
                 } else {
-                    self.add_local(name.clone());
+                    self.emit(Op::Unit, span.line);
+                    let slot = self.add_local(name.clone());
+                    self.compile_function(name.clone(), params, body, *span)?;
+                    self.emit(Op::SetLocal(slot), span.line);
+                    self.emit(Op::Pop, span.line);
                 }
                 Ok(())
             }
@@ -777,9 +781,16 @@ impl Compiler {
             }
             Expr::Assign {
                 target,
+                op: Some(op),
                 value,
                 span,
-            } => match target {
+            } => self.compile_compound_assign(target, *op, value, *span),
+            Expr::Assign {
+                target,
+                op: None,
+                value,
+                span,
+            } => match target.as_ref() {
                 AssignTarget::Var(name) => {
                     self.compile_expr(value)?;
                     let frame_idx = self.frames.len() - 1;
@@ -964,6 +975,10 @@ impl Compiler {
                             inclusive,
                         } => {
                             self.emit(Op::GetLocal(subj_slot), arm.span.line);
+                            self.emit(Op::IsNumeric, arm.span.line);
+                            let type_fail = self.emit(Op::JumpIfFalsePop(0), arm.span.line);
+
+                            self.emit(Op::GetLocal(subj_slot), arm.span.line);
                             let s_idx = self.current().chunk.add_constant(Constant::Int(*start));
                             self.emit(Op::Constant(s_idx), arm.span.line);
                             self.emit(Op::Ge, arm.span.line);
@@ -986,6 +1001,7 @@ impl Compiler {
                             let j = self.emit(Op::Jump(0), arm.span.line);
                             end_jumps.push(j);
 
+                            self.patch_jump(type_fail);
                             self.patch_jump(low_fail);
                             self.patch_jump(high_fail);
                             if let Some(gf) = guard_fail {
@@ -1254,5 +1270,77 @@ impl Compiler {
         let uv_idx = self.current().chunk.add_upvalue_list(upvalues);
         self.emit(Op::Closure(idx, uv_idx), span.line);
         Ok(())
+    }
+
+    fn compile_compound_assign(
+        &mut self,
+        target: &AssignTarget,
+        op: BinaryOp,
+        value: &Expr,
+        span: Span,
+    ) -> Result<(), String> {
+        let op_code = match op {
+            BinaryOp::Add => Op::Add,
+            BinaryOp::Sub => Op::Sub,
+            BinaryOp::Mul => Op::Mul,
+            BinaryOp::Div => Op::Div,
+            _ => unreachable!(),
+        };
+        match target {
+            AssignTarget::Var(name) => {
+                let frame_idx = self.frames.len() - 1;
+                if let Some((_, slot)) = Self::resolve_local(&self.frames[frame_idx], name) {
+                    self.emit(Op::GetLocal(slot), span.line);
+                    self.push_temps(1);
+                    self.compile_expr(value)?;
+                    self.pop_temps(1);
+                    self.emit(op_code, span.line);
+                    self.emit(Op::SetLocal(slot), span.line);
+                } else if let Some(upval) = self.resolve_upvalue(frame_idx, name) {
+                    self.emit(Op::GetUpvalue(upval), span.line);
+                    self.push_temps(1);
+                    self.compile_expr(value)?;
+                    self.pop_temps(1);
+                    self.emit(op_code, span.line);
+                    self.emit(Op::SetUpvalue(upval), span.line);
+                } else {
+                    let idx = self.current().chunk.add_string_constant(name);
+                    self.emit(Op::GetGlobal(idx), span.line);
+                    self.push_temps(1);
+                    self.compile_expr(value)?;
+                    self.pop_temps(1);
+                    self.emit(op_code, span.line);
+                    self.emit(Op::SetGlobal(idx), span.line);
+                }
+                Ok(())
+            }
+            AssignTarget::Index { object, index } => {
+                self.compile_expr(object)?;
+                self.push_temps(1);
+                self.compile_expr(index)?;
+                self.push_temps(1);
+                self.emit(Op::Dup2, span.line);
+                self.emit(Op::GetIndex, span.line);
+                self.push_temps(1);
+                self.compile_expr(value)?;
+                self.pop_temps(3);
+                self.emit(op_code, span.line);
+                self.emit(Op::SetIndex, span.line);
+                Ok(())
+            }
+            AssignTarget::Attr { object, name } => {
+                self.compile_expr(object)?;
+                self.push_temps(1);
+                self.emit(Op::Dup, span.line);
+                let idx = self.current().chunk.add_string_constant(name);
+                self.emit(Op::GetAttr(idx), span.line);
+                self.push_temps(1);
+                self.compile_expr(value)?;
+                self.pop_temps(2);
+                self.emit(op_code, span.line);
+                self.emit(Op::SetAttr(idx), span.line);
+                Ok(())
+            }
+        }
     }
 }

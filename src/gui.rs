@@ -54,6 +54,8 @@ mod win32_gui {
     const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
     const OFN_PATHMUSTEXIST: u32 = 0x0000_0800;
     const OFN_FILEMUSTEXIST: u32 = 0x0000_1000;
     const OFN_OVERWRITEPROMPT: u32 = 0x0000_0002;
@@ -141,6 +143,42 @@ mod win32_gui {
         h_thread: Handle,
         dw_process_id: u32,
         dw_thread_id: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobExtendedLimitInformation {
+        basic_limit_information: BasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
     }
 
     #[repr(C)]
@@ -269,6 +307,12 @@ mod win32_gui {
         ) -> i32;
         fn TerminateProcess(hProcess: Handle, uExitCode: u32) -> i32;
         fn CreateJobObjectW(lpJobAttributes: *const c_void, lpName: *const u16) -> Handle;
+        fn SetInformationJobObject(
+            hJob: Handle,
+            jobObjectInformationClass: i32,
+            lpJobObjectInformation: *const c_void,
+            cbJobObjectInformationLength: u32,
+        ) -> i32;
         fn AssignProcessToJobObject(hJob: Handle, hProcess: Handle) -> i32;
         fn TerminateJobObject(hJob: Handle, uExitCode: u32) -> i32;
         fn WaitForSingleObject(hHandle: Handle, dwMilliseconds: u32) -> u32;
@@ -431,6 +475,7 @@ mod win32_gui {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
+                let _ = fs::remove_file(&temp_path);
                 append_out(
                     state.hwnd_out,
                     &format!("Failed to locate askane.exe: {}\n", e),
@@ -470,6 +515,7 @@ mod win32_gui {
         let mut h_read: Handle = null_mut();
         let mut h_write: Handle = null_mut();
         if unsafe { CreatePipe(&mut h_read, &mut h_write, &sa, 0) } == 0 {
+            let _ = fs::remove_file(&temp_path);
             append_out(state.hwnd_out, "Failed to create output pipe.\n");
             return;
         }
@@ -484,6 +530,7 @@ mod win32_gui {
                 CloseHandle(h_read);
                 CloseHandle(h_write);
             }
+            let _ = fs::remove_file(&temp_path);
             append_out(state.hwnd_out, "Failed to create input pipe.\n");
             return;
         }
@@ -542,6 +589,7 @@ mod win32_gui {
                 CloseHandle(h_read);
                 CloseHandle(h_in_write);
             }
+            let _ = fs::remove_file(&temp_path);
             append_out(state.hwnd_out, "Failed to start askane child process.\n");
             return;
         }
@@ -549,7 +597,17 @@ mod win32_gui {
         unsafe { CloseHandle(pi.h_thread) };
         let h_job = unsafe { CreateJobObjectW(null(), null()) };
         if !h_job.is_null() {
-            if unsafe { AssignProcessToJobObject(h_job, pi.h_process) } == 0 {
+            let mut job_info = JobExtendedLimitInformation::default();
+            job_info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set_ok = unsafe {
+                SetInformationJobObject(
+                    h_job,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                    (&job_info as *const JobExtendedLimitInformation).cast::<c_void>(),
+                    std::mem::size_of::<JobExtendedLimitInformation>() as u32,
+                )
+            };
+            if set_ok == 0 || unsafe { AssignProcessToJobObject(h_job, pi.h_process) } == 0 {
                 unsafe {
                     TerminateProcess(pi.h_process, 1);
                     CloseHandle(h_job);
@@ -557,6 +615,7 @@ mod win32_gui {
                     CloseHandle(h_read);
                     CloseHandle(h_in_write);
                 }
+                let _ = fs::remove_file(&temp_path);
                 append_out(
                     state.hwnd_out,
                     "Failed to isolate Askane child process in a Job Object.\n",
@@ -571,6 +630,7 @@ mod win32_gui {
                 CloseHandle(h_read);
                 CloseHandle(h_in_write);
             }
+            let _ = fs::remove_file(&temp_path);
             append_out(
                 state.hwnd_out,
                 "Failed to create Job Object; child process was not started.\n",
@@ -578,8 +638,10 @@ mod win32_gui {
             return;
         }
         let h_proc_raw = pi.h_process as isize;
+        let h_job_raw = h_job as isize;
+        let h_in_raw = h_in_write as isize;
         *state.child_proc.lock().unwrap() = Some(h_proc_raw);
-        *state.child_stdin.lock().unwrap() = Some(h_in_write as isize);
+        *state.child_stdin.lock().unwrap() = Some(h_in_raw);
 
         let hwnd_raw = hwnd as isize;
         let h_read_raw = h_read as isize;
@@ -629,14 +691,16 @@ mod win32_gui {
             }
             {
                 let mut jguard = job_arc.lock().unwrap();
-                if let Some(jraw) = jguard.take() {
-                    unsafe { CloseHandle(jraw as Handle) };
+                if *jguard == Some(h_job_raw) {
+                    jguard.take();
+                    unsafe { CloseHandle(h_job_raw as Handle) };
                 }
             }
             {
                 let mut iguard = stdin_arc.lock().unwrap();
-                if let Some(iraw) = iguard.take() {
-                    unsafe { CloseHandle(iraw as Handle) };
+                if *iguard == Some(h_in_raw) {
+                    iguard.take();
+                    unsafe { CloseHandle(h_in_raw as Handle) };
                 }
             }
             if let Some(p) = cleanup_tmp {

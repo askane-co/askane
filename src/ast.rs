@@ -89,7 +89,8 @@ pub enum Expr {
         span: Span,
     },
     Assign {
-        target: AssignTarget,
+        target: Box<AssignTarget>,
+        op: Option<BinaryOp>,
         value: Box<Expr>,
         span: Span,
     },

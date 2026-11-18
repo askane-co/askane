@@ -314,19 +314,10 @@ impl Parser {
                     ));
                 }
             };
-            let value = if let Some(op) = compound_op {
-                Expr::Binary {
-                    left: Box::new(expr),
-                    op,
-                    right: Box::new(rhs),
-                    span,
-                }
-            } else {
-                rhs
-            };
             return Ok(Expr::Assign {
-                target,
-                value: Box::new(value),
+                target: Box::new(target),
+                op: compound_op,
+                value: Box::new(rhs),
                 span,
             });
         }

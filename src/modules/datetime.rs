@@ -34,15 +34,29 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, m as u32, d as u32)
 }
 
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = y - if m <= 2 { 1 } else { 0 };
+fn days_from_civil(y: i64, m: u32, d: u32) -> i128 {
+    let y = (y as i128) - if m <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
     let m = m as u64;
     let d = d as u64;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i64 - 719_468
+    era * 146_097 + doe as i128 - 719_468
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let y128 = y as i128;
+            let leap =
+                y128.rem_euclid(4) == 0 && (y128.rem_euclid(100) != 0 || y128.rem_euclid(400) == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 fn decompose_unix(ts: i64) -> (i64, u32, u32, u32, u32, u32) {
@@ -137,7 +151,8 @@ fn dt_parse_iso(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         .parse()
         .map_err(|_| "invalid month".to_string())?;
     let d: u32 = d_parts[2].parse().map_err(|_| "invalid day".to_string())?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    let max_d = days_in_month(y, m);
+    if !(1..=12).contains(&m) || d == 0 || d > max_d {
         return Err("datetime.parse_iso(): month or day out of range".to_string());
     }
     let (hh, mm, ss) = if let Some(t) = time_part {
@@ -163,6 +178,11 @@ fn dt_parse_iso(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
 
     let days = days_from_civil(y, m, d);
-    let ts = days * 86_400 + (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
+    let ts_i128 = days
+        .checked_mul(86_400)
+        .and_then(|s| s.checked_add((hh as i128) * 3600 + (mm as i128) * 60 + (ss as i128)))
+        .ok_or_else(|| "datetime.parse_iso(): timestamp out of range".to_string())?;
+    let ts = i64::try_from(ts_i128)
+        .map_err(|_| "datetime.parse_iso(): timestamp out of i64 range".to_string())?;
     Ok(Value::Int(ts))
 }

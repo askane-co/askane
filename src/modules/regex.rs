@@ -19,6 +19,14 @@ pub fn module() -> Value {
 }
 
 #[derive(Clone)]
+enum ClassItem {
+    Range(char, char),
+    Digit,
+    Word,
+    Space,
+}
+
+#[derive(Clone)]
 enum Atom {
     Any,
     Literal(char),
@@ -27,7 +35,7 @@ enum Atom {
     Space,
     Class {
         negated: bool,
-        chars: Vec<(char, char)>,
+        items: Vec<ClassItem>,
     },
 }
 
@@ -93,26 +101,51 @@ fn compile_pattern(pattern: &str) -> Result<Compiled, String> {
                 if negated {
                     i += 1;
                 }
-                let mut ranges = Vec::new();
+                let mut items = Vec::new();
                 while i < chars.len() && chars[i] != ']' {
-                    let start = chars[i];
-                    i += 1;
-                    if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] != ']' {
-                        let end = chars[i + 1];
-                        i += 2;
-                        ranges.push((start, end));
+                    let start_item = if chars[i] == '\\' {
+                        i += 1;
+                        let esc = *chars.get(i).ok_or_else(|| {
+                            "regex: trailing backslash in character class".to_string()
+                        })?;
+                        i += 1;
+                        match esc {
+                            'd' => ClassItem::Digit,
+                            'w' => ClassItem::Word,
+                            's' => ClassItem::Space,
+                            other => ClassItem::Range(other, other),
+                        }
                     } else {
-                        ranges.push((start, start));
+                        let c = chars[i];
+                        i += 1;
+                        ClassItem::Range(c, c)
+                    };
+                    if let ClassItem::Range(start, _) = start_item {
+                        if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] != ']' {
+                            i += 1;
+                            let end = if chars[i] == '\\' {
+                                i += 1;
+                                let esc = *chars.get(i).ok_or_else(|| {
+                                    "regex: trailing backslash in character class".to_string()
+                                })?;
+                                i += 1;
+                                esc
+                            } else {
+                                let c = chars[i];
+                                i += 1;
+                                c
+                            };
+                            items.push(ClassItem::Range(start, end));
+                            continue;
+                        }
                     }
+                    items.push(start_item);
                 }
                 if i >= chars.len() || chars[i] != ']' {
                     return Err("regex: unclosed character class".to_string());
                 }
                 i += 1;
-                Atom::Class {
-                    negated,
-                    chars: ranges,
-                }
+                Atom::Class { negated, items }
             }
             c => {
                 i += 1;
@@ -152,8 +185,13 @@ fn atom_matches(atom: &Atom, ch: char) -> bool {
         Atom::Digit => ch.is_ascii_digit(),
         Atom::Word => ch.is_alphanumeric() || ch == '_',
         Atom::Space => ch.is_whitespace(),
-        Atom::Class { negated, chars } => {
-            let hit = chars.iter().any(|&(a, b)| ch >= a && ch <= b);
+        Atom::Class { negated, items } => {
+            let hit = items.iter().any(|item| match item {
+                ClassItem::Range(a, b) => ch >= *a && ch <= *b,
+                ClassItem::Digit => ch.is_ascii_digit(),
+                ClassItem::Word => ch.is_alphanumeric() || ch == '_',
+                ClassItem::Space => ch.is_whitespace(),
+            });
             if *negated { !hit } else { hit }
         }
     }
@@ -218,6 +256,7 @@ fn match_at(
 }
 
 fn find_first_char_range(
+    vm: &VM,
     comp: &Compiled,
     chars: &[char],
     start_from: usize,
@@ -225,13 +264,16 @@ fn find_first_char_range(
     if chars.len() > 1_048_576 {
         return Err("regex input exceeds 1M characters limit".to_string());
     }
-    let mut steps = 0usize;
     let limit = if comp.anchored_start {
         if start_from == 0 { 1 } else { 0 }
     } else {
         chars.len() + 1
     };
     for s in start_from..limit {
+        if (s & 63) == 0 {
+            vm.check_timeout()?;
+        }
+        let mut steps = 0usize;
         if let Some(end) = match_at(comp, 0, chars, s, &mut steps)? {
             return Ok(Some((s, end)));
         }
@@ -250,30 +292,30 @@ fn expect_str<'a>(v: &'a Value, fn_name: &str) -> Result<&'a str, String> {
     }
 }
 
-fn rx_is_match(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn rx_is_match(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("regex.is_match() expects 2 strings (pattern, text)".to_string());
     }
     let comp = compile_pattern(expect_str(&args[0], "is_match")?)?;
     let chars: Vec<char> = expect_str(&args[1], "is_match")?.chars().collect();
     Ok(Value::Bool(
-        find_first_char_range(&comp, &chars, 0)?.is_some(),
+        find_first_char_range(vm, &comp, &chars, 0)?.is_some(),
     ))
 }
 
-fn rx_find(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn rx_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("regex.find() expects 2 strings (pattern, text)".to_string());
     }
     let comp = compile_pattern(expect_str(&args[0], "find")?)?;
     let chars: Vec<char> = expect_str(&args[1], "find")?.chars().collect();
-    match find_first_char_range(&comp, &chars, 0)? {
+    match find_first_char_range(vm, &comp, &chars, 0)? {
         Some((s, e)) => Ok(Value::Str(chars[s..e].iter().collect())),
         None => Ok(Value::Unit),
     }
 }
 
-fn rx_find_all(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn rx_find_all(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("regex.find_all() expects 2 strings (pattern, text)".to_string());
     }
@@ -282,7 +324,8 @@ fn rx_find_all(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos <= chars.len() && out.len() < 10_000 {
-        match find_first_char_range(&comp, &chars, pos)? {
+        vm.check_timeout()?;
+        match find_first_char_range(vm, &comp, &chars, pos)? {
             Some((s, e)) => {
                 out.push(Value::Str(chars[s..e].iter().collect()));
                 pos = if e > s { e } else { s + 1 };
@@ -293,7 +336,7 @@ fn rx_find_all(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
-fn rx_replace(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn rx_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err("regex.replace() expects 3 strings (pattern, text, replacement)".to_string());
     }
@@ -304,9 +347,13 @@ fn rx_replace(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let mut out = String::new();
     let mut pos = 0;
     let mut count = 0;
-    while pos <= chars.len() && count < 10_000 {
-        match find_first_char_range(&comp, &chars, pos)? {
+    while pos <= chars.len() {
+        vm.check_timeout()?;
+        match find_first_char_range(vm, &comp, &chars, pos)? {
             Some((s, e)) => {
+                if count >= 10_000 {
+                    return Err("regex.replace(): match limit (10000) exceeded".to_string());
+                }
                 for &c in &chars[pos..s] {
                     out.push(c);
                 }
@@ -330,6 +377,9 @@ fn rx_replace(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if pos < chars.len() {
         for &c in &chars[pos..] {
             out.push(c);
+        }
+        if out.len() > MAX_OUT {
+            return Err("regex.replace() output exceeds 64 MiB limit".to_string());
         }
     }
     Ok(Value::Str(out))

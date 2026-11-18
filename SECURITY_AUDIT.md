@@ -112,3 +112,22 @@ locals после ошибки, instruction budget, блокировки private
    - добавлены лимиты размера результата для конкатенации строк (64 MiB), списков (`10_000_000` элементов), `strings.replace`, `strings.join`, `regex.replace`, а также лимиты объектов `gfx` (`IMAGES`, `texts`) и флаг `OFN_NOCHANGEDIR` в файловых диалогах;
    - `askane permissions` теперь рекурсивно обходит всё AST (включая вложенные блоки и функции), учитывает `process`, `dialog`, `audio` и транзитивно проверяет локальные импорты `.ask`;
    - `cargo test` после правок 0.14.2: 36/36 passed.
+
+## Изменения и аудит 0.14.3
+
+1. **Таймауты, CLI и пути песочницы (`vm.rs`, `main.rs`, `fs.rs`):**
+   - в `VM::execute` введён независимый `step_counter`, чтобы `--timeout` срабатывал даже при `--unsafe` (`max_instructions == None`); в CLI явные `--timeout` и `--max-steps` больше не затираются порядком флага `--unsafe`;
+   - относительные `--allow-read` / `--allow-write` резолвятся относительно стартового CWD CLI и поддерживают ещё не созданные каталоги через каноникализацию существующего предка; в `normalize_lexical` учтены Windows-префиксы `\\?\` и регистронезависимость;
+   - `askane permissions` ограничивает глубину импортов (`depth < 32`), а не общее число файлов `visited`, и не подавляет ошибки импортируемых `.ask` файлов; `collect_ask_files` пропускает симлинки и отслеживает посещённые директории;
+   - `fs.copy()` ограничен регулярными файлами и лимитом `MAX_FS_BYTES` (32 MiB); `fs.remove()` и `fs.move()` работают с самим симлинком внутри песочницы без удаления/перемещения его цели; `fs.glob()` корректно проверяет пути при вызове из подкаталога модуля.
+2. **Процессы, GUI Studio и графика (`process.rs`, `gui.rs`, `gfx.rs`):**
+   - `process.run()` ожидает потоки чтения `stdout`/`stderr` с периодической проверкой `vm.check_timeout()` и принудительно завершает `ProcessJob` / группу процессов `-pgid`, если потомок оставил фоновый процесс с открытыми пайпами;
+   - в `gui.rs` устранена гонка закрытия `child_job` / `child_stdin` в фоновом потоке, добавлен `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` для Job Object и очистка временного файла на всех путях ошибки;
+   - `gfx` очищает кэш `IMAGES` и `LAST_FRAME` в `gfx.close()` и при `Drop` у `VM`.
+3. **VM, компилятор, парсер и стандартная библиотека (`compiler.rs`, `parser.rs`, `bytecode.rs`, `value.rs`, `glob.rs`, `regex.rs`, `math.rs`, `datetime.rs`):**
+   - исправлена рекурсия локальных и модульных функций (`Stmt::FnDecl` при `scope_depth > 0`), добавлена проверка числового типа в `Pattern::Range` и однократное вычисление объекта/индекса при составном присваивании;
+   - устранены паники переполнения в `Op::Slice`, `math.abs(i64::MIN)` и `datetime.parse_iso` (плюс проверка валидности дней месяца);
+   - ограничена работа на DAG-графах в `Value::equals_depth` (мемоизация + бюджет) и `Value::fmt_with_seen`, а в `unique`/`sort`/`flatten`/`map`/`filter`/`reduce`/`any`/`all`/`find` добавлен `vm.check_timeout()`;
+   - `glob.match` переписан на итеративный DP с корректной границей сегмента `**/`; в `regex` счётчик backtracking привязан к стартовой позиции, добавлена проверка таймаута, экранирование в `[...]` и ошибка при превышении лимита замен в `regex.replace`;
+   - `verify_proto_depth` проверяет `Op::MakeModule` и запрещает `Constant::Function` в `Op::Constant`; `format_askane_source` и `needs_more_input` корректно обрабатывают `"""..."""`, `r"..."` и `/* ... */`.
+   - `cargo test --locked` после правок 0.14.3: 37/37 passed.

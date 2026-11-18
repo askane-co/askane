@@ -60,6 +60,10 @@ pub fn build_module(
     }
 }
 
+pub fn reset_runtime_state() {
+    gfx::reset_state();
+}
+
 pub fn get_builtin_module(name: &str) -> Option<Value> {
     match name {
         "math" => Some(math::module()),

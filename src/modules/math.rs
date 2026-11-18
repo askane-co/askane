@@ -51,7 +51,10 @@ fn m_abs(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("math.abs() expects 1 argument".to_string());
     }
     match &args[0] {
-        Value::Int(i) => Ok(Value::Int(i.abs())),
+        Value::Int(i) => i
+            .checked_abs()
+            .map(Value::Int)
+            .ok_or_else(|| "math.abs() integer overflow".to_string()),
         Value::Float(f) => Ok(Value::Float(f.abs())),
         other => Err(format!(
             "math.abs() expects a number, got '{}'",

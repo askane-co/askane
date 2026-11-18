@@ -148,7 +148,7 @@ fn fs_remove(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.remove() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "remove")?;
-    let path_buf = vm.resolve_write_path(path)?;
+    let path_buf = vm.resolve_write_link_or_path(path)?;
     fs::remove_file(&path_buf).map_err(|e| format!("fs.remove('{}'): {}", path, e))?;
     Ok(Value::Unit)
 }
@@ -258,6 +258,17 @@ fn fs_copy(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let src = expect_str(&args[0], "copy")?;
     let dst = expect_str(&args[1], "copy")?;
     let src_buf = vm.resolve_read_path(src)?;
+    let meta =
+        fs::metadata(&src_buf).map_err(|e| format!("fs.copy('{}', '{}'): {}", src, dst, e))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "fs.copy('{}'): only regular files can be copied",
+            src
+        ));
+    }
+    if meta.len() > MAX_FS_BYTES as u64 {
+        return Err("fs.copy() exceeds 32 MiB limit".to_string());
+    }
     let dst_buf = vm.resolve_write_path(dst)?;
     check_not_symlink(vm, &dst_buf, dst)?;
     let bytes = fs::copy(&src_buf, &dst_buf)
@@ -271,7 +282,7 @@ fn fs_move(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let src = expect_str(&args[0], "move")?;
     let dst = expect_str(&args[1], "move")?;
-    let src_buf = vm.resolve_write_path(src)?;
+    let src_buf = vm.resolve_write_link_or_path(src)?;
     let dst_buf = vm.resolve_write_path(dst)?;
     check_not_symlink(vm, &dst_buf, dst)?;
     fs::rename(&src_buf, &dst_buf).map_err(|e| format!("fs.move('{}', '{}'): {}", src, dst, e))?;
@@ -286,6 +297,17 @@ fn fs_size(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let path_buf = vm.resolve_read_path(path)?;
     let meta = fs::metadata(&path_buf).map_err(|e| format!("fs.size('{}'): {}", path, e))?;
     Ok(Value::Int(meta.len() as i64))
+}
+
+fn strip_verbatim(path: &std::path::Path) -> std::borrow::Cow<'_, str> {
+    let s = path.to_string_lossy();
+    #[cfg(windows)]
+    if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+        return std::borrow::Cow::Owned(format!("\\\\{}", rest));
+    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        return std::borrow::Cow::Owned(rest.to_string());
+    }
+    s
 }
 
 fn collect_glob(
@@ -314,8 +336,9 @@ fn collect_glob(
             }
             let rel = path.strip_prefix(base).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let check_target = strip_verbatim(&path);
             if crate::modules::glob::glob_matches(pattern, &rel_str)
-                && vm.resolve_read_path(&rel_str).is_ok()
+                && vm.resolve_read_path(&check_target).is_ok()
             {
                 out.push(Value::Str(rel_str));
             }
@@ -332,7 +355,7 @@ fn fs_glob(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.glob() expects 1 string argument (pattern)".to_string());
     }
     let pattern = expect_str(&args[0], "glob")?;
-    let root = vm.sandbox_root().clone();
+    let root = fs::canonicalize(vm.sandbox_root()).unwrap_or_else(|_| vm.sandbox_root().clone());
     let mut out = Vec::new();
     collect_glob(vm, &root, &root, pattern, &mut out, 0)?;
     Ok(Value::List(Rc::new(RefCell::new(out))))

@@ -42,6 +42,8 @@ pub enum Op {
     True,
     False,
     Pop,
+    Dup,
+    Dup2,
 
     GetLocal(u16),
     SetLocal(u16),
@@ -68,6 +70,7 @@ pub enum Op {
     Gt,
     Ge,
     In,
+    IsNumeric,
 
     Jump(usize),
     JumpIfFalsePop(usize),
@@ -221,7 +224,6 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
         ));
     }
     let code_len = chunk.code.len();
-    let const_len = chunk.constants.len();
     if proto.local_count < proto.arity as u16 + 1 {
         return Err(format!(
             "Bytecode verification failed in '{}': invalid local count",
@@ -256,21 +258,29 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
                     ));
                 }
             }
-            Op::Constant(idx) => {
-                if (idx as usize) >= const_len {
+            Op::Constant(idx) => match chunk.constants.get(idx as usize) {
+                Some(Constant::Int(_) | Constant::Float(_) | Constant::Str(_)) => {}
+                Some(Constant::Function(_)) => {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': Constant({}) is a function (use Closure)",
+                        proto.name, idx
+                    ));
+                }
+                None => {
                     return Err(format!(
                         "Bytecode verification failed in '{}': Constant({}) out of bounds at ip {}",
                         proto.name, idx, ip
                     ));
                 }
-            }
+            },
             Op::GetGlobal(idx)
             | Op::DefineGlobal(idx)
             | Op::SetGlobal(idx)
             | Op::GetAttr(idx)
             | Op::SetAttr(idx)
             | Op::OptGetAttr(idx)
-            | Op::Import(idx, _) => {
+            | Op::Import(idx, _)
+            | Op::MakeModule(idx, _) => {
                 check_str(idx, "string-operand")?;
             }
             Op::Closure(fn_idx, uv_idx) => {
