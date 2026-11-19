@@ -14,33 +14,6 @@ pub fn module() -> Value {
     )
 }
 
-fn extract_bytes(val: &Value, fn_name: &str) -> Result<Vec<u8>, String> {
-    match val {
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
-        Value::List(l) => {
-            let items = l.borrow();
-            let mut out = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                match item {
-                    Value::Int(b) if (0..=255).contains(b) => out.push(*b as u8),
-                    _ => {
-                        return Err(format!(
-                            "hash.{}() byte list items must be integers 0..=255",
-                            fn_name
-                        ));
-                    }
-                }
-            }
-            Ok(out)
-        }
-        other => Err(format!(
-            "hash.{}() expects a string or byte list, got '{}'",
-            fn_name,
-            other.type_name()
-        )),
-    }
-}
-
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -121,11 +94,12 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn hash_sha256(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn hash_sha256(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
-        return Err("hash.sha256() expects 1 argument (str or byte list)".to_string());
+        return Err("hash.sha256() expects 1 argument (bytes, str, or byte list)".to_string());
     }
-    let data = extract_bytes(&args[0], "sha256")?;
+    let data = args[0].as_bytes_cow("hash.sha256()")?;
+    vm.charge_work((data.len() as u64) / 32 + 1)?;
     let digest = sha256_bytes(&data);
     let mut hex = String::with_capacity(64);
     for b in digest {
@@ -134,13 +108,14 @@ fn hash_sha256(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Str(hex))
 }
 
-fn hash_crc32(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn hash_crc32(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
-        return Err("hash.crc32() expects 1 argument (str or byte list)".to_string());
+        return Err("hash.crc32() expects 1 argument (bytes, str, or byte list)".to_string());
     }
-    let data = extract_bytes(&args[0], "crc32")?;
+    let data = args[0].as_bytes_cow("hash.crc32()")?;
+    vm.charge_work((data.len() as u64) / 64 + 1)?;
     let mut crc: u32 = 0xFFFF_FFFF;
-    for b in data {
+    for &b in data.iter() {
         crc ^= b as u32;
         for _ in 0..8 {
             let mask = (crc & 1).wrapping_neg();
@@ -150,13 +125,14 @@ fn hash_crc32(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int((!crc) as i64))
 }
 
-fn hash_fnv1a(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn hash_fnv1a(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
-        return Err("hash.fnv1a() expects 1 argument (str or byte list)".to_string());
+        return Err("hash.fnv1a() expects 1 argument (bytes, str, or byte list)".to_string());
     }
-    let data = extract_bytes(&args[0], "fnv1a")?;
+    let data = args[0].as_bytes_cow("hash.fnv1a()")?;
+    vm.charge_work((data.len() as u64) / 64 + 1)?;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in data {
+    for &b in data.iter() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }

@@ -1,7 +1,9 @@
 use std::rc::Rc;
 
-use crate::ast::{AssignTarget, BinaryOp, Expr, ImportSource, Pattern, Program, Stmt, UnaryOp};
-use crate::bytecode::{Chunk, Constant, FunctionProto, Op, UpvalueDesc};
+use crate::ast::{
+    AssignTarget, BinaryOp, Expr, FnParam, ImportSource, Pattern, Program, Stmt, UnaryOp,
+};
+use crate::bytecode::{Chunk, Constant, FunctionProto, Op, StructProto, UpvalueDesc};
 use crate::lexer::Span;
 
 struct Local {
@@ -9,6 +11,7 @@ struct Local {
     depth: usize,
     slot: u16,
     is_captured: bool,
+    is_pub: bool,
 }
 
 struct LoopContext {
@@ -22,6 +25,7 @@ struct LoopContext {
 struct FunctionCompiler {
     name: String,
     arity: u8,
+    is_main: bool,
     chunk: Chunk,
     locals: Vec<Local>,
     upvalues: Vec<UpvalueDesc>,
@@ -32,17 +36,18 @@ struct FunctionCompiler {
 }
 
 impl FunctionCompiler {
-    fn new(name: String, arity: u8) -> Self {
-        let mut locals = Vec::new();
-        locals.push(Local {
+    fn new(name: String, arity: u8, is_main: bool) -> Self {
+        let locals = vec![Local {
             name: String::new(),
             depth: 0,
             slot: 0,
             is_captured: false,
-        });
+            is_pub: false,
+        }];
         Self {
             name,
             arity,
+            is_main,
             chunk: Chunk::default(),
             locals,
             upvalues: Vec::new(),
@@ -68,6 +73,9 @@ impl Compiler {
         for op in &chunk.code {
             let slot = match op {
                 crate::bytecode::Op::GetLocal(i) | crate::bytecode::Op::SetLocal(i) => Some(*i),
+                crate::bytecode::Op::ForPrep(i, _) | crate::bytecode::Op::ForIter(i, _) => {
+                    Some(i.saturating_add(2))
+                }
                 _ => None,
             };
             if let Some(slot) = slot {
@@ -85,7 +93,7 @@ impl Compiler {
     }
     pub fn compile(program: &Program) -> Result<Rc<FunctionProto>, String> {
         let mut compiler = Self {
-            frames: vec![FunctionCompiler::new("<script>".to_string(), 0)],
+            frames: vec![FunctionCompiler::new("<script>".to_string(), 0, true)],
         };
 
         for stmt in &program.stmts {
@@ -108,8 +116,12 @@ impl Compiler {
         Ok(Rc::new(FunctionProto {
             name: frame.name,
             arity: frame.arity,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: Vec::new(),
             local_count: Self::local_count(&frame.chunk, frame.arity as u16 + 1),
             upvalue_count: frame.upvalues.len() as u16,
+            is_main: frame.is_main,
             chunk: frame.chunk,
         }))
     }
@@ -122,6 +134,7 @@ impl Compiler {
             frames: vec![FunctionCompiler::new(
                 format!("<module {}>", module_name),
                 0,
+                false,
             )],
         };
         compiler.current().scope_depth = 1;
@@ -135,12 +148,18 @@ impl Compiler {
             compiler.emit(Op::Pop, tail.span().line);
         }
 
+        let has_any_pub = compiler
+            .current()
+            .locals
+            .iter()
+            .skip(1)
+            .any(|l| l.depth == 1 && l.is_pub);
         let exports: Vec<(String, u16)> = compiler
             .current()
             .locals
             .iter()
             .skip(1)
-            .filter(|l| l.depth == 1 && !l.name.is_empty())
+            .filter(|l| l.depth == 1 && !l.name.is_empty() && (!has_any_pub || l.is_pub))
             .map(|l| (l.name.clone(), l.slot))
             .collect();
 
@@ -162,8 +181,12 @@ impl Compiler {
         Ok(Rc::new(FunctionProto {
             name: frame.name,
             arity: frame.arity,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: Vec::new(),
             local_count: Self::local_count(&frame.chunk, frame.arity as u16 + 1),
             upvalue_count: frame.upvalues.len() as u16,
+            is_main: frame.is_main,
             chunk: frame.chunk,
         }))
     }
@@ -216,6 +239,10 @@ impl Compiler {
     }
 
     fn add_local(&mut self, name: String) -> u16 {
+        self.add_local_with_pub(name, false)
+    }
+
+    fn add_local_with_pub(&mut self, name: String, is_pub: bool) -> u16 {
         let stack_idx = self.current().stack_height();
         if stack_idx > u16::MAX as usize {
             self.current().chunk.limit_exceeded = true;
@@ -228,8 +255,19 @@ impl Compiler {
             depth,
             slot,
             is_captured: false,
+            is_pub,
         });
         slot
+    }
+
+    fn check_pub(&self, is_pub: bool, span: Span) -> Result<(), String> {
+        if is_pub && (self.frames.len() > 1 || self.frames.last().unwrap().scope_depth > 1) {
+            return Err(format!(
+                "[{}:{}] 'pub' is only allowed on top-level declarations",
+                span.line, span.col
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_local(frame: &FunctionCompiler, name: &str) -> Option<(usize, u16)> {
@@ -288,17 +326,61 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Stmt::Let { name, value, span } => {
+            Stmt::ImportFrom {
+                source,
+                items,
+                span,
+            } => {
+                let (raw, is_path) = match source {
+                    ImportSource::Name(n) => (n.as_str(), false),
+                    ImportSource::Path(p) => (p.as_str(), true),
+                };
+                let src_idx = self.current().chunk.add_string_constant(raw);
+                let top_level = self.current().scope_depth == 0;
+                self.emit(Op::Import(src_idx, is_path), span.line);
+                if top_level {
+                    self.begin_scope();
+                }
+                let mod_slot = self.add_local(String::new());
+                for item in items {
+                    self.emit(Op::GetLocal(mod_slot), span.line);
+                    let name_idx = self.current().chunk.add_string_constant(&item.name);
+                    self.emit(Op::GetAttr(name_idx), span.line);
+                    if top_level {
+                        let alias_idx = self.current().chunk.add_string_constant(&item.alias);
+                        self.emit(Op::DefineGlobal(alias_idx), span.line);
+                    } else {
+                        self.add_local(item.alias.clone());
+                    }
+                }
+                if top_level {
+                    self.end_scope(span.line);
+                }
+                Ok(())
+            }
+            Stmt::Let {
+                name,
+                value,
+                is_pub,
+                span,
+            } => {
+                self.check_pub(*is_pub, *span)?;
                 self.compile_expr(value)?;
                 if self.current().scope_depth == 0 {
                     let idx = self.current().chunk.add_string_constant(name);
                     self.emit(Op::DefineGlobal(idx), span.line);
                 } else {
-                    self.add_local(name.clone());
+                    self.add_local_with_pub(name.clone(), *is_pub);
                 }
                 Ok(())
             }
-            Stmt::LetList { names, value, span } => {
+            Stmt::LetList {
+                names,
+                value,
+                is_pub,
+                span,
+            } => {
+                self.check_pub(*is_pub, *span)?;
                 let top_level = self.current().scope_depth == 0;
                 self.compile_expr(value)?;
                 if top_level {
@@ -314,7 +396,7 @@ impl Compiler {
                         let idx = self.current().chunk.add_string_constant(name);
                         self.emit(Op::DefineGlobal(idx), span.line);
                     } else {
-                        self.add_local(name.clone());
+                        self.add_local_with_pub(name.clone(), *is_pub);
                     }
                 }
                 if top_level {
@@ -325,8 +407,10 @@ impl Compiler {
             Stmt::LetDict {
                 fields,
                 value,
+                is_pub,
                 span,
             } => {
+                self.check_pub(*is_pub, *span)?;
                 let top_level = self.current().scope_depth == 0;
                 self.compile_expr(value)?;
                 if top_level {
@@ -341,7 +425,7 @@ impl Compiler {
                         let idx = self.current().chunk.add_string_constant(field);
                         self.emit(Op::DefineGlobal(idx), span.line);
                     } else {
-                        self.add_local(field.clone());
+                        self.add_local_with_pub(field.clone(), *is_pub);
                     }
                 }
                 if top_level {
@@ -353,18 +437,81 @@ impl Compiler {
                 name,
                 params,
                 body,
+                is_pub,
                 span,
             } => {
+                self.check_pub(*is_pub, *span)?;
                 if self.current().scope_depth == 0 {
                     self.compile_function(name.clone(), params, body, *span)?;
                     let idx = self.current().chunk.add_string_constant(name);
                     self.emit(Op::DefineGlobal(idx), span.line);
                 } else {
                     self.emit(Op::Unit, span.line);
-                    let slot = self.add_local(name.clone());
+                    let slot = self.add_local_with_pub(name.clone(), *is_pub);
                     self.compile_function(name.clone(), params, body, *span)?;
                     self.emit(Op::SetLocal(slot), span.line);
                     self.emit(Op::Pop, span.line);
+                }
+                Ok(())
+            }
+            Stmt::StructDecl {
+                name,
+                is_pub,
+                fields,
+                methods,
+                span,
+            } => {
+                self.check_pub(*is_pub, *span)?;
+                let local_slot = if self.current().scope_depth > 0 {
+                    self.emit(Op::Unit, span.line);
+                    Some(self.add_local_with_pub(name.clone(), *is_pub))
+                } else {
+                    None
+                };
+                let struct_proto = Rc::new(StructProto {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.default.is_some()))
+                        .collect(),
+                    methods: methods.iter().map(|m| m.name.clone()).collect(),
+                });
+                let proto_idx = self
+                    .current()
+                    .chunk
+                    .add_constant(Constant::Struct(struct_proto));
+
+                let mut pushed = 0usize;
+                for field in fields {
+                    if let Some(default_expr) = &field.default {
+                        self.compile_function(
+                            format!("{}::default_{}", name, field.name),
+                            &[],
+                            default_expr,
+                            default_expr.span(),
+                        )?;
+                        self.push_temps(1);
+                        pushed += 1;
+                    }
+                }
+                for method in methods {
+                    self.compile_function(
+                        format!("{}.{}", name, method.name),
+                        &method.params,
+                        &method.body,
+                        method.span,
+                    )?;
+                    self.push_temps(1);
+                    pushed += 1;
+                }
+                self.pop_temps(pushed);
+                self.emit(Op::MakeStructDef(proto_idx), span.line);
+                if let Some(slot) = local_slot {
+                    self.emit(Op::SetLocal(slot), span.line);
+                    self.emit(Op::Pop, span.line);
+                } else {
+                    let idx = self.current().chunk.add_string_constant(name);
+                    self.emit(Op::DefineGlobal(idx), span.line);
                 }
                 Ok(())
             }
@@ -409,22 +556,14 @@ impl Compiler {
                 self.begin_scope();
                 self.compile_expr(iter)?;
                 let iter_slot = self.add_local("$for_iter".to_string());
+                self.emit(Op::Unit, span.line);
+                let _idx_slot = self.add_local("$for_idx".to_string());
+                self.emit(Op::Unit, span.line);
+                let _end_slot = self.add_local("$for_end".to_string());
 
-                let idx_const = self.current().chunk.add_constant(Constant::Int(0));
-                self.emit(Op::Constant(idx_const), span.line);
-                let idx_slot = self.add_local("$for_idx".to_string());
-
-                let len_name = self.current().chunk.add_string_constant("len");
-                self.emit(Op::GetGlobal(len_name), span.line);
-                self.emit(Op::GetLocal(iter_slot), span.line);
-                self.emit(Op::Call(1), span.line);
-                let len_slot = self.add_local("$for_len".to_string());
-
+                let prep_jump = self.emit(Op::ForPrep(iter_slot, 0), span.line);
                 let loop_start = self.current_ip();
-                self.emit(Op::GetLocal(idx_slot), span.line);
-                self.emit(Op::GetLocal(len_slot), span.line);
-                self.emit(Op::Lt, span.line);
-                let exit_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
+                let exit_jump = self.emit(Op::ForIter(iter_slot, 0), span.line);
 
                 let continue_stack_height = self.current().stack_height();
                 let loop_try_depth = self.current().try_depth;
@@ -437,9 +576,6 @@ impl Compiler {
                 });
 
                 self.begin_scope();
-                self.emit(Op::GetLocal(iter_slot), span.line);
-                self.emit(Op::GetLocal(idx_slot), span.line);
-                self.emit(Op::GetIndex, span.line);
                 self.add_local(var.clone());
 
                 self.compile_expr(body)?;
@@ -452,14 +588,8 @@ impl Compiler {
                     self.current().chunk.patch_jump(j, continue_target);
                 }
 
-                let one_const = self.current().chunk.add_constant(Constant::Int(1));
-                self.emit(Op::GetLocal(idx_slot), span.line);
-                self.emit(Op::Constant(one_const), span.line);
-                self.emit(Op::Add, span.line);
-                self.emit(Op::SetLocal(idx_slot), span.line);
-                self.emit(Op::Pop, span.line);
-
                 self.emit(Op::Jump(loop_start), span.line);
+                self.patch_jump(prep_jump);
                 self.patch_jump(exit_jump);
 
                 self.end_scope(span.line);
@@ -565,7 +695,8 @@ impl Compiler {
                     ));
                 }
                 if let Some(expr) = value {
-                    self.compile_expr(expr)?;
+                    let in_tail = self.current().try_depth == 0;
+                    self.compile_expr_inner(expr, in_tail)?;
                 } else {
                     self.emit(Op::Unit, span.line);
                 }
@@ -664,6 +795,10 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), String> {
+        self.compile_expr_inner(expr, false)
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr, in_tail: bool) -> Result<(), String> {
         match expr {
             Expr::Int(v, span) => {
                 let idx = self.current().chunk.add_constant(Constant::Int(*v));
@@ -677,6 +812,11 @@ impl Compiler {
             }
             Expr::Str(s, span) => {
                 let idx = self.current().chunk.add_string_constant(s);
+                self.emit(Op::Constant(idx), span.line);
+                Ok(())
+            }
+            Expr::Bytes(b, span) => {
+                let idx = self.current().chunk.add_bytes_constant(b);
                 self.emit(Op::Constant(idx), span.line);
                 Ok(())
             }
@@ -761,22 +901,87 @@ impl Compiler {
                 self.push_temps(1);
                 self.compile_expr(right)?;
                 self.pop_temps(1);
-                let op_code = match op {
-                    BinaryOp::Add => Op::Add,
-                    BinaryOp::Sub => Op::Sub,
-                    BinaryOp::Mul => Op::Mul,
-                    BinaryOp::Div => Op::Div,
-                    BinaryOp::Mod => Op::Mod,
-                    BinaryOp::Eq => Op::Eq,
-                    BinaryOp::Ne => Op::Ne,
-                    BinaryOp::Lt => Op::Lt,
-                    BinaryOp::Le => Op::Le,
-                    BinaryOp::Gt => Op::Gt,
-                    BinaryOp::Ge => Op::Ge,
-                    BinaryOp::In => Op::In,
-                    BinaryOp::And | BinaryOp::Or => unreachable!(),
-                };
-                self.emit(op_code, span.line);
+                match op {
+                    BinaryOp::NotIn => {
+                        self.emit(Op::In, span.line);
+                        self.emit(Op::Not, span.line);
+                    }
+                    other => {
+                        let op_code = match other {
+                            BinaryOp::Add => Op::Add,
+                            BinaryOp::Sub => Op::Sub,
+                            BinaryOp::Mul => Op::Mul,
+                            BinaryOp::Div => Op::Div,
+                            BinaryOp::Mod => Op::Mod,
+                            BinaryOp::Eq => Op::Eq,
+                            BinaryOp::Ne => Op::Ne,
+                            BinaryOp::Lt => Op::Lt,
+                            BinaryOp::Le => Op::Le,
+                            BinaryOp::Gt => Op::Gt,
+                            BinaryOp::Ge => Op::Ge,
+                            BinaryOp::In => Op::In,
+                            BinaryOp::And | BinaryOp::Or | BinaryOp::NotIn => unreachable!(),
+                        };
+                        self.emit(op_code, span.line);
+                    }
+                }
+                Ok(())
+            }
+            Expr::ChainedCmp(cmp) => {
+                let first = &cmp.first;
+                let comparisons = &cmp.comparisons;
+                let span = cmp.span;
+                self.compile_expr(first)?;
+                let cur_slot = self.add_local(String::new());
+                let mut fail_jumps = Vec::new();
+                for (i, (op, rhs)) in comparisons.iter().enumerate() {
+                    self.emit(Op::GetLocal(cur_slot), span.line);
+                    self.push_temps(1);
+                    self.compile_expr(rhs)?;
+                    self.pop_temps(1);
+                    if i + 1 < comparisons.len() {
+                        self.emit(Op::Dup, span.line);
+                        self.emit(Op::SetLocal(cur_slot), span.line);
+                        self.emit(Op::Pop, span.line);
+                    }
+                    match op {
+                        BinaryOp::Lt => {
+                            self.emit(Op::Lt, span.line);
+                        }
+                        BinaryOp::Le => {
+                            self.emit(Op::Le, span.line);
+                        }
+                        BinaryOp::Gt => {
+                            self.emit(Op::Gt, span.line);
+                        }
+                        BinaryOp::Ge => {
+                            self.emit(Op::Ge, span.line);
+                        }
+                        BinaryOp::In => {
+                            self.emit(Op::In, span.line);
+                        }
+                        BinaryOp::NotIn => {
+                            self.emit(Op::In, span.line);
+                            self.emit(Op::Not, span.line);
+                        }
+                        _ => unreachable!(),
+                    }
+                    if i + 1 < comparisons.len() {
+                        fail_jumps.push(self.emit(Op::JumpIfFalsePop(0), span.line));
+                    } else {
+                        self.emit(Op::SetLocal(cur_slot), span.line);
+                        self.emit(Op::Pop, span.line);
+                    }
+                }
+                let end_jump = self.emit(Op::Jump(0), span.line);
+                for fj in fail_jumps {
+                    self.patch_jump(fj);
+                }
+                self.emit(Op::False, span.line);
+                self.emit(Op::SetLocal(cur_slot), span.line);
+                self.emit(Op::Pop, span.line);
+                self.patch_jump(end_jump);
+                self.current().locals.pop();
                 Ok(())
             }
             Expr::Assign {
@@ -826,6 +1031,9 @@ impl Compiler {
             },
             Expr::Block { stmts, tail, span } => {
                 if let Some(tail_expr) = tail {
+                    if in_tail && stmts.is_empty() && self.current().try_depth == 0 {
+                        return self.compile_expr_inner(tail_expr, true);
+                    }
                     self.emit(Op::Unit, span.line);
                     let res_slot = self.add_local(String::new());
                     self.begin_scope();
@@ -856,12 +1064,12 @@ impl Compiler {
                 self.compile_expr(cond)?;
                 let else_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
 
-                self.compile_expr(then_branch)?;
+                self.compile_expr_inner(then_branch, in_tail)?;
                 let end_jump = self.emit(Op::Jump(0), span.line);
 
                 self.patch_jump(else_jump);
                 if let Some(else_expr) = else_branch {
-                    self.compile_expr(else_expr)?;
+                    self.compile_expr_inner(else_expr, in_tail)?;
                 } else {
                     self.emit(Op::Unit, span.line);
                 }
@@ -1093,7 +1301,67 @@ impl Compiler {
                     self.push_temps(1);
                 }
                 self.pop_temps(1 + args.len());
-                self.emit(Op::Call(args.len() as u8), span.line);
+                if in_tail && self.current().try_depth == 0 {
+                    self.emit(Op::TailCall(args.len() as u8), span.line);
+                } else {
+                    self.emit(Op::Call(args.len() as u8), span.line);
+                }
+                Ok(())
+            }
+            Expr::CallNamed(call) => {
+                let callee = &call.callee;
+                let pos_args = &call.pos_args;
+                let named_args = &call.named_args;
+                let span = call.span;
+                if pos_args.len() + named_args.len() > u8::MAX as usize {
+                    return Err(format!(
+                        "[{}:{}] Too many arguments (max 255)",
+                        span.line, span.col
+                    ));
+                }
+                self.compile_expr(callee)?;
+                self.push_temps(1);
+                for arg in pos_args {
+                    self.compile_expr(arg)?;
+                    self.push_temps(1);
+                }
+                let mut kw_names = Vec::with_capacity(named_args.len());
+                for (name, val) in named_args {
+                    kw_names.push(name.clone());
+                    self.compile_expr(val)?;
+                    self.push_temps(1);
+                }
+                self.pop_temps(1 + pos_args.len() + named_args.len());
+                let kw_idx = self.current().chunk.add_kw_list(kw_names);
+                self.emit(Op::CallNamed(pos_args.len() as u8, kw_idx), span.line);
+                Ok(())
+            }
+            Expr::StructInit(st) => {
+                let target = &st.target;
+                let fields = &st.fields;
+                let spread = &st.spread;
+                let span = st.span;
+                self.compile_expr(target)?;
+                self.push_temps(1);
+                let mut pushed = 1usize;
+                let has_spread = if let Some(sp) = spread {
+                    self.compile_expr(sp)?;
+                    self.push_temps(1);
+                    pushed += 1;
+                    1u16
+                } else {
+                    0u16
+                };
+                let mut names = Vec::with_capacity(fields.len());
+                for (fname, fval) in fields {
+                    names.push(fname.clone());
+                    self.compile_expr(fval)?;
+                    self.push_temps(1);
+                    pushed += 1;
+                }
+                self.pop_temps(pushed);
+                let kw_idx = self.current().chunk.add_kw_list(names);
+                self.emit(Op::InitStruct(has_spread, kw_idx), span.line);
                 Ok(())
             }
             Expr::Index {
@@ -1145,27 +1413,16 @@ impl Compiler {
 
                 self.compile_expr(iter)?;
                 let iter_slot = self.add_local("$comp_iter".to_string());
+                self.emit(Op::Unit, span.line);
+                let _idx_slot = self.add_local("$comp_idx".to_string());
+                self.emit(Op::Unit, span.line);
+                let _end_slot = self.add_local("$comp_end".to_string());
 
-                let zero_c = self.current().chunk.add_constant(Constant::Int(0));
-                self.emit(Op::Constant(zero_c), span.line);
-                let idx_slot = self.add_local("$comp_idx".to_string());
-
-                let len_name = self.current().chunk.add_string_constant("len");
-                self.emit(Op::GetGlobal(len_name), span.line);
-                self.emit(Op::GetLocal(iter_slot), span.line);
-                self.emit(Op::Call(1), span.line);
-                let len_slot = self.add_local("$comp_len".to_string());
-
+                let prep_jump = self.emit(Op::ForPrep(iter_slot, 0), span.line);
                 let loop_start = self.current_ip();
-                self.emit(Op::GetLocal(idx_slot), span.line);
-                self.emit(Op::GetLocal(len_slot), span.line);
-                self.emit(Op::Lt, span.line);
-                let exit_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
+                let exit_jump = self.emit(Op::ForIter(iter_slot, 0), span.line);
 
                 self.begin_scope();
-                self.emit(Op::GetLocal(iter_slot), span.line);
-                self.emit(Op::GetLocal(idx_slot), span.line);
-                self.emit(Op::GetIndex, span.line);
                 self.add_local(var.clone());
 
                 let skip_push = if let Some(c) = cond {
@@ -1189,14 +1446,8 @@ impl Compiler {
                 }
                 self.end_scope(span.line);
 
-                let one_c = self.current().chunk.add_constant(Constant::Int(1));
-                self.emit(Op::GetLocal(idx_slot), span.line);
-                self.emit(Op::Constant(one_c), span.line);
-                self.emit(Op::Add, span.line);
-                self.emit(Op::SetLocal(idx_slot), span.line);
-                self.emit(Op::Pop, span.line);
-
                 self.emit(Op::Jump(loop_start), span.line);
+                self.patch_jump(prep_jump);
                 self.patch_jump(exit_jump);
                 self.end_scope(span.line);
 
@@ -1229,7 +1480,7 @@ impl Compiler {
     fn compile_function(
         &mut self,
         name: String,
-        params: &[String],
+        params: &[FnParam],
         body: &Expr,
         span: Span,
     ) -> Result<(), String> {
@@ -1239,19 +1490,36 @@ impl Compiler {
                 span.line, span.col
             ));
         }
-        let mut func_compiler = FunctionCompiler::new(name, params.len() as u8);
+        let is_variadic = params.last().is_some_and(|p| p.is_variadic);
+        let min_arity = params
+            .iter()
+            .filter(|p| !p.is_variadic && p.default.is_none())
+            .count() as u8;
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let parent_is_main = self.frames.last().is_none_or(|f| f.is_main);
+        let mut func_compiler = FunctionCompiler::new(name, params.len() as u8, parent_is_main);
         func_compiler.scope_depth = 1;
         for (i, p) in params.iter().enumerate() {
             func_compiler.locals.push(Local {
-                name: p.clone(),
+                name: p.name.clone(),
                 depth: 1,
                 slot: (i + 1) as u16,
                 is_captured: false,
+                is_pub: false,
             });
         }
 
         self.frames.push(func_compiler);
-        self.compile_expr(body)?;
+        for (i, p) in params.iter().enumerate() {
+            if let Some(default_expr) = &p.default {
+                let skip = self.emit(Op::JumpIfArgPresent(i as u16, 0), span.line);
+                self.compile_expr(default_expr)?;
+                self.emit(Op::SetLocal((i + 1) as u16), span.line);
+                self.emit(Op::Pop, span.line);
+                self.patch_jump(skip);
+            }
+        }
+        self.compile_expr_inner(body, true)?;
         self.emit(Op::Return, span.line);
         let compiled = self.frames.pop().unwrap();
         if compiled.chunk.limit_exceeded {
@@ -1262,8 +1530,12 @@ impl Compiler {
         let proto = Rc::new(FunctionProto {
             name: compiled.name,
             arity: compiled.arity,
+            min_arity,
+            is_variadic,
+            param_names,
             local_count: Self::local_count(&compiled.chunk, compiled.arity as u16 + 1),
             upvalue_count: compiled.upvalues.len() as u16,
+            is_main: compiled.is_main,
             chunk: compiled.chunk,
         });
         let idx = self.current().chunk.add_constant(Constant::Function(proto));

@@ -9,6 +9,7 @@ pub enum TokenKind {
     Int(i64),
     Float(f64),
     Str(String),
+    Bytes(Vec<u8>),
     InterpStart(String),
     InterpMid(String),
     InterpEnd(String),
@@ -17,6 +18,7 @@ pub enum TokenKind {
 
     Let,
     Fn,
+    Struct,
     If,
     Else,
     Match,
@@ -25,6 +27,8 @@ pub enum TokenKind {
     For,
     In,
     Import,
+    From,
+    Pub,
     As,
     Return,
     Break,
@@ -154,6 +158,24 @@ impl Lexer {
                 self.advance(); // 'r'
                 self.advance(); // '"'
                 tokens.push(self.lex_raw_string(span)?);
+                continue;
+            }
+
+            if ch == 'b' && self.peek_next() == Some('"') {
+                self.advance(); // 'b'
+                self.advance(); // '"'
+                tokens.push(self.lex_byte_string(span)?);
+                continue;
+            }
+
+            if ((ch == 'b' && self.peek_next() == Some('r'))
+                || (ch == 'r' && self.peek_next() == Some('b')))
+                && self.chars.get(self.pos + 2).copied() == Some('"')
+            {
+                self.advance();
+                self.advance();
+                self.advance();
+                tokens.push(self.lex_raw_byte_string(span)?);
                 continue;
             }
 
@@ -436,6 +458,7 @@ impl Lexer {
         let kind = match ident.as_str() {
             "let" => TokenKind::Let,
             "fn" => TokenKind::Fn,
+            "struct" => TokenKind::Struct,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "match" => TokenKind::Match,
@@ -444,6 +467,8 @@ impl Lexer {
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "import" => TokenKind::Import,
+            "from" => TokenKind::From,
+            "pub" => TokenKind::Pub,
             "as" => TokenKind::As,
             "return" => TokenKind::Return,
             "break" => TokenKind::Break,
@@ -565,6 +590,101 @@ impl Lexer {
         }
         Err(format!(
             "[{}:{}] Unterminated multiline string literal",
+            span.line, span.col
+        ))
+    }
+
+    fn lex_byte_string(&mut self, span: Span) -> Result<Token, String> {
+        let mut out = Vec::new();
+        while let Some(c) = self.peek() {
+            if c == '"' {
+                self.advance();
+                return Ok(Token {
+                    kind: TokenKind::Bytes(out),
+                    span,
+                });
+            }
+            if c == '\\' {
+                self.advance();
+                let esc = self.peek().ok_or_else(|| {
+                    format!(
+                        "[{}:{}] Unterminated escape in byte literal",
+                        span.line, span.col
+                    )
+                })?;
+                self.advance();
+                match esc {
+                    'n' => out.push(b'\n'),
+                    'r' => out.push(b'\r'),
+                    't' => out.push(b'\t'),
+                    '\\' => out.push(b'\\'),
+                    '"' => out.push(b'"'),
+                    '0' => out.push(0),
+                    'x' => {
+                        let h1 = self.advance().ok_or_else(|| {
+                            format!(
+                                "[{}:{}] Incomplete \\xHH escape in byte literal",
+                                span.line, span.col
+                            )
+                        })?;
+                        let h2 = self.advance().ok_or_else(|| {
+                            format!(
+                                "[{}:{}] Incomplete \\xHH escape in byte literal",
+                                span.line, span.col
+                            )
+                        })?;
+                        let hex = [h1, h2].iter().collect::<String>();
+                        let val = u8::from_str_radix(&hex, 16).map_err(|_| {
+                            format!(
+                                "[{}:{}] Invalid hex escape '\\x{}' in byte literal",
+                                span.line, span.col, hex
+                            )
+                        })?;
+                        out.push(val);
+                    }
+                    other => {
+                        return Err(format!(
+                            "[{}:{}] Unknown escape sequence '\\{}' in byte literal",
+                            span.line, span.col, other
+                        ));
+                    }
+                }
+            } else if c.is_ascii() {
+                self.advance();
+                out.push(c as u8);
+            } else {
+                return Err(format!(
+                    "[{}:{}] Byte literal can only contain ASCII characters (use \\xNN for raw bytes)",
+                    span.line, span.col
+                ));
+            }
+        }
+        Err(format!(
+            "[{}:{}] Unterminated byte literal",
+            span.line, span.col
+        ))
+    }
+
+    fn lex_raw_byte_string(&mut self, span: Span) -> Result<Token, String> {
+        let mut out = Vec::new();
+        while let Some(c) = self.peek() {
+            self.advance();
+            if c == '"' {
+                return Ok(Token {
+                    kind: TokenKind::Bytes(out),
+                    span,
+                });
+            }
+            if !c.is_ascii() {
+                return Err(format!(
+                    "[{}:{}] Raw byte literal can only contain ASCII characters",
+                    span.line, span.col
+                ));
+            }
+            out.push(c as u8);
+        }
+        Err(format!(
+            "[{}:{}] Unterminated raw byte literal",
             span.line, span.col
         ))
     }

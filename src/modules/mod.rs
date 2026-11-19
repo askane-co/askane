@@ -1,5 +1,6 @@
 mod audio;
 mod base64;
+mod bytes;
 mod clipboard;
 mod csv;
 mod datetime;
@@ -19,7 +20,7 @@ mod path;
 mod process;
 mod random;
 mod regex;
-mod strings;
+pub(crate) mod strings;
 mod sys;
 mod term;
 mod test;
@@ -78,6 +79,7 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "time" => Some(time::module()),
         "random" => Some(random::module()),
         "base64" => Some(base64::module()),
+        "bytes" => Some(bytes::module()),
         "csv" => Some(csv::module()),
         "log" => Some(log::module()),
         "test" => Some(test::module()),

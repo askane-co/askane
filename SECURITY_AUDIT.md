@@ -131,3 +131,17 @@ locals после ошибки, instruction budget, блокировки private
    - `glob.match` переписан на итеративный DP с корректной границей сегмента `**/`; в `regex` счётчик backtracking привязан к стартовой позиции, добавлена проверка таймаута, экранирование в `[...]` и ошибка при превышении лимита замен в `regex.replace`;
    - `verify_proto_depth` проверяет `Op::MakeModule` и запрещает `Constant::Function` в `Op::Constant`; `format_askane_source` и `needs_more_input` корректно обрабатывают `"""..."""`, `r"..."` и `/* ... */`.
    - `cargo test --locked` после правок 0.14.3: 37/37 passed.
+
+## Реализованные меры безопасности и стабилизации (0.15.0)
+1. **Единый бюджет ресурсов `ResourceBudget` (`vm.rs`, `modules/*`, `main.rs`, `gui.rs`):**
+   - аллокации (`bytes`, строки, списки, словари, множества, структуры), I/O-байты и стоимость тяжёлых нативных операций (`strings.repeat`/`replace`/`join`, `base64`, `hex`, `hash`, `fs`, `random`) проверяются через `charge_alloc` / `charge_io` / `charge_work` с поддержкой `--max-mem=MB`;
+   - ошибки исчерпания бюджета памяти/I/O помечены как unrecoverable в `is_unrecoverable_error`, чтобы `try`/`catch` и `test.assert_err` не могли их подавить.
+2. **Изоляция `askane.toml` и многофайловых модулей (`main.rs`, `vm.rs`, `compiler.rs`):**
+   - `askane.toml` является строго декларативным (`entry`, `tests`, `[limits]`): любые поля/секции вроде `[permissions]`, `allow_*`, `sandbox = false` или `unsafe` игнорируются и никогда не выдают привилегий песочницы; пути `entry` и `tests` проверяются на отсутствие абсолютных путей и выхода `..` за корень проекта (`resolve_manifest_subpath`);
+   - относительные импорты внутри модулей разрешаются относительно `Closure.base_dir` самого импортирующего модуля и строго проверяются на границы `sandbox_root` (`resolve_read_path_from`); `askane permissions` отслеживает транзитивные импорты `from ... import` и пакеты директорий `mod.ask`.
+3. **Безопасность новых конструкций и оптимизаций VM (`value.rs`, `bytecode.rs`, `parser.rs`, `vm.rs`, `main.rs`):**
+   - `SetKey::from_value` отклоняет `NaN` и не-хешируемые мутабельные типы, сохраняет консистентность `Int`/`Float` и нормализует `-0.0`;
+   - inline-кэши глобальных переменных и полей структур привязаны к монотонному `ic_epoch` (`self.frames.is_empty()`), что исключает коллизии при переиспользовании адресов `Rc<FunctionProto>`;
+   - `Op::ForPrep`/`Op::ForIter` делают снимок при итерации по `set` и проверяют актуальную длину списка на каждой итерации; `verify_proto_depth` валидирует `Constant::Struct`, `kw_lists`, `JumpIfArgPresent`, `ForPrep`/`ForIter`; `askane fmt` проверяет синтаксис через `Lexer` и `Parser` до и после форматирования.
+   - `cargo test --locked` после правок 0.15.0: 41/41 passed.
+

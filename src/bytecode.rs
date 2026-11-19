@@ -8,11 +8,20 @@ pub struct UpvalueDesc {
 }
 
 #[derive(Debug, Clone)]
+pub struct StructProto {
+    pub name: String,
+    pub fields: Vec<(String, bool)>,
+    pub methods: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Constant {
     Int(i64),
     Float(f64),
     Str(String),
+    Bytes(Vec<u8>),
     Function(Rc<FunctionProto>),
+    Struct(Rc<StructProto>),
 }
 
 impl fmt::Display for Constant {
@@ -21,7 +30,9 @@ impl fmt::Display for Constant {
             Constant::Int(v) => write!(f, "{}", v),
             Constant::Float(v) => write!(f, "{}", v),
             Constant::Str(s) => write!(f, "{:?}", s),
+            Constant::Bytes(b) => write!(f, "<bytes {}>", b.len()),
             Constant::Function(proto) => write!(f, "<fn {}>", proto.name),
+            Constant::Struct(st) => write!(f, "<struct {}>", st.name),
         }
     }
 }
@@ -30,8 +41,12 @@ impl fmt::Display for Constant {
 pub struct FunctionProto {
     pub name: String,
     pub arity: u8,
+    pub min_arity: u8,
+    pub is_variadic: bool,
+    pub param_names: Vec<String>,
     pub local_count: u16,
     pub upvalue_count: u16,
+    pub is_main: bool,
     pub chunk: Chunk,
 }
 
@@ -77,12 +92,19 @@ pub enum Op {
     JumpIfFalsePeek(usize),
     JumpIfTruePeek(usize),
     JumpIfNotUnitPeek(usize),
+    JumpIfArgPresent(u16, usize),
 
     Call(u8),
+    TailCall(u8),
+    CallNamed(u8, u16),
     Closure(u16, u16),
+    ForPrep(u16, usize),
+    ForIter(u16, usize),
 
     MakeList(u16),
     MakeDict(u16),
+    MakeStructDef(u16),
+    InitStruct(u16, u16),
     GetIndex,
     Slice(bool),
     SetIndex,
@@ -105,6 +127,7 @@ pub struct Chunk {
     pub constants: Vec<Constant>,
     pub lines: Vec<usize>,
     pub upvalue_lists: Vec<Vec<UpvalueDesc>>,
+    pub kw_lists: Vec<Vec<String>>,
     pub limit_exceeded: bool,
 }
 
@@ -136,6 +159,17 @@ impl Chunk {
         self.add_constant(Constant::Str(s.to_string()))
     }
 
+    pub fn add_bytes_constant(&mut self, b: &[u8]) -> u16 {
+        for (i, c) in self.constants.iter().enumerate() {
+            if let Constant::Bytes(existing) = c {
+                if existing.as_slice() == b {
+                    return i as u16;
+                }
+            }
+        }
+        self.add_constant(Constant::Bytes(b.to_vec()))
+    }
+
     pub fn add_upvalue_list(&mut self, list: Vec<UpvalueDesc>) -> u16 {
         if self.upvalue_lists.len() > u16::MAX as usize {
             self.limit_exceeded = true;
@@ -145,6 +179,15 @@ impl Chunk {
         (self.upvalue_lists.len() - 1) as u16
     }
 
+    pub fn add_kw_list(&mut self, list: Vec<String>) -> u16 {
+        if self.kw_lists.len() > u16::MAX as usize {
+            self.limit_exceeded = true;
+            return 0;
+        }
+        self.kw_lists.push(list);
+        (self.kw_lists.len() - 1) as u16
+    }
+
     pub fn patch_jump(&mut self, op_idx: usize, target_ip: usize) {
         match &mut self.code[op_idx] {
             Op::Jump(target)
@@ -152,6 +195,9 @@ impl Chunk {
             | Op::JumpIfFalsePeek(target)
             | Op::JumpIfTruePeek(target)
             | Op::JumpIfNotUnitPeek(target)
+            | Op::JumpIfArgPresent(_, target)
+            | Op::ForPrep(_, target)
+            | Op::ForIter(_, target)
             | Op::SetupTry(target) => {
                 *target = target_ip;
             }
@@ -224,6 +270,12 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
         ));
     }
     let code_len = chunk.code.len();
+    if proto.min_arity > proto.arity {
+        return Err(format!(
+            "Bytecode verification failed in '{}': min_arity exceeds arity",
+            proto.name
+        ));
+    }
     if proto.local_count < proto.arity as u16 + 1 {
         return Err(format!(
             "Bytecode verification failed in '{}': invalid local count",
@@ -259,10 +311,12 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
                 }
             }
             Op::Constant(idx) => match chunk.constants.get(idx as usize) {
-                Some(Constant::Int(_) | Constant::Float(_) | Constant::Str(_)) => {}
-                Some(Constant::Function(_)) => {
+                Some(
+                    Constant::Int(_) | Constant::Float(_) | Constant::Str(_) | Constant::Bytes(_),
+                ) => {}
+                Some(Constant::Function(_) | Constant::Struct(_)) => {
                     return Err(format!(
-                        "Bytecode verification failed in '{}': Constant({}) is a function (use Closure)",
+                        "Bytecode verification failed in '{}': Constant({}) cannot be loaded directly",
                         proto.name, idx
                     ));
                 }
@@ -273,6 +327,31 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
                     ));
                 }
             },
+            Op::MakeStructDef(idx) => match chunk.constants.get(idx as usize) {
+                Some(Constant::Struct(_)) => {}
+                _ => {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': MakeStructDef({}) is not a struct",
+                        proto.name, idx
+                    ));
+                }
+            },
+            Op::CallNamed(_, kw_idx) => {
+                if chunk.kw_lists.get(kw_idx as usize).is_none() {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': kw_list {} out of bounds",
+                        proto.name, kw_idx
+                    ));
+                }
+            }
+            Op::InitStruct(has_spread, kw_idx) => {
+                if has_spread > 1 || chunk.kw_lists.get(kw_idx as usize).is_none() {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': invalid InitStruct operands at ip {}",
+                        proto.name, ip
+                    ));
+                }
+            }
             Op::GetGlobal(idx)
             | Op::DefineGlobal(idx)
             | Op::SetGlobal(idx)
@@ -322,6 +401,22 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
                             proto.name, desc.index
                         ));
                     }
+                }
+            }
+            Op::JumpIfArgPresent(arg_idx, t) => {
+                if arg_idx >= proto.arity as u16 || t >= code_len {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': invalid JumpIfArgPresent({}, {}) at ip {}",
+                        proto.name, arg_idx, t, ip
+                    ));
+                }
+            }
+            Op::ForPrep(slot, t) | Op::ForIter(slot, t) => {
+                if slot as usize + 2 >= proto.local_count as usize || t >= code_len {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': invalid loop op ({}, {}) at ip {}",
+                        proto.name, slot, t, ip
+                    ));
                 }
             }
             Op::Jump(t)

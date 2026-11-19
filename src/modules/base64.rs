@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::modules::build_module;
 use crate::value::Value;
 use crate::vm::VM;
@@ -8,8 +10,10 @@ pub fn module() -> Value {
         &[
             ("encode", b64_encode),
             ("decode", b64_decode),
+            ("decode_bytes", b64_decode_bytes),
             ("encode_url", b64_encode_url),
             ("decode_url", b64_decode_url),
+            ("decode_url_bytes", b64_decode_url_bytes),
         ],
         &[],
     )
@@ -98,65 +102,87 @@ fn decode_str(input: &str, url_safe: bool) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn b64_encode(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn b64_encode_with(
+    vm: &mut VM,
+    args: &[Value],
+    fn_name: &str,
+    alphabet: &[u8; 64],
+    pad: bool,
+) -> Result<Value, String> {
     if args.len() != 1 {
-        return Err("base64.encode() expects 1 string argument".to_string());
+        return Err(format!(
+            "base64.{}() expects 1 argument (str or bytes)",
+            fn_name
+        ));
     }
-    match &args[0] {
-        Value::Str(s) => Ok(Value::Str(encode_bytes(s.as_bytes(), STD_ALPHABET, true))),
-        other => Err(format!(
-            "base64.encode() expects a string, got '{}'",
-            other.type_name()
-        )),
-    }
-}
-
-fn b64_encode_url(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err("base64.encode_url() expects 1 string argument".to_string());
-    }
-    match &args[0] {
-        Value::Str(s) => Ok(Value::Str(encode_bytes(s.as_bytes(), URL_ALPHABET, false))),
-        other => Err(format!(
-            "base64.encode_url() expects a string, got '{}'",
-            other.type_name()
-        )),
-    }
-}
-
-fn b64_decode(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err("base64.decode() expects 1 string argument".to_string());
-    }
-    match &args[0] {
-        Value::Str(s) => {
-            let bytes = decode_str(s, false)?;
-            let text = String::from_utf8(bytes)
-                .map_err(|_| "base64.decode(): decoded bytes are not valid UTF-8".to_string())?;
-            Ok(Value::Str(text))
+    let raw = match &args[0] {
+        Value::Str(s) => s.as_bytes(),
+        Value::Bytes(b) => b.as_slice(),
+        other => {
+            return Err(format!(
+                "base64.{}() expects str or bytes, got '{}'",
+                fn_name,
+                other.type_name()
+            ));
         }
-        other => Err(format!(
-            "base64.decode() expects a string, got '{}'",
-            other.type_name()
-        )),
-    }
+    };
+    vm.charge_alloc(raw.len().div_ceil(3).saturating_mul(4))?;
+    vm.charge_work((raw.len() as u64) / 32 + 1)?;
+    Ok(Value::Str(encode_bytes(raw, alphabet, pad)))
 }
 
-fn b64_decode_url(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn b64_encode(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    b64_encode_with(vm, args, "encode", STD_ALPHABET, true)
+}
+
+fn b64_encode_url(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    b64_encode_with(vm, args, "encode_url", URL_ALPHABET, false)
+}
+
+fn b64_decode_impl(
+    vm: &mut VM,
+    args: &[Value],
+    fn_name: &str,
+    url_safe: bool,
+) -> Result<Vec<u8>, String> {
     if args.len() != 1 {
-        return Err("base64.decode_url() expects 1 string argument".to_string());
+        return Err(format!("base64.{}() expects 1 string argument", fn_name));
     }
-    match &args[0] {
-        Value::Str(s) => {
-            let bytes = decode_str(s, true)?;
-            let text = String::from_utf8(bytes).map_err(|_| {
-                "base64.decode_url(): decoded bytes are not valid UTF-8".to_string()
-            })?;
-            Ok(Value::Str(text))
+    let s = match &args[0] {
+        Value::Str(s) => s.as_str(),
+        other => {
+            return Err(format!(
+                "base64.{}() expects a string, got '{}'",
+                fn_name,
+                other.type_name()
+            ));
         }
-        other => Err(format!(
-            "base64.decode_url() expects a string, got '{}'",
-            other.type_name()
-        )),
-    }
+    };
+    vm.charge_alloc((s.len() / 4).saturating_mul(3) + 3)?;
+    vm.charge_work((s.len() as u64) / 32 + 1)?;
+    decode_str(s, url_safe)
+}
+
+fn b64_decode(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    let bytes = b64_decode_impl(vm, args, "decode", false)?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "base64.decode(): decoded bytes are not valid UTF-8".to_string())?;
+    Ok(Value::Str(text))
+}
+
+fn b64_decode_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    let bytes = b64_decode_impl(vm, args, "decode_bytes", false)?;
+    Ok(Value::Bytes(Rc::new(bytes)))
+}
+
+fn b64_decode_url(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    let bytes = b64_decode_impl(vm, args, "decode_url", true)?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "base64.decode_url(): decoded bytes are not valid UTF-8".to_string())?;
+    Ok(Value::Str(text))
+}
+
+fn b64_decode_url_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    let bytes = b64_decode_impl(vm, args, "decode_url_bytes", true)?;
+    Ok(Value::Bytes(Rc::new(bytes)))
 }

@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.14.3";
+const VERSION: &str = "0.15.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -79,7 +79,47 @@ fn format_error_with_source(source: &str, err: &str) -> String {
     out
 }
 
-fn run_file(path: &str, dump_bytecode: bool, permissions: Permissions) -> Result<(), String> {
+fn run_file_with_root(
+    path: &str,
+    dump_bytecode: bool,
+    permissions: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+) -> Result<(), String> {
+    run_file_with_options(
+        path,
+        dump_bytecode,
+        false,
+        permissions,
+        sandbox_root_override,
+    )
+}
+
+fn print_profile_report(vm: &VM) {
+    let entries = vm.profile_report();
+    if entries.is_empty() {
+        return;
+    }
+    eprintln!("\n=== Profile ===");
+    eprintln!(
+        "{:<28} {:>10} {:>12} {:>12}",
+        "Function", "Calls", "Steps", "Time (ms)"
+    );
+    for (name, stat) in entries.into_iter().take(25) {
+        let ms = (stat.total_ns as f64) / 1_000_000.0;
+        eprintln!(
+            "{:<28} {:>10} {:>12} {:>12.3}",
+            name, stat.calls, stat.steps, ms
+        );
+    }
+}
+
+fn run_file_with_options(
+    path: &str,
+    dump_bytecode: bool,
+    profile: bool,
+    permissions: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+) -> Result<(), String> {
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
     let proto = compile_source(&source).map_err(|e| format_error_with_source(&source, &e))?;
@@ -89,15 +129,30 @@ fn run_file(path: &str, dump_bytecode: bool, permissions: Permissions) -> Result
     }
     let mut vm = VM::new_with_sandbox(!permissions.allow_all);
     vm.set_permissions(permissions);
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-            vm.set_current_dir(parent.clone());
-            vm.set_sandbox_root(parent);
+    vm.set_profile(profile);
+    let entry_parent = match std::path::Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            Some(fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()))
         }
+        _ => None,
+    };
+    if let Some(root) = sandbox_root_override {
+        let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        vm.set_current_dir(canon_root.clone());
+        vm.set_sandbox_root(canon_root);
+    } else if let Some(ref parent) = entry_parent {
+        vm.set_current_dir(parent.clone());
+        vm.set_sandbox_root(parent.clone());
     }
-    vm.run(proto)
-        .map_err(|e| format_error_with_source(&source, &e))?;
+    let run_result = if sandbox_root_override.is_some() {
+        vm.run_with_base_dir(proto, entry_parent)
+    } else {
+        vm.run(proto)
+    };
+    run_result.map_err(|e| format_error_with_source(&source, &e))?;
+    if profile {
+        print_profile_report(&vm);
+    }
     Ok(())
 }
 
@@ -188,6 +243,7 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
         ast::Expr::Int(_, _)
         | ast::Expr::Float(_, _)
         | ast::Expr::Str(_, _)
+        | ast::Expr::Bytes(_, _)
         | ast::Expr::Bool(_, _)
         | ast::Expr::Unit(_)
         | ast::Expr::Ident(_, _) => {}
@@ -259,13 +315,42 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
                 collect_imports_expr(&arm.body, imports);
             }
         }
-        ast::Expr::Fn { body, .. } => {
+        ast::Expr::Fn { params, body, .. } => {
+            for p in params {
+                if let Some(d) = &p.default {
+                    collect_imports_expr(d, imports);
+                }
+            }
             collect_imports_expr(body, imports);
         }
         ast::Expr::Call { callee, args, .. } => {
             collect_imports_expr(callee, imports);
             for a in args {
                 collect_imports_expr(a, imports);
+            }
+        }
+        ast::Expr::CallNamed(c) => {
+            collect_imports_expr(&c.callee, imports);
+            for a in &c.pos_args {
+                collect_imports_expr(a, imports);
+            }
+            for (_, a) in &c.named_args {
+                collect_imports_expr(a, imports);
+            }
+        }
+        ast::Expr::StructInit(st) => {
+            collect_imports_expr(&st.target, imports);
+            if let Some(sp) = &st.spread {
+                collect_imports_expr(sp, imports);
+            }
+            for (_, v) in &st.fields {
+                collect_imports_expr(v, imports);
+            }
+        }
+        ast::Expr::ChainedCmp(c) => {
+            collect_imports_expr(&c.first, imports);
+            for (_, rhs) in &c.comparisons {
+                collect_imports_expr(rhs, imports);
             }
         }
         ast::Expr::Index { object, index, .. } => {
@@ -303,7 +388,7 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
 
 fn collect_imports_stmt(stmt: &ast::Stmt, imports: &mut Vec<ast::ImportSource>) {
     match stmt {
-        ast::Stmt::Import { source, .. } => {
+        ast::Stmt::Import { source, .. } | ast::Stmt::ImportFrom { source, .. } => {
             imports.push(source.clone());
         }
         ast::Stmt::Let { value, .. }
@@ -311,8 +396,30 @@ fn collect_imports_stmt(stmt: &ast::Stmt, imports: &mut Vec<ast::ImportSource>) 
         | ast::Stmt::LetDict { value, .. } => {
             collect_imports_expr(value, imports);
         }
-        ast::Stmt::FnDecl { body, .. } => {
+        ast::Stmt::FnDecl { params, body, .. } => {
+            for p in params {
+                if let Some(d) = &p.default {
+                    collect_imports_expr(d, imports);
+                }
+            }
             collect_imports_expr(body, imports);
+        }
+        ast::Stmt::StructDecl {
+            fields, methods, ..
+        } => {
+            for f in fields {
+                if let Some(d) = &f.default {
+                    collect_imports_expr(d, imports);
+                }
+            }
+            for m in methods {
+                for p in &m.params {
+                    if let Some(d) = &p.default {
+                        collect_imports_expr(d, imports);
+                    }
+                }
+                collect_imports_expr(&m.body, imports);
+            }
         }
         ast::Stmt::While { cond, body, .. } => {
             collect_imports_expr(cond, imports);
@@ -401,16 +508,20 @@ fn inspect_permissions_file(
                     Some(parent) if !parent.as_os_str().is_empty() => parent,
                     _ => std::path::Path::new("."),
                 };
-                let mut sub = base_dir.join(&p);
-                if sub.extension().is_none() {
-                    sub.set_extension("ask");
+                let joined = base_dir.join(&p);
+                let mut candidates = Vec::new();
+                if joined.extension().is_none() {
+                    candidates.push(joined.with_extension("ask"));
+                    candidates.push(joined.join("mod.ask"));
+                } else {
+                    candidates.push(joined);
                 }
-                if sub.is_file() {
-                    inspect_permissions_file(&sub, visited, capabilities, depth + 1)?;
-                } else if sub.exists() {
+                if let Some(sub) = candidates.iter().find(|c| c.is_file()) {
+                    inspect_permissions_file(sub, visited, capabilities, depth + 1)?;
+                } else if let Some(non_file) = candidates.iter().find(|c| c.exists()) {
                     return Err(format!(
                         "Imported path '{}' is not a regular file",
-                        sub.display()
+                        non_file.display()
                     ));
                 } else {
                     push_unique(
@@ -436,15 +547,19 @@ fn inspect_permissions(path: &str) -> Result<Vec<String>, String> {
     Ok(capabilities)
 }
 
-fn run_eval(code: &str, perms: Permissions) -> Result<(), String> {
+fn run_eval(code: &str, profile: bool, perms: Permissions) -> Result<(), String> {
     let proto = compile_source(code).map_err(|e| format_error_with_source(code, &e))?;
     let mut vm = VM::new_with_sandbox(!perms.allow_all);
     vm.set_permissions(perms);
+    vm.set_profile(profile);
     let val = vm
         .run(proto)
         .map_err(|e| format_error_with_source(code, &e))?;
     if !matches!(val, Value::Unit) {
         println!("{}", val);
+    }
+    if profile {
+        print_profile_report(&vm);
     }
     Ok(())
 }
@@ -500,7 +615,11 @@ fn collect_ask_files_inner(
     Ok(())
 }
 
-fn run_tests_cmd(path: &str, perms: Permissions) -> Result<(), String> {
+fn run_tests_cmd(
+    path: &str,
+    perms: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+) -> Result<(), String> {
     let mut files = Vec::new();
     collect_ask_files(std::path::Path::new(path), &mut files)?;
     if files.is_empty() {
@@ -510,7 +629,7 @@ fn run_tests_cmd(path: &str, perms: Permissions) -> Result<(), String> {
     let mut failed = 0usize;
     for file in &files {
         let label = file.display().to_string();
-        match run_file(&label, false, perms.clone()) {
+        match run_file_with_root(&label, false, perms.clone(), sandbox_root_override) {
             Ok(()) => {
                 println!("PASS {}", label);
                 passed += 1;
@@ -527,6 +646,214 @@ fn run_tests_cmd(path: &str, perms: Permissions) -> Result<(), String> {
         Err(format!("{} test file(s) failed", failed))
     } else {
         Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct AskaneManifest {
+    entry: Option<String>,
+    tests: Option<String>,
+    max_steps: Option<u64>,
+    max_mem_mb: Option<u64>,
+    timeout_ms: Option<u64>,
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else if ch == '"' {
+            in_double = true;
+        } else if ch == '\'' {
+            in_single = true;
+        } else if ch == '#' {
+            return &line[..idx];
+        }
+    }
+    line
+}
+
+fn unquote_toml_string(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('t') => out.push('\t'),
+                    Some('\\') => out.push('\\'),
+                    Some('"') => out.push('"'),
+                    Some(other) => out.push(other),
+                    None => return Err("Unterminated escape in askane.toml string".to_string()),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        Ok(out)
+    } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        Ok(trimmed[1..trimmed.len() - 1].to_string())
+    } else {
+        Err(format!(
+            "Expected quoted string in askane.toml, got '{}'",
+            trimmed
+        ))
+    }
+}
+
+fn parse_toml_u64(raw: &str, field: &str) -> Result<u64, String> {
+    let cleaned: String = raw.trim().chars().filter(|&c| c != '_').collect();
+    cleaned.parse::<u64>().map_err(|_| {
+        format!(
+            "Invalid integer for '{}' in askane.toml: '{}'",
+            field,
+            raw.trim()
+        )
+    })
+}
+
+fn parse_askane_manifest(src: &str) -> Result<AskaneManifest, String> {
+    let mut manifest = AskaneManifest::default();
+    let mut section = String::new();
+    for (line_no, raw_line) in src.lines().enumerate() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') && !line.starts_with("[[") {
+            section = line[1..line.len() - 1].trim().to_string();
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!(
+                "Invalid line {} in askane.toml: '{}'",
+                line_no + 1,
+                line
+            ));
+        };
+        let key = k.trim();
+        let val = v.trim();
+        match (section.as_str(), key) {
+            ("", "entry") => manifest.entry = Some(unquote_toml_string(val)?),
+            ("", "tests") => manifest.tests = Some(unquote_toml_string(val)?),
+            ("" | "limits", "max_steps") => {
+                manifest.max_steps = Some(parse_toml_u64(val, "max_steps")?);
+            }
+            ("" | "limits", "max_mem_mb") => {
+                manifest.max_mem_mb = Some(parse_toml_u64(val, "max_mem_mb")?);
+            }
+            ("" | "limits", "timeout_ms") => {
+                manifest.timeout_ms = Some(parse_toml_u64(val, "timeout_ms")?);
+            }
+            _ => {
+                // Non-authoritative metadata or permission-like keys are intentionally ignored
+                // so a manifest can never grant sandbox privileges.
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+fn load_manifest_from_dir(
+    dir: &std::path::Path,
+) -> Result<Option<(std::path::PathBuf, AskaneManifest)>, String> {
+    let manifest_path = dir.join("askane.toml");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let text = read_text_limited(&manifest_path, 256 * 1024)
+        .map_err(|e| format!("Could not read '{}': {}", manifest_path.display(), e))?;
+    let manifest = parse_askane_manifest(&text)?;
+    Ok(Some((dir.to_path_buf(), manifest)))
+}
+
+fn discover_manifest_from_cwd() -> Result<Option<(std::path::PathBuf, AskaneManifest)>, String> {
+    let mut cur = env::current_dir().map_err(|e| e.to_string())?;
+    for _ in 0..32 {
+        if let Some(found) = load_manifest_from_dir(&cur)? {
+            return Ok(Some(found));
+        }
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        cur = parent.to_path_buf();
+    }
+    Ok(None)
+}
+
+fn resolve_manifest_subpath(
+    project_root: &std::path::Path,
+    rel: &str,
+    field: &str,
+) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(rel);
+    if p.is_absolute() {
+        return Err(format!(
+            "askane.toml '{}' path must be relative: '{}'",
+            field, rel
+        ));
+    }
+    let mut depth: i32 = 0;
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(format!(
+                        "askane.toml '{}' path '{}' cannot escape project root",
+                        field, rel
+                    ));
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "askane.toml '{}' path must be relative: '{}'",
+                    field, rel
+                ));
+            }
+        }
+    }
+    Ok(project_root.join(p))
+}
+
+fn apply_manifest_limits(
+    perms: &mut Permissions,
+    manifest: &AskaneManifest,
+    explicit: ExplicitLimits,
+) {
+    if !explicit.max_steps {
+        if let Some(steps) = manifest.max_steps {
+            perms.max_instructions = Some(steps);
+        }
+    }
+    if !explicit.max_mem {
+        if let Some(mb) = manifest.max_mem_mb {
+            perms.max_memory_bytes = Some(mb.saturating_mul(1024 * 1024));
+        }
+    }
+    if !explicit.timeout {
+        if let Some(ms) = manifest.timeout_ms {
+            perms.max_duration_ms = Some(ms);
+        }
     }
 }
 
@@ -612,8 +939,21 @@ fn needs_more_input(buf: &str) -> bool {
             i += 2;
             continue;
         }
-        if ch == 'r' && next == Some('"') && (i == 0 || !is_ident_char(chars[i - 1])) {
+        if ((ch == 'b' && next == Some('r')) || (ch == 'r' && next == Some('b')))
+            && chars.get(i + 2).copied() == Some('"')
+            && (i == 0 || !is_ident_char(chars[i - 1]))
+        {
             in_raw_string = true;
+            i += 3;
+            continue;
+        }
+        if (ch == 'r' || ch == 'b') && next == Some('"') && (i == 0 || !is_ident_char(chars[i - 1]))
+        {
+            if ch == 'r' {
+                in_raw_string = true;
+            } else {
+                in_string = true;
+            }
             i += 2;
             continue;
         }
@@ -725,7 +1065,7 @@ fn run_repl() {
                 }
                 ":modules" => {
                     println!(
-                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, csv, log, test, hash, ini, datetime, clipboard, audio, url, hex, uuid, term, glob, regex, dialog, process, http, gfx, mem"
+                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, bytes, csv, log, test, hash, ini, datetime, clipboard, audio, url, hex, uuid, term, glob, regex, dialog, process, http, gfx, mem"
                     );
                     continue;
                 }
@@ -772,14 +1112,17 @@ fn print_help() {
     println!("Usage:");
     println!("  askane                       Start interactive REPL");
     println!("  askane --gui [file.ask]      Open Askane Studio GUI editor (Windows)");
-    println!("  askane <file.ask>            Run an Askane script");
+    println!("  askane [run] <file_or_dir>   Run an Askane script or project (uses askane.toml)");
     println!("  askane -e \"<code>\"           Evaluate inline code");
-    println!("  askane check [--json] <path> Syntax & compile check for file or directory");
+    println!(
+        "  askane check [--json] [path] Syntax & compile check for file, directory, or project"
+    );
     println!("  askane permissions <file>    Inspect capabilities imported by a script");
-    println!("  askane fmt [--check] <file>  Format an Askane source file");
+    println!("  askane fmt [--check] <path>  Format an Askane file or directory");
     println!("  askane init [dir]            Create a starter Askane project");
-    println!("  askane test <file_or_dir>    Run .ask test files");
+    println!("  askane test [file_or_dir]    Run .ask test files or project tests");
     println!("  askane -b <file.ask>         Disassemble compiled bytecode");
+    println!("  askane --profile <file.ask>  Print function profiling stats after execution");
     println!("  askane -h | --help           Show help");
     println!("  askane -v | --version        Show version");
     println!();
@@ -801,6 +1144,9 @@ fn print_help() {
     );
     println!(
         "  --max-steps=N                Override sandbox instruction budget (default 10000000)"
+    );
+    println!(
+        "  --max-mem=MB                 Override sandbox allocation budget in MiB (default 64)"
     );
     println!(
         "  --timeout=MS                 Override sandbox execution timeout in ms (default 30000)"
@@ -847,31 +1193,443 @@ fn append_csv_paths(target: &mut Option<Vec<std::path::PathBuf>>, value: Option<
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FmtTokKind {
+    Word,
+    Str,
+    Comment,
+    BinOp,
+    UnaryOnly,
+    Minus,
+    Star,
+    Pipe,
+    OrOr,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+    Hash,
+    Dot,
+    Range,
+    Comma,
+    Colon,
+    Semi,
+    Other,
+}
+
+struct FmtTok {
+    text: String,
+    kind: FmtTokKind,
+}
+
+fn is_fmt_keyword_unary_lhs(w: &str) -> bool {
+    matches!(
+        w,
+        "return" | "throw" | "in" | "if" | "while" | "match" | "else" | "catch" | "not"
+    )
+}
+
+fn is_fmt_space_before_lparen(w: &str) -> bool {
+    matches!(
+        w,
+        "if" | "while" | "match" | "return" | "throw" | "in" | "else" | "for"
+    )
+}
+
+fn format_line_tokens(line: &str) -> Vec<FmtTok> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '/' && next == Some('/') {
+            let text: String = chars[i..].iter().collect();
+            toks.push(FmtTok {
+                text: text.trim_end().to_string(),
+                kind: FmtTokKind::Comment,
+            });
+            break;
+        }
+        if c == '/' && next == Some('*') {
+            let start = i;
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && chars.get(i + 1).copied() == Some('/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            toks.push(FmtTok {
+                text: chars[start..i].iter().collect(),
+                kind: FmtTokKind::Comment,
+            });
+            continue;
+        }
+        if ((c == 'b' && next == Some('r')) || (c == 'r' && next == Some('b')))
+            && chars.get(i + 2).copied() == Some('"')
+            && (i == 0 || !is_ident_char(chars[i - 1]))
+        {
+            let start = i;
+            i += 3;
+            while i < chars.len() {
+                let ch = chars[i];
+                i += 1;
+                if ch == '"' {
+                    break;
+                }
+            }
+            toks.push(FmtTok {
+                text: chars[start..i].iter().collect(),
+                kind: FmtTokKind::Str,
+            });
+            continue;
+        }
+        if (c == 'r' || c == 'b') && next == Some('"') && (i == 0 || !is_ident_char(chars[i - 1])) {
+            let is_raw = c == 'r';
+            let start = i;
+            i += 2;
+            let mut esc = false;
+            while i < chars.len() {
+                let ch = chars[i];
+                i += 1;
+                if is_raw {
+                    if ch == '"' {
+                        break;
+                    }
+                } else if esc {
+                    esc = false;
+                } else if ch == '\\' {
+                    esc = true;
+                } else if ch == '"' {
+                    break;
+                }
+            }
+            toks.push(FmtTok {
+                text: chars[start..i].iter().collect(),
+                kind: FmtTokKind::Str,
+            });
+            continue;
+        }
+        if c == '"' {
+            if next == Some('"') && chars.get(i + 2).copied() == Some('"') {
+                let start = i;
+                i += 3;
+                while i < chars.len() {
+                    if chars[i] == '"'
+                        && chars.get(i + 1).copied() == Some('"')
+                        && chars.get(i + 2).copied() == Some('"')
+                    {
+                        i += 3;
+                        break;
+                    }
+                    i += 1;
+                }
+                toks.push(FmtTok {
+                    text: chars[start..i].iter().collect(),
+                    kind: FmtTokKind::Str,
+                });
+            } else {
+                let start = i;
+                i += 1;
+                let mut esc = false;
+                let mut interp: Vec<usize> = Vec::new();
+                while i < chars.len() {
+                    let ch = chars[i];
+                    if !interp.is_empty() {
+                        if ch == '"' {
+                            i += 1;
+                            let mut s_esc = false;
+                            while i < chars.len() {
+                                let sc = chars[i];
+                                i += 1;
+                                if s_esc {
+                                    s_esc = false;
+                                } else if sc == '\\' {
+                                    s_esc = true;
+                                } else if sc == '"' {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        if ch == '{' {
+                            *interp.last_mut().unwrap() += 1;
+                        } else if ch == '}' {
+                            if *interp.last().unwrap() == 0 {
+                                interp.pop();
+                            } else {
+                                *interp.last_mut().unwrap() -= 1;
+                            }
+                        }
+                        i += 1;
+                    } else if esc {
+                        esc = false;
+                        i += 1;
+                    } else if ch == '\\' {
+                        esc = true;
+                        i += 1;
+                    } else if ch == '$' && chars.get(i + 1).copied() == Some('{') {
+                        interp.push(0);
+                        i += 2;
+                    } else if ch == '"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                toks.push(FmtTok {
+                    text: chars[start..i].iter().collect(),
+                    kind: FmtTokKind::Str,
+                });
+            }
+            continue;
+        }
+        if is_ident_char(c) {
+            let start = i;
+            i += 1;
+            while i < chars.len()
+                && (is_ident_char(chars[i])
+                    || (chars[i] == '.'
+                        && chars[start].is_ascii_digit()
+                        && chars.get(i + 1).is_some_and(|ch| ch.is_ascii_digit())))
+            {
+                i += 1;
+            }
+            toks.push(FmtTok {
+                text: chars[start..i].iter().collect(),
+                kind: FmtTokKind::Word,
+            });
+            continue;
+        }
+        let rest: String = chars[i..chars.len().min(i + 3)].iter().collect();
+        if rest.starts_with("..=") {
+            toks.push(FmtTok {
+                text: "..=".to_string(),
+                kind: FmtTokKind::Range,
+            });
+            i += 3;
+            continue;
+        }
+        let two: String = chars[i..chars.len().min(i + 2)].iter().collect();
+        match two.as_str() {
+            ".." => {
+                toks.push(FmtTok {
+                    text: "..".to_string(),
+                    kind: FmtTokKind::Range,
+                });
+                i += 2;
+                continue;
+            }
+            "?." => {
+                toks.push(FmtTok {
+                    text: "?.".to_string(),
+                    kind: FmtTokKind::Dot,
+                });
+                i += 2;
+                continue;
+            }
+            "=>" | "|>" | "??" | "==" | "!=" | "<=" | ">=" | "&&" | "+=" | "-=" | "*=" | "/=" => {
+                toks.push(FmtTok {
+                    text: two,
+                    kind: FmtTokKind::BinOp,
+                });
+                i += 2;
+                continue;
+            }
+            "||" => {
+                toks.push(FmtTok {
+                    text: "||".to_string(),
+                    kind: FmtTokKind::OrOr,
+                });
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        let kind = match c {
+            '(' => FmtTokKind::LParen,
+            ')' => FmtTokKind::RParen,
+            '[' => FmtTokKind::LBracket,
+            ']' => FmtTokKind::RBracket,
+            '{' => FmtTokKind::LBrace,
+            '}' => FmtTokKind::RBrace,
+            '#' => FmtTokKind::Hash,
+            '.' => FmtTokKind::Dot,
+            ',' => FmtTokKind::Comma,
+            ':' => FmtTokKind::Colon,
+            ';' => FmtTokKind::Semi,
+            '!' => FmtTokKind::UnaryOnly,
+            '-' => FmtTokKind::Minus,
+            '*' => FmtTokKind::Star,
+            '|' => FmtTokKind::Pipe,
+            '+' | '/' | '%' | '=' | '<' | '>' => FmtTokKind::BinOp,
+            _ => FmtTokKind::Other,
+        };
+        toks.push(FmtTok {
+            text: c.to_string(),
+            kind,
+        });
+        i += 1;
+    }
+    toks
+}
+
+fn render_formatted_line(toks: &[FmtTok]) -> String {
+    let mut out = String::new();
+    let mut in_lambda_pipe = false;
+    let mut prev_kind: Option<FmtTokKind> = None;
+    let mut prev_word = String::new();
+    let mut prev_was_unary = false;
+
+    for (idx, tok) in toks.iter().enumerate() {
+        let next = toks.get(idx + 1);
+        let is_unary_minus = tok.kind == FmtTokKind::Minus
+            && match prev_kind {
+                None => true,
+                Some(
+                    FmtTokKind::LParen
+                    | FmtTokKind::LBracket
+                    | FmtTokKind::LBrace
+                    | FmtTokKind::Comma
+                    | FmtTokKind::Colon
+                    | FmtTokKind::Semi
+                    | FmtTokKind::BinOp
+                    | FmtTokKind::Minus
+                    | FmtTokKind::Star
+                    | FmtTokKind::UnaryOnly
+                    | FmtTokKind::Pipe
+                    | FmtTokKind::OrOr
+                    | FmtTokKind::Range,
+                ) => true,
+                Some(FmtTokKind::Word) => is_fmt_keyword_unary_lhs(&prev_word),
+                _ => false,
+            };
+        let is_unary_star = tok.kind == FmtTokKind::Star
+            && matches!(
+                prev_kind,
+                None | Some(FmtTokKind::LParen | FmtTokKind::Comma)
+            );
+
+        if let Some(pk) = prev_kind {
+            let need_space = match (pk, tok.kind) {
+                (_, FmtTokKind::Comment) => true,
+                (FmtTokKind::Comment, _) => true,
+                (FmtTokKind::UnaryOnly, _) => false,
+                (_, _) if prev_was_unary => false,
+                (FmtTokKind::Dot, _) | (_, FmtTokKind::Dot) => false,
+                (FmtTokKind::Hash, FmtTokKind::LBrace) => false,
+                (FmtTokKind::LParen, _) | (_, FmtTokKind::RParen) => false,
+                (FmtTokKind::LBracket, _) | (_, FmtTokKind::RBracket) => false,
+                (_, FmtTokKind::Comma | FmtTokKind::Colon | FmtTokKind::Semi) => false,
+                (FmtTokKind::Range, _) => false,
+                (_, FmtTokKind::Range) => matches!(pk, FmtTokKind::Comma | FmtTokKind::Colon),
+                (FmtTokKind::LBrace, FmtTokKind::RBrace) => false,
+                (FmtTokKind::LBrace, _) | (_, FmtTokKind::RBrace) => true,
+                (_, FmtTokKind::LBrace) => true,
+                (FmtTokKind::Comma | FmtTokKind::Colon | FmtTokKind::Semi, _) => true,
+                (FmtTokKind::BinOp, _) | (_, FmtTokKind::BinOp) => true,
+                (FmtTokKind::Minus, _) if !prev_was_unary => true,
+                (_, FmtTokKind::Minus) if !is_unary_minus => true,
+                (FmtTokKind::Word, FmtTokKind::Minus) if is_fmt_keyword_unary_lhs(&prev_word) => {
+                    true
+                }
+                (_, FmtTokKind::Minus) => false,
+                (FmtTokKind::Star, _) if !prev_was_unary => true,
+                (_, FmtTokKind::Star) if !is_unary_star => true,
+                (_, FmtTokKind::Star) => matches!(pk, FmtTokKind::Comma),
+                (FmtTokKind::OrOr, _) => true,
+                (_, FmtTokKind::OrOr) => !matches!(pk, FmtTokKind::LParen | FmtTokKind::LBracket),
+                (FmtTokKind::Pipe, _) => !in_lambda_pipe,
+                (_, FmtTokKind::Pipe) => {
+                    if in_lambda_pipe {
+                        false
+                    } else {
+                        !matches!(pk, FmtTokKind::LParen | FmtTokKind::LBracket)
+                    }
+                }
+                (FmtTokKind::Word, FmtTokKind::LParen) => is_fmt_space_before_lparen(&prev_word),
+                (_, FmtTokKind::LParen) => false,
+                (_, FmtTokKind::LBracket) => {
+                    matches!(pk, FmtTokKind::Word) && is_fmt_keyword_unary_lhs(&prev_word)
+                }
+                (
+                    FmtTokKind::Word
+                    | FmtTokKind::Str
+                    | FmtTokKind::RParen
+                    | FmtTokKind::RBracket
+                    | FmtTokKind::RBrace,
+                    FmtTokKind::Word | FmtTokKind::Str | FmtTokKind::UnaryOnly | FmtTokKind::Hash,
+                ) => true,
+                _ => false,
+            };
+            if need_space && !(tok.kind == FmtTokKind::LBrace && pk == FmtTokKind::Hash) {
+                out.push(' ');
+            }
+        }
+        let _ = next;
+        out.push_str(&tok.text);
+        if tok.kind == FmtTokKind::Pipe {
+            in_lambda_pipe = !in_lambda_pipe;
+        }
+        prev_was_unary = is_unary_minus || is_unary_star || tok.kind == FmtTokKind::UnaryOnly;
+        if tok.kind == FmtTokKind::Word {
+            prev_word = tok.text.clone();
+        } else {
+            prev_word.clear();
+        }
+        prev_kind = Some(tok.kind);
+    }
+    out
+}
+
 fn format_askane_source(src: &str) -> String {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut indent: usize = 0;
     let mut in_multiline_str = false;
     let mut in_block_comment = false;
+    let mut prev_blank = false;
 
     for raw in src.replace("\r\n", "\n").lines() {
         let started_in_multiline = in_multiline_str;
         let scan_src = if started_in_multiline {
+            prev_blank = false;
             out.push(raw.to_string());
-            raw
+            raw.to_string()
         } else {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
-                out.push(String::new());
+                if !prev_blank {
+                    out.push(String::new());
+                    prev_blank = true;
+                }
                 continue;
             }
+            prev_blank = false;
             let leading_closes = if in_block_comment {
                 0
             } else {
-                trimmed.chars().take_while(|&c| c == '}').count()
+                trimmed
+                    .chars()
+                    .take_while(|&c| c == '}' || c == ')' || c == ']')
+                    .count()
             };
             let line_indent = indent.saturating_sub(leading_closes);
-            out.push(format!("{}{}", "    ".repeat(line_indent), trimmed));
-            trimmed
+            let formatted_body = if in_block_comment {
+                trimmed.to_string()
+            } else {
+                render_formatted_line(&format_line_tokens(trimmed))
+            };
+            out.push(format!("{}{}", "    ".repeat(line_indent), formatted_body));
+            trimmed.to_string()
         };
 
         let mut in_str = false;
@@ -933,6 +1691,12 @@ fn format_askane_source(src: &str) -> String {
             } else if c == '/' && next == Some('*') {
                 in_block_comment = true;
                 i += 2;
+            } else if ((c == 'b' && next == Some('r')) || (c == 'r' && next == Some('b')))
+                && chars.get(i + 2).copied() == Some('"')
+                && (i == 0 || !is_ident_char(chars[i - 1]))
+            {
+                in_raw_str = true;
+                i += 3;
             } else if c == 'r' && next == Some('"') && (i == 0 || !is_ident_char(chars[i - 1])) {
                 in_raw_str = true;
                 i += 2;
@@ -963,49 +1727,100 @@ fn format_askane_source(src: &str) -> String {
                     indent = indent.saturating_sub(1);
                 }
                 i += 1;
+            } else if c == '(' || c == '[' {
+                indent += 1;
+                i += 1;
+            } else if c == ')' || c == ']' {
+                indent = indent.saturating_sub(1);
+                i += 1;
             } else {
                 i += 1;
             }
         }
     }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
     let mut joined = out.join("\n");
-    if src.ends_with('\n') && !joined.ends_with('\n') {
+    if (src.ends_with('\n') || !joined.is_empty()) && !joined.ends_with('\n') {
         joined.push('\n');
     }
     joined
 }
 
+fn verify_askane_syntax(source: &str) -> Result<(), String> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize()?;
+    let mut parser = Parser::new(tokens);
+    let _ = parser.parse_program()?;
+    Ok(())
+}
+
 fn run_fmt(path: &str, check_only: bool) -> Result<(), String> {
-    let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
-        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
-    let formatted = format_askane_source(&source);
-    if check_only {
-        if formatted != source {
-            return Err(format!("File '{}' is not formatted", path));
+    let p = std::path::Path::new(path);
+    let mut files = Vec::new();
+    if p.is_dir() {
+        collect_ask_files(p, &mut files)?;
+        if files.is_empty() {
+            return Err(format!("No .ask files found in '{}'", path));
         }
-        println!("OK (formatted): {}", path);
     } else {
-        fs::write(path, formatted).map_err(|e| format!("Could not write '{}': {}", path, e))?;
-        println!("Formatted {}", path);
+        files.push(p.to_path_buf());
+    }
+    for file in files {
+        let fstr = file.display().to_string();
+        let source = read_text_limited(&file, MAX_SOURCE_BYTES)
+            .map_err(|e| format!("Could not read '{}': {}", fstr, e))?;
+        verify_askane_syntax(&source).map_err(|e| {
+            format!(
+                "Syntax error in '{}':\n{}",
+                fstr,
+                format_error_with_source(&source, &e)
+            )
+        })?;
+        let formatted = format_askane_source(&source);
+        verify_askane_syntax(&formatted)
+            .map_err(|e| format!("Internal formatter error on '{}': {}", fstr, e))?;
+        if check_only {
+            if formatted != source {
+                return Err(format!("File '{}' is not formatted", fstr));
+            }
+            println!("OK (formatted): {}", fstr);
+        } else {
+            fs::write(&file, formatted)
+                .map_err(|e| format!("Could not write '{}': {}", fstr, e))?;
+            println!("Formatted {}", fstr);
+        }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Default)]
+struct ExplicitLimits {
+    max_steps: bool,
+    max_mem: bool,
+    timeout: bool,
 }
 
 enum CliParseOutcome {
     ExitZero,
     Run {
         dump_bytecode: bool,
+        profile: bool,
         eval_code: Option<String>,
         perms: Permissions,
         script_path: Option<String>,
+        explicit_limits: ExplicitLimits,
     },
 }
 
 fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
     let mut dump_bytecode = false;
+    let mut profile = false;
     let mut eval_code: Option<String> = None;
     let mut perms = Permissions::sandboxed();
     let mut explicit_max_steps: Option<u64> = None;
+    let mut explicit_max_mem: Option<u64> = None;
     let mut explicit_timeout: Option<u64> = None;
     let mut script_path: Option<String> = None;
 
@@ -1022,6 +1837,8 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
         }
         if arg == "-b" || arg == "--bytecode" {
             dump_bytecode = true;
+        } else if arg == "--profile" {
+            profile = true;
         } else if arg == "-e" || arg == "--eval" {
             i += 1;
             let Some(code) = args.get(i) else {
@@ -1032,6 +1849,9 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
             perms = Permissions::unrestricted();
             if let Some(steps) = explicit_max_steps {
                 perms.max_instructions = Some(steps);
+            }
+            if let Some(mem_bytes) = explicit_max_mem {
+                perms.max_memory_bytes = Some(mem_bytes);
             }
             if let Some(ms) = explicit_timeout {
                 perms.max_duration_ms = Some(ms);
@@ -1068,6 +1888,15 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
                 }
                 Err(_) => return Err(format!("Invalid --max-steps value: {}", val)),
             }
+        } else if let Some(val) = arg.strip_prefix("--max-mem=") {
+            match val.parse::<u64>() {
+                Ok(mb) => {
+                    let bytes = mb.saturating_mul(1024 * 1024);
+                    explicit_max_mem = Some(bytes);
+                    perms.max_memory_bytes = Some(bytes);
+                }
+                Err(_) => return Err(format!("Invalid --max-mem value: {}", val)),
+            }
         } else if let Some(val) = arg.strip_prefix("--timeout=") {
             match val.parse::<u64>() {
                 Ok(n) => {
@@ -1094,9 +1923,15 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
 
     Ok(CliParseOutcome::Run {
         dump_bytecode,
+        profile,
         eval_code,
         perms,
         script_path,
+        explicit_limits: ExplicitLimits {
+            max_steps: explicit_max_steps.is_some(),
+            max_mem: explicit_max_mem.is_some(),
+            timeout: explicit_timeout.is_some(),
+        },
     })
 }
 
@@ -1125,13 +1960,23 @@ fn main() {
             } else if target.is_none() {
                 target = Some(arg.clone());
             } else {
-                eprintln!("Usage: askane check [--json] <file.ask>");
+                eprintln!("Usage: askane check [--json] [file_or_dir]");
                 process::exit(1);
             }
         }
-        let Some(path) = target else {
-            eprintln!("Usage: askane check [--json] <file.ask>");
-            process::exit(1);
+        let path = match target {
+            Some(p) => p,
+            None => match discover_manifest_from_cwd() {
+                Ok(Some((root, _))) => root.display().to_string(),
+                Ok(None) => {
+                    eprintln!("Usage: askane check [--json] [file_or_dir]");
+                    process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Check failed: {}", e);
+                    process::exit(1);
+                }
+            },
         };
         if let Err(e) = run_check(&path, json_out) {
             if !e.is_empty() {
@@ -1176,7 +2021,7 @@ fn main() {
         let files = [
             (
                 root.join("askane.toml"),
-                "name = \"my-askane-app\"\nversion = \"0.1.0\"\nentry = \"main.ask\"\nsandbox = true\n",
+                "name = \"my-askane-app\"\nversion = \"0.1.0\"\nentry = \"main.ask\"\ntests = \"tests\"\nsandbox = true\n",
             ),
             (root.join("main.ask"), "println(\"Hello from Askane!\");\n"),
             (
@@ -1238,27 +2083,38 @@ fn main() {
     let slice_start = if args[1] == "test" {
         is_test_cmd = true;
         2
+    } else if args[1] == "run" {
+        2
     } else {
         1
     };
 
-    let (dump_bytecode, eval_code, perms, script_path) = match parse_run_args(&args[slice_start..])
-    {
-        Ok(CliParseOutcome::ExitZero) => return,
-        Ok(CliParseOutcome::Run {
-            dump_bytecode,
-            eval_code,
-            perms,
-            script_path,
-        }) => (dump_bytecode, eval_code, perms, script_path),
-        Err(e) => {
-            eprintln!("{}", e);
-            process::exit(1);
-        }
-    };
+    let (dump_bytecode, profile, eval_code, mut perms, script_path, explicit_limits) =
+        match parse_run_args(&args[slice_start..]) {
+            Ok(CliParseOutcome::ExitZero) => return,
+            Ok(CliParseOutcome::Run {
+                dump_bytecode,
+                profile,
+                eval_code,
+                perms,
+                script_path,
+                explicit_limits,
+            }) => (
+                dump_bytecode,
+                profile,
+                eval_code,
+                perms,
+                script_path,
+                explicit_limits,
+            ),
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        };
 
     if let Some(code) = eval_code {
-        if let Err(e) = run_eval(&code, perms) {
+        if let Err(e) = run_eval(&code, profile, perms) {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
@@ -1266,19 +2122,100 @@ fn main() {
     }
 
     if is_test_cmd {
-        let target = script_path.as_deref().unwrap_or(".");
-        if let Err(e) = run_tests_cmd(target, perms) {
+        let result = match script_path {
+            Some(ref target) => {
+                let target_path = std::path::Path::new(target);
+                if target_path.is_dir() {
+                    match load_manifest_from_dir(target_path) {
+                        Ok(Some((root, manifest))) => {
+                            apply_manifest_limits(&mut perms, &manifest, explicit_limits);
+                            let tests_rel = manifest.tests.as_deref().unwrap_or("tests");
+                            resolve_manifest_subpath(&root, tests_rel, "tests").and_then(
+                                |tests_path| {
+                                    run_tests_cmd(
+                                        &tests_path.display().to_string(),
+                                        perms,
+                                        Some(&root),
+                                    )
+                                },
+                            )
+                        }
+                        Ok(None) => run_tests_cmd(target, perms, None),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    run_tests_cmd(target, perms, None)
+                }
+            }
+            None => match discover_manifest_from_cwd() {
+                Ok(Some((root, manifest))) => {
+                    apply_manifest_limits(&mut perms, &manifest, explicit_limits);
+                    let tests_rel = manifest.tests.as_deref().unwrap_or("tests");
+                    resolve_manifest_subpath(&root, tests_rel, "tests").and_then(|tests_path| {
+                        run_tests_cmd(&tests_path.display().to_string(), perms, Some(&root))
+                    })
+                }
+                Ok(None) => run_tests_cmd(".", perms, None),
+                Err(e) => Err(e),
+            },
+        };
+        if let Err(e) = result {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
         return;
     }
 
-    let Some(path) = script_path else {
-        eprintln!("Missing script file. Run 'askane --help' for usage.");
-        process::exit(1);
+    let run_result = match script_path {
+        Some(ref path) => {
+            let p = std::path::Path::new(path);
+            if p.is_dir() {
+                match load_manifest_from_dir(p) {
+                    Ok(Some((root, manifest))) => {
+                        apply_manifest_limits(&mut perms, &manifest, explicit_limits);
+                        let entry_rel = manifest.entry.as_deref().unwrap_or("main.ask");
+                        resolve_manifest_subpath(&root, entry_rel, "entry").and_then(|entry_path| {
+                            run_file_with_options(
+                                &entry_path.display().to_string(),
+                                dump_bytecode,
+                                profile,
+                                perms,
+                                Some(&root),
+                            )
+                        })
+                    }
+                    Ok(None) => Err(format!(
+                        "Directory '{}' does not contain an askane.toml manifest",
+                        path
+                    )),
+                    Err(e) => Err(e),
+                }
+            } else {
+                run_file_with_options(path, dump_bytecode, profile, perms, None)
+            }
+        }
+        None => match discover_manifest_from_cwd() {
+            Ok(Some((root, manifest))) => {
+                apply_manifest_limits(&mut perms, &manifest, explicit_limits);
+                let entry_rel = manifest.entry.as_deref().unwrap_or("main.ask");
+                resolve_manifest_subpath(&root, entry_rel, "entry").and_then(|entry_path| {
+                    run_file_with_options(
+                        &entry_path.display().to_string(),
+                        dump_bytecode,
+                        profile,
+                        perms,
+                        Some(&root),
+                    )
+                })
+            }
+            Ok(None) => {
+                eprintln!("Missing script file. Run 'askane --help' for usage.");
+                process::exit(1);
+            }
+            Err(e) => Err(e),
+        },
     };
-    if let Err(e) = run_file(&path, dump_bytecode, perms) {
+    if let Err(e) = run_result {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
@@ -1551,7 +2488,7 @@ mod tests {
 
     #[test]
     fn test_safety_stack_overflow_and_cycles() {
-        let proto = compile_source("fn boom() { boom() } boom()").unwrap();
+        let proto = compile_source("fn boom() { 1 + boom() } boom()").unwrap();
         let mut vm = VM::new();
         let err = vm.run(proto).unwrap_err();
         assert!(err.contains("Stack overflow"));
@@ -2042,13 +2979,18 @@ mod tests {
         let bad_proto = std::rc::Rc::new(bytecode::FunctionProto {
             name: "bad".to_string(),
             arity: 0,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: vec![],
             local_count: 1,
             upvalue_count: 0,
+            is_main: true,
             chunk: bytecode::Chunk {
                 code: vec![bytecode::Op::Jump(999)],
                 constants: vec![],
                 lines: vec![1],
                 upvalue_lists: vec![],
+                kw_lists: vec![],
                 limit_exceeded: false,
             },
         });
@@ -2128,7 +3070,7 @@ line2""";
 
             let hx = hex.encode("Hi");
             test.assert_eq(hx, "4869");
-            test.assert_eq(hex.decode(hx), [72, 105]);
+            test.assert_eq(hex.decode(hx), b"Hi");
 
             let id = uuid.v4();
             test.assert_eq(len(id), 36);
@@ -2518,26 +3460,36 @@ line2""";
         let child_proto = std::rc::Rc::new(bytecode::FunctionProto {
             name: "child".to_string(),
             arity: 0,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: vec![],
             local_count: 1,
             upvalue_count: 1,
+            is_main: false,
             chunk: bytecode::Chunk {
                 code: vec![bytecode::Op::GetUpvalue(0), bytecode::Op::Return],
                 constants: vec![],
                 lines: vec![1, 1],
                 upvalue_lists: vec![],
+                kw_lists: vec![],
                 limit_exceeded: false,
             },
         });
         let bad_uv_proto = std::rc::Rc::new(bytecode::FunctionProto {
             name: "parent".to_string(),
             arity: 0,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: vec![],
             local_count: 1,
             upvalue_count: 0,
+            is_main: true,
             chunk: bytecode::Chunk {
                 code: vec![bytecode::Op::Closure(0, 0), bytecode::Op::Return],
                 constants: vec![bytecode::Constant::Function(child_proto)],
                 lines: vec![1, 1],
                 upvalue_lists: vec![vec![]],
+                kw_lists: vec![],
                 limit_exceeded: false,
             },
         });
@@ -2854,26 +3806,36 @@ line2""";
         let fn_proto = std::rc::Rc::new(bytecode::FunctionProto {
             name: "inner".to_string(),
             arity: 0,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: vec![],
             local_count: 1,
             upvalue_count: 0,
+            is_main: false,
             chunk: bytecode::Chunk {
                 code: vec![bytecode::Op::Unit, bytecode::Op::Return],
                 constants: vec![],
                 lines: vec![1, 1],
                 upvalue_lists: vec![],
+                kw_lists: vec![],
                 limit_exceeded: false,
             },
         });
         let bad_const_proto = std::rc::Rc::new(bytecode::FunctionProto {
             name: "bad_const".to_string(),
             arity: 0,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: vec![],
             local_count: 1,
             upvalue_count: 0,
+            is_main: true,
             chunk: bytecode::Chunk {
                 code: vec![bytecode::Op::Constant(0), bytecode::Op::Return],
                 constants: vec![bytecode::Constant::Function(fn_proto)],
                 lines: vec![1, 1],
                 upvalue_lists: vec![],
+                kw_lists: vec![],
                 limit_exceeded: false,
             },
         });
@@ -2882,13 +3844,18 @@ line2""";
         let bad_mod_proto = std::rc::Rc::new(bytecode::FunctionProto {
             name: "bad_mod".to_string(),
             arity: 0,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: vec![],
             local_count: 1,
             upvalue_count: 0,
+            is_main: true,
             chunk: bytecode::Chunk {
                 code: vec![bytecode::Op::MakeModule(0, 0), bytecode::Op::Return],
                 constants: vec![bytecode::Constant::Int(123)],
                 lines: vec![1, 1],
                 upvalue_lists: vec![],
+                kw_lists: vec![],
                 limit_exceeded: false,
             },
         });
@@ -2905,5 +3872,644 @@ line2""";
         assert!(needs_more_input("let s = \"${1 +\n"));
 
         let _ = fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_v015_bytes_and_resource_budget() {
+        let val = eval(
+            r#"
+            import test;
+            import hex;
+            import base64;
+            import hash;
+            import random;
+            import sys;
+            import fs;
+
+            // Global bytes() constructor works alongside literal & sequence ops
+            test.assert_eq(bytes("Hi"), b"Hi");
+            test.assert_eq(bytes([72, 105]), b"Hi");
+            test.assert_eq(bytes(3), b"\x00\x00\x00");
+            test.assert_err(|| bytes([256]), "0..=255");
+
+            import bytes;
+
+            // Byte literals (standard & raw), indexing, slicing, concatenation, in, len
+            let hdr = b"BM\x00\x01";
+            test.assert_eq(type_of(hdr), "bytes");
+            test.assert_eq(len(hdr), 4);
+            test.assert_eq(hdr[0], 66);
+            test.assert_eq(hdr[-1], 1);
+            test.assert_eq(hdr[0..2], b"BM");
+            test.assert_eq(hdr[1..=2], b"M\x00");
+            test.assert(66 in hdr);
+            test.assert(!(99 in hdr));
+            test.assert(b"\x00\x01" in hdr);
+            test.assert(!(b"\x02" in hdr));
+            test.assert_eq(b"A" + b"B", b"AB");
+            test.assert_eq(br"a\b", b"a\\b");
+            test.assert_eq(rb"a\b", b"a\\b");
+
+            // Iteration & sequence helpers work over bytes
+            let total = 0;
+            for b in b"\x01\x02\x03" {
+                total += b;
+            }
+            test.assert_eq(total, 6);
+            test.assert_eq(take(b"abcdef", 3), b"abc");
+            test.assert_eq(skip(b"abcdef", 3), b"def");
+            test.assert_eq(sum(b"\x0a\x14"), 30);
+
+            // bytes module UTF-8 & list conversions
+            test.assert_eq(bytes.from_utf8(bytes.to_utf8("Askane")), "Askane");
+            test.assert_eq(bytes.to_list(b"AB"), [65, 66]);
+            test.assert_eq(bytes.from_list([65, 66]), b"AB");
+            test.assert_eq(bytes.zeros(2), b"\x00\x00");
+            test.assert_err(|| bytes.from_utf8(b"\xff\xfe"), "invalid UTF-8");
+
+            // Integration across hex, base64, hash, random, sys.budget
+            test.assert_eq(hex.encode(b"\xde\xad\xbe\xef"), "deadbeef");
+            test.assert_eq(hex.decode("deadbeef"), b"\xde\xad\xbe\xef");
+            let b64 = base64.encode(b"\x00\xff\x10");
+            test.assert_eq(base64.decode_bytes(b64), b"\x00\xff\x10");
+            test.assert_err(|| base64.decode(b64), "not valid UTF-8");
+            let b64u = base64.encode_url(b"\xfb\xff");
+            test.assert_eq(base64.decode_url_bytes(b64u), b"\xfb\xff");
+            test.assert_eq(hash.sha256(b"abc"), hash.sha256("abc"));
+            test.assert_eq(hash.crc32(b"123456789"), 3421780262);
+            test.assert_eq(type_of(random.crypto_bytes(4)), "bytes");
+            let bgt = sys.budget();
+            test.assert(bgt.memory_used > 0);
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // fs.read_bytes returns Value::Bytes, fs.write_bytes accepts both bytes and lists
+        let tmp_dir = std::env::temp_dir().join(format!("askane_bytes_{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let bin_path = tmp_dir.join("sample.bin");
+        let fs_src = format!(
+            r#"
+            import fs;
+            import test;
+            fs.write_bytes({:?}, b"\x00\x01\x7f\xff");
+            let got = fs.read_bytes({:?});
+            test.assert_eq(type_of(got), "bytes");
+            test.assert_eq(got, b"\x00\x01\x7f\xff");
+            fs.write_bytes({:?}, [10, 20, 30]);
+            test.assert_eq(fs.read_bytes({:?}), b"\x0a\x14\x1e");
+            true
+            "#,
+            bin_path.to_string_lossy(),
+            bin_path.to_string_lossy(),
+            bin_path.to_string_lossy(),
+            bin_path.to_string_lossy(),
+        );
+        let mut perms_fs = Permissions::sandboxed();
+        perms_fs.allow_read = Some(vec![tmp_dir.clone()]);
+        perms_fs.allow_write = Some(vec![tmp_dir.clone()]);
+        let mut vm_fs = VM::new();
+        vm_fs.set_permissions(perms_fs);
+        assert!(
+            vm_fs
+                .run(compile_source(&fs_src).unwrap())
+                .unwrap()
+                .equals(&Value::Bool(true))
+        );
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        // ResourceBudget (--max-mem=MB) blocks large allocations and cannot be caught by try/catch
+        let mut perms_mem = Permissions::sandboxed();
+        perms_mem.max_memory_bytes = Some(1024);
+        let mut vm_mem = VM::new();
+        vm_mem.set_permissions(perms_mem);
+        let mem_proto = compile_source(r#"try { bytes(4096) } catch e { "caught" }"#).unwrap();
+        let err = vm_mem.run(mem_proto).unwrap_err();
+        assert!(err.contains("memory budget exceeded"), "err: {}", err);
+
+        // Native work budget deducts instructions_left so heavy native ops obey --max-steps
+        let mut perms_work = Permissions::sandboxed();
+        perms_work.max_instructions = Some(50);
+        let mut vm_work = VM::new();
+        vm_work.set_permissions(perms_work);
+        let work_proto =
+            compile_source(r#"import strings; strings.repeat("abcdefgh", 1000)"#).unwrap();
+        let err_w = vm_work.run(work_proto).unwrap_err();
+        assert!(err_w.contains("instruction limit"), "err: {}", err_w);
+
+        // CLI --max-mem flag works both before and after --unsafe
+        match parse_run_args(&[
+            "--max-mem=12".to_string(),
+            "--unsafe".to_string(),
+            "a.ask".to_string(),
+        ])
+        .unwrap()
+        {
+            CliParseOutcome::Run { perms, .. } => {
+                assert!(perms.allow_all);
+                assert_eq!(perms.max_memory_bytes, Some(12 * 1024 * 1024));
+            }
+            CliParseOutcome::ExitZero => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_v015_modules_and_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "askane_v015_stage2_proj_{}_{:?}",
+            process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src").join("pkg").join("inner")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+
+        fs::write(
+            root.join("shared.ask"),
+            r#"
+let VERSION = 15;
+fn answer() { 42 }
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("src").join("pkg").join("inner").join("sub.ask"),
+            r#"
+import http;
+pub fn check_main() { is_main() }
+pub fn dynamic_shared() {
+    from "../../../shared" import answer as get_answer;
+    get_answer()
+}
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("src").join("pkg").join("mod.ask"),
+            r#"
+from "./inner/sub" import check_main, dynamic_shared;
+let hidden_secret = 999;
+fn private_fn() { hidden_secret }
+pub let top_is_main = is_main();
+pub fn greet(name) { "hi " + name }
+pub fn from_sub() { [check_main(), dynamic_shared()] }
+"#,
+        )
+        .unwrap();
+
+        let entry = root.join("src").join("main.ask");
+        fs::write(
+            &entry,
+            r#"
+import test;
+from "./pkg" import greet, top_is_main, from_sub as call_sub;
+from "../shared" import VERSION as sh_ver;
+from math import floor as m_floor;
+
+test.assert(is_main());
+test.assert(!top_is_main);
+test.assert_eq(greet("world"), "hi world");
+test.assert_eq(call_sub(), [false, 42]);
+test.assert_eq(sh_ver, 15);
+test.assert_eq(m_floor(3.9), 3.0);
+true
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("tests").join("proj_test.ask"),
+            r#"
+import test;
+from "../shared" import VERSION, answer;
+from "../src/pkg" import greet;
+test.assert_eq(VERSION, 15);
+test.assert_eq(answer(), 42);
+test.assert_eq(greet("test"), "hi test");
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("askane.toml"),
+            r#"
+name = "demo"
+entry = "src/main.ask"
+tests = "tests"
+sandbox = false # must be ignored
+
+[permissions]
+allow_net = true
+unsafe = true
+
+[limits]
+max_steps = 500_000
+max_mem_mb = 16
+timeout_ms = 5000
+"#,
+        )
+        .unwrap();
+
+        // 1. Run entry via manifest root override so src/main.ask can import ../shared
+        run_file_with_root(
+            &entry.display().to_string(),
+            false,
+            Permissions::sandboxed(),
+            Some(&root),
+        )
+        .unwrap();
+
+        // 2. Non-pub symbol inside pub-using module is not exported
+        let private_probe = root.join("src").join("probe_priv.ask");
+        fs::write(&private_probe, "import \"./pkg\"; pkg.private_fn()").unwrap();
+        let priv_err = run_file_with_root(
+            &private_probe.display().to_string(),
+            false,
+            Permissions::sandboxed(),
+            Some(&root),
+        )
+        .unwrap_err();
+        assert!(
+            priv_err.contains("has no export 'private_fn'"),
+            "err: {}",
+            priv_err
+        );
+
+        let from_priv_probe = root.join("src").join("probe_from_priv.ask");
+        fs::write(
+            &from_priv_probe,
+            "from \"./pkg\" import hidden_secret; hidden_secret",
+        )
+        .unwrap();
+        let from_priv_err = run_file_with_root(
+            &from_priv_probe.display().to_string(),
+            false,
+            Permissions::sandboxed(),
+            Some(&root),
+        )
+        .unwrap_err();
+        assert!(
+            from_priv_err.contains("has no export 'hidden_secret'"),
+            "err: {}",
+            from_priv_err
+        );
+
+        // 3. Transitive askane permissions tracks ImportFrom -> mod.ask -> sub.ask -> http
+        let caps = inspect_permissions(&entry.display().to_string()).unwrap();
+        assert!(
+            caps.iter().any(|c| c.contains("http (blocked by default")),
+            "caps: {:?}",
+            caps
+        );
+
+        // 4. Manifest parsing, limit application, CLI override priority, and security guarantees
+        let (loaded_root, manifest) = load_manifest_from_dir(&root).unwrap().unwrap();
+        assert_eq!(manifest.entry.as_deref(), Some("src/main.ask"));
+        assert_eq!(manifest.tests.as_deref(), Some("tests"));
+        assert_eq!(manifest.max_steps, Some(500_000));
+        assert_eq!(manifest.max_mem_mb, Some(16));
+        assert_eq!(manifest.timeout_ms, Some(5000));
+
+        let mut perms = Permissions::sandboxed();
+        apply_manifest_limits(
+            &mut perms,
+            &manifest,
+            ExplicitLimits {
+                max_steps: false,
+                max_mem: true,
+                timeout: false,
+            },
+        );
+        assert!(!perms.allow_all);
+        assert!(perms.allow_net.is_none());
+        assert_eq!(perms.max_instructions, Some(500_000));
+        assert_eq!(perms.max_memory_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(perms.max_duration_ms, Some(5000));
+
+        // 5. Reject manifest path escaping
+        assert!(resolve_manifest_subpath(&loaded_root, "../outside.ask", "entry").is_err());
+
+        // 6. Run project tests directory with project sandbox root
+        run_tests_cmd(
+            &root.join("tests").display().to_string(),
+            Permissions::sandboxed(),
+            Some(&root),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_v015_stage3_structs_sets_ergonomics() {
+        let val = eval(
+            r#"
+            import test;
+            import json;
+
+            // 1. Struct fields, defaults evaluated per instance, methods, self, ==, copy-update, dict/json, protocols
+            struct Bag {
+                owner,
+                items = [],
+                hp = 100,
+                fn add_item(self, x) {
+                    self.items.push(x);
+                    self
+                }
+                fn fmt(self) {
+                    "Bag(" + self.owner + ":" + str(self.hp) + ")"
+                }
+                fn contains(self, item) {
+                    item in self.items
+                }
+                fn iter(self) {
+                    self.items
+                }
+                fn close(self) {
+                    self.hp = 0;
+                    true
+                }
+            }
+
+            let b1 = Bag { owner: "Alice" };
+            let b2 = Bag { owner: "Bob" };
+            b1.add_item("sword");
+            test.assert_eq(b2.items, []);
+            test.assert("sword" in b1);
+            test.assert("bow" not in b1);
+            test.assert_eq(str(b1), "Bag(Alice:100)");
+
+            let collected = [];
+            for x in b1 {
+                collected.push(x);
+            }
+            test.assert_eq(collected, ["sword"]);
+            test.assert_eq([x.upper() for x in b1], ["SWORD"]);
+
+            let b3 = Bag { hp: 80, ..b2 };
+            test.assert_eq(b3.owner, "Bob");
+            test.assert_eq(b3.hp, 80);
+            let b3_copy = Bag { owner: "Bob", items: [], hp: 80 };
+            test.assert_eq(b3, b3_copy);
+            test.assert(b1 != b3);
+            test.assert_eq(dict(b3), #{ owner: "Bob", items: [], hp: 80 });
+            test.assert_eq(b3.to_dict(), #{ owner: "Bob", items: [], hp: 80 });
+            let j = json.parse(json.stringify(b3));
+            test.assert_eq(j.owner, "Bob");
+            test.assert_eq(j.hp, 80);
+            test.assert(b3.close());
+            test.assert_eq(b3.hp, 0);
+
+            // Control-flow braces next to identifier do NOT clash with struct literals
+            let flag = true;
+            let hit = false;
+            if flag {
+                hit = true;
+            }
+            test.assert(hit);
+
+            // 2. Built-in set(...) type
+            let s1 = set([1, 2, 2, 3, "a"]);
+            let s2 = set([3, 4, "a"]);
+            test.assert_eq(len(s1), 4);
+            test.assert(2 in s1);
+            test.assert(99 not in s1);
+            test.assert(s1.has(1.0));
+            test.assert_eq(s1.union(s2), set([1, 2, 3, 4, "a"]));
+            test.assert_eq(s1.intersect(s2), set([3, "a"]));
+            test.assert_eq(s1.diff(s2), set([1, 2]));
+            s1.add(5);
+            test.assert(5 in s1);
+            test.assert(s1.remove(2));
+            test.assert(!s1.remove(2));
+            let s_copy = [];
+            for item in set([10, 20]) {
+                s_copy.push(item);
+            }
+            test.assert_eq(s_copy, [10, 20]);
+
+            // 3. Default parameters (fresh per call!), named arguments, and *args
+            fn greet(name, prefix = "Hi", suffix = "!") {
+                prefix + " " + name + suffix
+            }
+            test.assert_eq(greet("Ask"), "Hi Ask!");
+            test.assert_eq(greet("Ask", suffix: "?", prefix: "Yo"), "Yo Ask?");
+            test.assert_eq(greet(name: "Ada"), "Hi Ada!");
+
+            fn append_fresh(val, lst = []) {
+                lst.push(val);
+                lst
+            }
+            test.assert_eq(append_fresh(1), [1]);
+            test.assert_eq(append_fresh(2), [2]);
+
+            fn collect_var(first, *rest) {
+                [first, rest]
+            }
+            test.assert_eq(collect_var(10), [10, []]);
+            test.assert_eq(collect_var(10, 20, 30), [10, [20, 30]]);
+
+            // 4. String & List methods
+            test.assert_eq("  hello world  ".trim().upper(), "HELLO WORLD");
+            test.assert_eq("a,b,c".split(",").join("-"), "a-b-c");
+            test.assert("hello".starts_with("he"));
+            test.assert("hello".ends_with("lo"));
+            let nums = [3, 1, 2];
+            nums.push(2);
+            test.assert_eq(nums.unique().sort(), [1, 2, 3]);
+            test.assert_eq(nums.map(|n| n * 2).sum(), 16);
+
+            // 5. Chained comparisons & short-circuiting & not in
+            let calls = 0;
+            fn inc(v) { calls += 1; v }
+            let x = 5;
+            test.assert(0 <= x <= 10);
+            test.assert(0 < x < 10 <= 10);
+            test.assert(!(10 < x < 20));
+            test.assert(0 < inc(5) <= 10);
+            test.assert_eq(calls, 1);
+            test.assert(!(10 < 5 < inc(99)));
+            test.assert_eq(calls, 1);
+            test.assert(1 < x not in [2, 3, 4]);
+            test.assert(!(1 < x not in [5, 6]));
+
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // Cross-module struct export/import test (pub struct)
+        let root = std::env::temp_dir().join(format!(
+            "askane_v015_stage3_mod_{}_{:?}",
+            process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("models.ask"),
+            r#"
+pub struct Point {
+    x = 0,
+    y = 0,
+    fn clone_offset(self, dx) {
+        Point { x: self.x + dx, ..self }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let entry = root.join("main.ask");
+        fs::write(
+            &entry,
+            r#"
+import test;
+import "./models";
+from "./models" import Point;
+let p1 = Point { x: 3, y: 4 };
+let p2 = models.Point { x: 1, y: 2 };
+test.assert_eq(p1.clone_offset(7).x, 10);
+test.assert_eq(p2.x, 1);
+test.assert_eq(models.Point(5, 6).y, 6);
+"#,
+        )
+        .unwrap();
+        run_file_with_root(
+            &entry.display().to_string(),
+            false,
+            Permissions::sandboxed(),
+            Some(&root),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_v015_stage4_perf_and_fmt() {
+        // 1. Fast ForPrep/ForIter range loop with closures (fresh capture per iteration) + continue/break
+        let val = eval(
+            r#"
+            import test;
+            let fns = [];
+            for i in range(0, 4) {
+                fns.push(|| i);
+            }
+            test.assert_eq([fns[0](), fns[1](), fns[2](), fns[3]()], [0, 1, 2, 3]);
+
+            let sum_filtered = 0;
+            for n in range(0, 10) {
+                if n % 2 == 0 {
+                    continue;
+                }
+                if n > 7 {
+                    break;
+                }
+                sum_filtered += n;
+            }
+            test.assert_eq(sum_filtered, 1 + 3 + 5 + 7);
+            test.assert_eq([x * x for x in range(1, 5) if x != 3], [1, 4, 16]);
+
+            // 2. Tail call optimization works way past MAX_CALL_DEPTH (1024)
+            fn tail_sum(n, acc) {
+                if n <= 0 {
+                    acc
+                } else {
+                    tail_sum(n - 1, acc + n)
+                }
+            }
+            test.assert_eq(tail_sum(5000, 0), 12502500);
+
+            // 3. Hot struct attribute IC + global IC across multiple loops
+            struct Counter { val = 0 }
+            let c = Counter { val: 0 };
+            for _i in range(0, 200) {
+                c.val += 1;
+            }
+            test.assert_eq(c.val, 200);
+            true
+            "#,
+        );
+        assert!(val.equals(&Value::Bool(true)));
+
+        // 4. --profile collects call counts, steps, and time without breaking output
+        let prof_proto = compile_source(
+            r#"
+            fn helper(n) { n * 2 }
+            let total = 0;
+            for i in range(0, 10) {
+                total += helper(i);
+            }
+            total
+            "#,
+        )
+        .unwrap();
+        let mut pvm = VM::new();
+        pvm.set_profile(true);
+        let pres = pvm.run(prof_proto).unwrap();
+        assert!(pres.equals(&Value::Int(90)));
+        let report = pvm.profile_report();
+        assert!(
+            report
+                .iter()
+                .any(|(name, stat)| name == "helper" && stat.calls == 10),
+            "report: {:?}",
+            report
+        );
+        match parse_run_args(&["--profile".to_string(), "a.ask".to_string()]).unwrap() {
+            CliParseOutcome::Run { profile, .. } => assert!(profile),
+            CliParseOutcome::ExitZero => panic!("expected Run"),
+        }
+
+        // 5. Token-aware & syntax-verified askane fmt golden corpus tests
+        let corpus = [
+            (
+                "fn add(a,b=1){return a+b;}\n",
+                "fn add(a, b = 1) { return a + b; }\n",
+            ),
+            (
+                "let xs=[1,2,3];\nlet neg=-xs[0];\n",
+                "let xs = [1, 2, 3];\nlet neg = -xs[0];\n",
+            ),
+            (
+                "struct Player{name,hp=100}\nlet p=Player{hp:80,..base};\n",
+                "struct Player { name, hp = 100 }\nlet p = Player { hp: 80, ..base };\n",
+            ),
+            (
+                "let d=#{a:1,b:\"x ${1+2}\"};\nlet e=#{};\n",
+                "let d = #{ a: 1, b: \"x ${1+2}\" };\nlet e = #{};\n",
+            ),
+            (
+                "let r=xs[0..=10];\nlet ok=0<=x<=10&&!flag;\n",
+                "let r = xs[0..=10];\nlet ok = 0 <= x <= 10 && !flag;\n",
+            ),
+            (
+                "let res=[x*2 for x in range(0,5)]|>filter(|n|n>2);\n",
+                "let res = [x * 2 for x in range(0, 5)] |> filter(|n| n > 2);\n",
+            ),
+            (
+                "let b=b\"hi\\x00\";\nlet s=r\"C:\\\\a\"; // keep comment\n\n\nlet z=1;\n",
+                "let b = b\"hi\\x00\";\nlet s = r\"C:\\\\a\"; // keep comment\n\nlet z = 1;\n",
+            ),
+        ];
+        for (raw, expected) in corpus {
+            let formatted = format_askane_source(raw);
+            assert_eq!(formatted, expected, "raw:\n{}", raw);
+            assert_eq!(format_askane_source(&formatted), expected);
+            verify_askane_syntax(&formatted).unwrap();
+        }
+
+        // run_fmt rejects invalid Askane syntax without clobbering file
+        let bad_fmt_path = std::env::temp_dir().join(format!(
+            "askane_bad_fmt_{}_{:?}.ask",
+            process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&bad_fmt_path, "let broken = ;").unwrap();
+        assert!(run_fmt(&bad_fmt_path.display().to_string(), false).is_err());
+        assert_eq!(fs::read_to_string(&bad_fmt_path).unwrap(), "let broken = ;");
+        let _ = fs::remove_file(&bad_fmt_path);
     }
 }

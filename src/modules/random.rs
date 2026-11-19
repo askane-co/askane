@@ -197,7 +197,7 @@ fn rand_crypto_int(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int(crypto_range_i64(min, max)?))
 }
 
-fn rand_crypto_bytes(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn rand_crypto_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("random.crypto_bytes() expects 1 integer argument (count)".to_string());
     }
@@ -205,10 +205,11 @@ fn rand_crypto_bytes(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         Value::Int(n) if *n >= 0 && *n <= 65536 => *n as usize,
         _ => return Err("random.crypto_bytes() count must be between 0 and 65536".to_string()),
     };
+    vm.charge_alloc(count)?;
+    vm.charge_work((count as u64) / 32 + 1)?;
     let mut buf = vec![0u8; count];
     if count > 0 {
         os_random_bytes(&mut buf)?;
     }
-    let list: Vec<Value> = buf.into_iter().map(|b| Value::Int(b as i64)).collect();
-    Ok(Value::List(std::rc::Rc::new(std::cell::RefCell::new(list))))
+    Ok(Value::Bytes(std::rc::Rc::new(buf)))
 }

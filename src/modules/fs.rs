@@ -87,6 +87,13 @@ fn fs_read(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let path = expect_str(&args[0], "read")?;
     let path_buf = vm.resolve_read_path(path)?;
+    if let Ok(meta) = fs::metadata(&path_buf) {
+        if meta.len() <= MAX_FS_BYTES as u64 {
+            let size = meta.len() as usize;
+            vm.charge_io(size)?;
+            vm.charge_alloc(size)?;
+        }
+    }
     let content = crate::read_text_limited(&path_buf, MAX_FS_BYTES)
         .map_err(|e| format!("fs.read('{}'): {}", path, e))?;
     Ok(Value::Str(content))
@@ -103,6 +110,7 @@ fn fs_write(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let path_buf = vm.resolve_write_path(path)?;
     check_safe_write_target(vm, &path_buf, path)?;
+    vm.charge_io(content.len())?;
     fs::write(&path_buf, content).map_err(|e| format!("fs.write('{}'): {}", path, e))?;
     Ok(Value::Unit)
 }
@@ -123,6 +131,7 @@ fn fs_append(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             return Err("fs.append() target file exceeds 32 MiB limit".to_string());
         }
     }
+    vm.charge_io(content.len())?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -201,53 +210,48 @@ fn fs_read_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let path_buf = vm.resolve_read_path(path)?;
     let file =
         fs::File::open(&path_buf).map_err(|e| format!("fs.read_bytes('{}'): {}", path, e))?;
-    if !file
+    let meta = file
         .metadata()
-        .map_err(|e| format!("fs.read_bytes('{}'): {}", path, e))?
-        .is_file()
-    {
+        .map_err(|e| format!("fs.read_bytes('{}'): {}", path, e))?;
+    if !meta.is_file() {
         return Err("Only regular files can be read".to_string());
     }
-    const LIMIT: usize = 32 * 1024 * 1024;
+    if meta.len() > MAX_FS_BYTES as u64 {
+        return Err(format!(
+            "File '{}' exceeds {} byte limit",
+            path, MAX_FS_BYTES
+        ));
+    }
+    let expected = meta.len() as usize;
+    vm.charge_io(expected)?;
+    vm.charge_alloc(expected)?;
     let mut buf = Vec::new();
-    file.take(LIMIT as u64 + 1)
+    file.take(MAX_FS_BYTES as u64 + 1)
         .read_to_end(&mut buf)
         .map_err(|e| format!("fs.read_bytes('{}'): {}", path, e))?;
-    if buf.len() > LIMIT {
-        return Err(format!("File '{}' exceeds {} byte limit", path, LIMIT));
+    if buf.len() > MAX_FS_BYTES {
+        return Err(format!(
+            "File '{}' exceeds {} byte limit",
+            path, MAX_FS_BYTES
+        ));
     }
-    let list: Vec<Value> = buf.into_iter().map(|b| Value::Int(b as i64)).collect();
-    Ok(Value::List(Rc::new(RefCell::new(list))))
+    Ok(Value::Bytes(Rc::new(buf)))
 }
 
 fn fs_write_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
-        return Err("fs.write_bytes() expects 2 arguments (path, byte_list)".to_string());
+        return Err("fs.write_bytes() expects 2 arguments (path, bytes)".to_string());
     }
     let path = expect_str(&args[0], "write_bytes")?;
-    let list = match &args[1] {
-        Value::List(l) => l,
-        other => {
-            return Err(format!(
-                "fs.write_bytes() expects a byte list, got '{}'",
-                other.type_name()
-            ));
-        }
-    };
-    let borrowed = list.borrow();
-    if borrowed.len() > 32 * 1024 * 1024 {
+    let bytes = args[1].as_bytes_cow("fs.write_bytes()")?;
+    if bytes.len() > MAX_FS_BYTES {
         return Err("fs.write_bytes() exceeds 32 MiB limit".to_string());
-    }
-    let mut bytes = Vec::with_capacity(borrowed.len());
-    for item in borrowed.iter() {
-        match item {
-            Value::Int(b) if (0..=255).contains(b) => bytes.push(*b as u8),
-            _ => return Err("fs.write_bytes() list items must be integers 0..=255".to_string()),
-        }
     }
     let path_buf = vm.resolve_write_path(path)?;
     check_not_symlink(vm, &path_buf, path)?;
-    fs::write(&path_buf, bytes).map_err(|e| format!("fs.write_bytes('{}'): {}", path, e))?;
+    vm.charge_io(bytes.len())?;
+    fs::write(&path_buf, bytes.as_ref())
+        .map_err(|e| format!("fs.write_bytes('{}'): {}", path, e))?;
     Ok(Value::Unit)
 }
 
@@ -271,6 +275,7 @@ fn fs_copy(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let dst_buf = vm.resolve_write_path(dst)?;
     check_not_symlink(vm, &dst_buf, dst)?;
+    vm.charge_io(meta.len() as usize)?;
     let bytes = fs::copy(&src_buf, &dst_buf)
         .map_err(|e| format!("fs.copy('{}', '{}'): {}", src, dst, e))?;
     Ok(Value::Int(bytes as i64))

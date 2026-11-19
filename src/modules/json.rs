@@ -99,6 +99,24 @@ fn stringify_value(val: &Value, out: &mut String, seen: &mut HashSet<usize>) -> 
             out.push('}');
             seen.remove(&ptr);
         }
+        Value::StructInstance(inst) => {
+            let ptr = Rc::as_ptr(inst) as usize;
+            if !seen.insert(ptr) {
+                return Err("json.stringify(): circular reference in struct".to_string());
+            }
+            out.push('{');
+            let vals = inst.fields.borrow();
+            for (i, (k, v)) in inst.def.field_names.iter().zip(vals.iter()).enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(k, out);
+                out.push(':');
+                stringify_value(v, out, seen)?;
+            }
+            out.push('}');
+            seen.remove(&ptr);
+        }
         other => {
             return Err(format!(
                 "json.stringify() cannot serialize type '{}'",

@@ -11,12 +11,42 @@ use crate::compiler::Compiler;
 use crate::lexer::Lexer;
 use crate::modules;
 use crate::parser::Parser;
-use crate::value::{Closure, NativeFunction, UpvalueState, Value};
+use crate::value::{
+    AskaneSet, BoundMethod, Closure, NativeFunction, StructDef, StructInstance, UpvalueState, Value,
+};
 
 struct CallFrame {
     closure: Rc<Closure>,
     ip: usize,
     base: usize,
+    arg_bits: [u64; 4],
+    enter_step: u64,
+    enter_time: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProfileEntry {
+    pub calls: u64,
+    pub steps: u64,
+    pub total_ns: u64,
+}
+
+fn make_positional_arg_bits(count: usize) -> [u64; 4] {
+    let mut bits = [0u64; 4];
+    for i in 0..count.min(256) {
+        bits[i >> 6] |= 1u64 << (i & 63);
+    }
+    bits
+}
+
+fn arg_is_present(bits: &[u64; 4], idx: usize) -> bool {
+    idx < 256 && ((bits[idx >> 6] >> (idx & 63)) & 1) != 0
+}
+
+fn set_arg_present(bits: &mut [u64; 4], idx: usize) {
+    if idx < 256 {
+        bits[idx >> 6] |= 1u64 << (idx & 63);
+    }
 }
 
 #[derive(Clone)]
@@ -40,6 +70,15 @@ pub struct Permissions {
     pub allow_exec: Option<Vec<String>>,
     pub max_instructions: Option<u64>,
     pub max_duration_ms: Option<u64>,
+    pub max_memory_bytes: Option<u64>,
+    pub max_io_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResourceBudget {
+    pub bytes_allocated: u64,
+    pub io_bytes_used: u64,
+    pub native_steps: u64,
 }
 
 impl Permissions {
@@ -55,6 +94,8 @@ impl Permissions {
             allow_exec: None,
             max_instructions: Some(10_000_000),
             max_duration_ms: Some(30_000),
+            max_memory_bytes: Some(64 * 1024 * 1024),
+            max_io_bytes: Some(128 * 1024 * 1024),
         }
     }
 
@@ -70,6 +111,8 @@ impl Permissions {
             allow_exec: Some(Vec::new()),
             max_instructions: None,
             max_duration_ms: None,
+            max_memory_bytes: None,
+            max_io_bytes: None,
         }
     }
 }
@@ -77,7 +120,11 @@ impl Permissions {
 pub struct VM {
     stack: Vec<Value>,
     frames: Vec<CallFrame>,
-    globals: HashMap<String, Value>,
+    global_slots: HashMap<String, usize>,
+    global_values: Vec<Value>,
+    global_ic: Vec<(usize, usize, usize, usize)>,
+    attr_ic: Vec<(usize, usize, usize, usize, usize)>,
+    ic_epoch: usize,
     open_upvalues: Vec<Rc<RefCell<UpvalueState>>>,
     start_time: Instant,
     current_dir: PathBuf,
@@ -88,8 +135,12 @@ pub struct VM {
     loading_modules: HashSet<String>,
     instructions_left: u64,
     step_counter: u64,
+    budget: ResourceBudget,
     run_start: Instant,
     try_handlers: Vec<TryHandler>,
+    fmt_depth: usize,
+    profile_enabled: bool,
+    profile_stats: HashMap<String, ProfileEntry>,
 }
 
 impl Drop for VM {
@@ -114,7 +165,11 @@ impl VM {
         let mut vm = Self {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
-            globals: HashMap::new(),
+            global_slots: HashMap::new(),
+            global_values: Vec::with_capacity(64),
+            global_ic: vec![(0, 0, 0, usize::MAX); 1024],
+            attr_ic: vec![(0, 0, 0, 0, 0); 1024],
+            ic_epoch: 1,
             open_upvalues: Vec::new(),
             start_time: Instant::now(),
             current_dir,
@@ -125,8 +180,12 @@ impl VM {
             loading_modules: HashSet::new(),
             instructions_left,
             step_counter: 0,
+            budget: ResourceBudget::default(),
             run_start: Instant::now(),
             try_handlers: Vec::new(),
+            fmt_depth: 0,
+            profile_enabled: false,
+            profile_stats: HashMap::new(),
         };
         vm.register_natives();
         vm
@@ -150,6 +209,38 @@ impl VM {
         self.sandboxed
     }
 
+    pub fn set_profile(&mut self, enabled: bool) {
+        self.profile_enabled = enabled;
+    }
+
+    pub fn profile_report(&self) -> Vec<(String, ProfileEntry)> {
+        let mut out: Vec<(String, ProfileEntry)> = self
+            .profile_stats
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.total_ns
+                .cmp(&a.1.total_ns)
+                .then(b.1.steps.cmp(&a.1.steps))
+        });
+        out
+    }
+
+    fn record_profile(&mut self, name: &str, enter_step: u64, enter_time: Option<Instant>) {
+        if !self.profile_enabled {
+            return;
+        }
+        let elapsed = enter_time
+            .map(|t| t.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        let steps = self.step_counter.saturating_sub(enter_step);
+        let entry = self.profile_stats.entry(name.to_string()).or_default();
+        entry.calls += 1;
+        entry.steps = entry.steps.saturating_add(steps);
+        entry.total_ns = entry.total_ns.saturating_add(elapsed);
+    }
+
     pub fn elapsed_ms(&self) -> i64 {
         self.start_time.elapsed().as_millis() as i64
     }
@@ -163,8 +254,63 @@ impl VM {
         Ok(())
     }
 
+    pub fn charge_alloc(&mut self, bytes: usize) -> Result<(), String> {
+        let next = self.budget.bytes_allocated.saturating_add(bytes as u64);
+        if let Some(limit) = self.permissions.max_memory_bytes {
+            if next > limit {
+                return Err(format!(
+                    "Sandbox memory budget exceeded (limit {} bytes)",
+                    limit
+                ));
+            }
+        }
+        self.budget.bytes_allocated = next;
+        Ok(())
+    }
+
+    pub fn charge_io(&mut self, bytes: usize) -> Result<(), String> {
+        let next = self.budget.io_bytes_used.saturating_add(bytes as u64);
+        if let Some(limit) = self.permissions.max_io_bytes {
+            if next > limit {
+                return Err(format!(
+                    "Sandbox I/O budget exceeded (limit {} bytes)",
+                    limit
+                ));
+            }
+        }
+        self.budget.io_bytes_used = next;
+        Ok(())
+    }
+
+    pub fn charge_work(&mut self, steps: u64) -> Result<(), String> {
+        self.budget.native_steps = self.budget.native_steps.saturating_add(steps);
+        if self.permissions.max_instructions.is_some() {
+            if self.instructions_left < steps {
+                self.instructions_left = 0;
+                return Err("Sandbox instruction limit exceeded".to_string());
+            }
+            self.instructions_left -= steps;
+        }
+        self.check_timeout()
+    }
+
+    pub fn budget_snapshot(&self) -> (u64, Option<u64>, u64, Option<u64>, Option<u64>) {
+        (
+            self.budget.bytes_allocated,
+            self.permissions.max_memory_bytes,
+            self.budget.io_bytes_used,
+            self.permissions.max_io_bytes,
+            self.permissions
+                .max_instructions
+                .map(|_| self.instructions_left),
+        )
+    }
+
     pub fn is_unrecoverable_error(err: &str) -> bool {
-        err.contains("Sandbox instruction limit exceeded") || err.contains("Execution timeout (")
+        err.contains("Sandbox instruction limit exceeded")
+            || err.contains("Sandbox memory budget exceeded")
+            || err.contains("Sandbox I/O budget exceeded")
+            || err.contains("Execution timeout (")
     }
 
     pub fn sleep_bounded(&self, ms: u64) -> Result<(), String> {
@@ -314,15 +460,34 @@ impl VM {
     }
 
     pub fn resolve_read_path(&self, input: &str) -> Result<PathBuf, String> {
-        self.resolve_path_with_roots(input, &self.permissions.allow_read, false)
+        self.resolve_path_with_roots_from(
+            &self.current_dir,
+            input,
+            &self.permissions.allow_read,
+            false,
+        )
+    }
+
+    pub fn resolve_read_path_from(&self, base_dir: &Path, input: &str) -> Result<PathBuf, String> {
+        self.resolve_path_with_roots_from(base_dir, input, &self.permissions.allow_read, false)
     }
 
     pub fn resolve_write_path(&self, input: &str) -> Result<PathBuf, String> {
-        self.resolve_path_with_roots(input, &self.permissions.allow_write, false)
+        self.resolve_path_with_roots_from(
+            &self.current_dir,
+            input,
+            &self.permissions.allow_write,
+            false,
+        )
     }
 
     pub fn resolve_write_link_or_path(&self, input: &str) -> Result<PathBuf, String> {
-        self.resolve_path_with_roots(input, &self.permissions.allow_write, true)
+        self.resolve_path_with_roots_from(
+            &self.current_dir,
+            input,
+            &self.permissions.allow_write,
+            true,
+        )
     }
 
     fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, String> {
@@ -348,8 +513,9 @@ impl VM {
         Ok(existing)
     }
 
-    fn resolve_path_with_roots(
+    fn resolve_path_with_roots_from(
         &self,
+        base_dir: &Path,
         input: &str,
         extra_roots: &Option<Vec<PathBuf>>,
         preserve_leaf_symlink: bool,
@@ -361,7 +527,7 @@ impl VM {
         let candidate = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
-            self.current_dir.join(raw)
+            base_dir.join(raw)
         };
         if self.permissions.allow_all {
             return Ok(candidate);
@@ -455,16 +621,16 @@ impl VM {
             Some(out)
         };
 
-        let Some(lexical) = normalize_lexical(raw, &self.current_dir) else {
+        let Some(lexical) = normalize_lexical(raw, base_dir) else {
             return Err(format!("path '{}' is outside the sandbox", input));
         };
         let mut lexical_roots = Vec::new();
-        if let Some(r) = normalize_lexical(&self.sandbox_root, &self.current_dir) {
+        if let Some(r) = normalize_lexical(&self.sandbox_root, base_dir) {
             lexical_roots.push(r);
         }
         if let Some(dirs) = extra_roots {
             for dir in dirs {
-                if let Some(r) = normalize_lexical(dir, &self.current_dir) {
+                if let Some(r) = normalize_lexical(dir, base_dir) {
                     lexical_roots.push(r);
                 }
             }
@@ -553,6 +719,9 @@ impl VM {
             ("str", native_str),
             ("int", native_int),
             ("float", native_float),
+            ("bytes", native_bytes),
+            ("set", native_set),
+            ("dict", native_dict),
             ("type_of", native_type_of),
             ("keys", native_keys),
             ("values", native_values),
@@ -574,19 +743,33 @@ impl VM {
             ("chunk", native_chunk),
             ("sum", native_sum),
             ("has", native_has),
+            ("is_main", native_is_main),
             ("read_line", native_read_line),
             ("clock", native_clock),
         ];
 
         for &(name, func) in natives {
-            self.globals.insert(
-                name.to_string(),
-                Value::NativeFn(NativeFunction { name, func }),
-            );
+            let val = Value::NativeFn(NativeFunction { name, func });
+            if let Some(&slot) = self.global_slots.get(name) {
+                self.global_values[slot] = val;
+            } else {
+                let slot = self.global_values.len();
+                self.global_values.push(val);
+                self.global_slots.insert(name.to_string(), slot);
+            }
         }
     }
 
     pub fn run(&mut self, proto: Rc<FunctionProto>) -> Result<Value, String> {
+        let base_dir = self.current_dir.clone();
+        self.run_with_base_dir(proto, Some(base_dir))
+    }
+
+    pub fn run_with_base_dir(
+        &mut self,
+        proto: Rc<FunctionProto>,
+        base_dir: Option<PathBuf>,
+    ) -> Result<Value, String> {
         verify_proto(&proto)?;
         if self.frames.len() >= MAX_CALL_DEPTH || self.loading_modules.len() > 32 {
             return Err("Maximum call/import depth exceeded".to_string());
@@ -594,20 +777,36 @@ impl VM {
         if self.frames.is_empty() {
             self.instructions_left = self.permissions.max_instructions.unwrap_or(u64::MAX);
             self.step_counter = 0;
+            self.budget = ResourceBudget::default();
             self.run_start = Instant::now();
             self.try_handlers.clear();
+            self.fmt_depth = 0;
+            self.ic_epoch = self.ic_epoch.wrapping_add(1).max(1);
+            if self.profile_enabled {
+                self.profile_stats.clear();
+            }
         }
         let closure = Rc::new(Closure {
             proto,
             upvalues: Vec::new(),
+            base_dir,
         });
         let base_depth = self.frames.len();
         let stack_base = self.stack.len();
         self.stack.push(Value::Closure(closure.clone()));
+        let enter_time = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let enter_step = self.step_counter;
         self.frames.push(CallFrame {
             closure,
             ip: 0,
             base: stack_base,
+            arg_bits: [0; 4],
+            enter_step,
+            enter_time,
         });
 
         match self.execute(base_depth) {
@@ -656,9 +855,284 @@ impl VM {
         out
     }
 
+    fn build_closure_slots(
+        &mut self,
+        closure: &Closure,
+        pos_args: &[Value],
+        kw: Option<(&[String], &[Value])>,
+    ) -> Result<(Vec<Value>, [u64; 4]), String> {
+        let total_arity = closure.proto.arity as usize;
+        let is_variadic = closure.proto.is_variadic;
+        let fixed = if is_variadic {
+            total_arity.saturating_sub(1)
+        } else {
+            total_arity
+        };
+
+        if !is_variadic && pos_args.len() > fixed {
+            return Err(format!(
+                "Expected at most {} arguments to '{}', got {}",
+                fixed,
+                closure.proto.name,
+                pos_args.len()
+            ));
+        }
+
+        let mut slots = vec![Value::Unit; total_arity];
+        let mut bits = [0u64; 4];
+        for (i, v) in pos_args.iter().take(fixed).enumerate() {
+            slots[i] = v.clone();
+            set_arg_present(&mut bits, i);
+        }
+        if is_variadic {
+            let rest = if pos_args.len() > fixed {
+                let extra = &pos_args[fixed..];
+                self.charge_alloc(extra.len().saturating_mul(std::mem::size_of::<Value>()))?;
+                extra.to_vec()
+            } else {
+                Vec::new()
+            };
+            slots[fixed] = Value::List(Rc::new(RefCell::new(rest)));
+            set_arg_present(&mut bits, fixed);
+        }
+
+        if let Some((kw_names, kw_vals)) = kw {
+            for (kname, kval) in kw_names.iter().zip(kw_vals.iter()) {
+                let Some(idx) = closure.proto.param_names[..fixed]
+                    .iter()
+                    .position(|p| p == kname)
+                else {
+                    return Err(format!(
+                        "Function '{}' got unexpected keyword argument '{}'",
+                        closure.proto.name, kname
+                    ));
+                };
+                if arg_is_present(&bits, idx) {
+                    return Err(format!(
+                        "Function '{}' got multiple values for argument '{}'",
+                        closure.proto.name, kname
+                    ));
+                }
+                slots[idx] = kval.clone();
+                set_arg_present(&mut bits, idx);
+            }
+        }
+
+        for i in 0..closure.proto.min_arity as usize {
+            if !arg_is_present(&bits, i) {
+                let pname = closure
+                    .proto
+                    .param_names
+                    .get(i)
+                    .map(String::as_str)
+                    .unwrap_or("?");
+                return Err(format!(
+                    "Missing required argument '{}' in call to '{}'",
+                    pname, closure.proto.name
+                ));
+            }
+        }
+
+        Ok((slots, bits))
+    }
+
+    fn instantiate_struct(
+        &mut self,
+        def: &Rc<StructDef>,
+        spread: Option<Value>,
+        field_names: &[String],
+        field_vals: &[Value],
+    ) -> Result<Value, String> {
+        let base_vals = match spread {
+            Some(Value::StructInstance(inst)) => {
+                if !Rc::ptr_eq(&inst.def, def) {
+                    return Err(format!(
+                        "Struct spread '..' expects '{}', got '{}'",
+                        def.name, inst.def.name
+                    ));
+                }
+                Some(inst.fields.borrow().clone())
+            }
+            Some(other) => {
+                return Err(format!(
+                    "Struct spread '..' expects '{}', got '{}'",
+                    def.name,
+                    other.type_name()
+                ));
+            }
+            None => None,
+        };
+
+        let mut provided: Vec<Option<Value>> = vec![None; def.field_names.len()];
+        for (fname, fval) in field_names.iter().zip(field_vals.iter()) {
+            let Some(&idx) = def.field_index.get(fname) else {
+                return Err(format!("Struct '{}' has no field '{}'", def.name, fname));
+            };
+            if provided[idx].is_some() {
+                return Err(format!(
+                    "Multiple values provided for field '{}' of struct '{}'",
+                    fname, def.name
+                ));
+            }
+            provided[idx] = Some(fval.clone());
+        }
+
+        let mut out = Vec::with_capacity(def.field_names.len());
+        for i in 0..def.field_names.len() {
+            let v = if let Some(val) = provided[i].take() {
+                val
+            } else if let Some(ref b) = base_vals {
+                b[i].clone()
+            } else if let Some(ref default_fn) = def.field_defaults[i] {
+                self.call_value(default_fn.clone(), &[])?
+            } else {
+                return Err(format!(
+                    "Missing required field '{}' for struct '{}'",
+                    def.field_names[i], def.name
+                ));
+            };
+            out.push(v);
+        }
+        self.charge_alloc(
+            out.len()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .max(16),
+        )?;
+        Ok(Value::StructInstance(Rc::new(StructInstance {
+            def: def.clone(),
+            fields: RefCell::new(out),
+        })))
+    }
+
+    fn format_value_protocol(&mut self, val: &Value) -> Result<String, String> {
+        if self.fmt_depth < 16 {
+            if let Value::StructInstance(inst) = val {
+                if let Some(fmt_fn) = inst.def.methods.get("fmt").cloned() {
+                    self.fmt_depth += 1;
+                    let res = self.call_value(fmt_fn, &[val.clone()]);
+                    self.fmt_depth -= 1;
+                    let out = res?;
+                    return Ok(match out {
+                        Value::Str(s) => s,
+                        other => format!("{}", other),
+                    });
+                }
+            }
+        }
+        Ok(format!("{}", val))
+    }
+
+    fn get_attr_value(
+        &self,
+        obj: Value,
+        attr: &str,
+        line: usize,
+        op_sym: &str,
+    ) -> Result<Value, String> {
+        match &obj {
+            Value::Module { name, exports } => {
+                exports.borrow().get(attr).cloned().ok_or_else(|| {
+                    format!("[line {}] Module '{}' has no export '{}'", line, name, attr)
+                })
+            }
+            Value::StructDef(def) => def.methods.get(attr).cloned().ok_or_else(|| {
+                format!(
+                    "[line {}] Struct '{}' has no static member '{}'",
+                    line, def.name, attr
+                )
+            }),
+            Value::StructInstance(inst) => {
+                if let Some(&field_idx) = inst.def.field_index.get(attr) {
+                    return Ok(inst.fields.borrow()[field_idx].clone());
+                }
+                if let Some(m) = inst.def.methods.get(attr) {
+                    return Ok(Value::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj.clone(),
+                        func: m.clone(),
+                    })));
+                }
+                if attr == "to_dict" {
+                    return Ok(Value::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj.clone(),
+                        func: Value::NativeFn(NativeFunction {
+                            name: "struct.to_dict",
+                            func: method_struct_to_dict,
+                        }),
+                    })));
+                }
+                Err(format!(
+                    "[line {}] Struct '{}' has no field or method '{}'",
+                    line, inst.def.name, attr
+                ))
+            }
+            Value::Dict(dict) => {
+                if let Some(val) = dict.borrow().get(attr).cloned() {
+                    return Ok(val);
+                }
+                if let Some((name, func)) = resolve_builtin_method(&obj, attr) {
+                    return Ok(Value::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj,
+                        func: Value::NativeFn(NativeFunction { name, func }),
+                    })));
+                }
+                Ok(Value::Unit)
+            }
+            Value::Str(_) | Value::List(_) | Value::Set(_) | Value::Bytes(_) => {
+                if let Some((name, func)) = resolve_builtin_method(&obj, attr) {
+                    Ok(Value::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj,
+                        func: Value::NativeFn(NativeFunction { name, func }),
+                    })))
+                } else {
+                    Err(format!(
+                        "[line {}] Type '{}' has no method '{}'",
+                        line,
+                        obj.type_name(),
+                        attr
+                    ))
+                }
+            }
+            other => Err(format!(
+                "[line {}] Cannot access '{}{}' on '{}'",
+                line,
+                op_sym,
+                attr,
+                other.type_name()
+            )),
+        }
+    }
+
     pub fn call_value(&mut self, callee: Value, args: &[Value]) -> Result<Value, String> {
         match callee {
-            Value::NativeFn(native) => (native.func)(self, args),
+            Value::NativeFn(native) => {
+                let enter_step = self.step_counter;
+                let enter_time = if self.profile_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let res = (native.func)(self, args);
+                self.record_profile(native.name, enter_step, enter_time);
+                res
+            }
+            Value::BoundMethod(m) => {
+                let mut combined = Vec::with_capacity(1 + args.len());
+                combined.push(m.receiver.clone());
+                combined.extend_from_slice(args);
+                self.call_value(m.func.clone(), &combined)
+            }
+            Value::StructDef(def) => {
+                if args.len() > def.field_names.len() {
+                    return Err(format!(
+                        "Struct '{}' takes at most {} positional arguments, got {}",
+                        def.name,
+                        def.field_names.len(),
+                        args.len()
+                    ));
+                }
+                let names = &def.field_names[..args.len()];
+                self.instantiate_struct(&def, None, names, args)
+            }
             Value::Closure(closure) => {
                 if self.frames.len() >= MAX_CALL_DEPTH {
                     return Err(format!(
@@ -666,22 +1140,29 @@ impl VM {
                         MAX_CALL_DEPTH
                     ));
                 }
-                if closure.proto.arity as usize != args.len() {
-                    return Err(format!(
-                        "Expected {} arguments to '{}', got {}",
-                        closure.proto.arity,
-                        closure.proto.name,
-                        args.len()
-                    ));
-                }
                 let base_depth = self.frames.len();
                 let base = self.stack.len();
+                let (slots, bits) =
+                    if args.len() == closure.proto.arity as usize && !closure.proto.is_variadic {
+                        (args.to_vec(), make_positional_arg_bits(args.len()))
+                    } else {
+                        self.build_closure_slots(&closure, args, None)?
+                    };
                 self.stack.push(Value::Closure(closure.clone()));
-                self.stack.extend_from_slice(args);
+                self.stack.extend(slots);
+                let enter_step = self.step_counter;
+                let enter_time = if self.profile_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 self.frames.push(CallFrame {
                     closure,
                     ip: 0,
                     base,
+                    arg_bits: bits,
+                    enter_step,
+                    enter_time,
                 });
                 match self.execute(base_depth) {
                     Ok(v) => Ok(v),
@@ -745,12 +1226,14 @@ impl VM {
     }
 
     fn step(&mut self, target_depth: usize) -> Result<Option<Value>, String> {
-        let (op, line) = {
+        let (op, line, proto_ptr, op_ip) = {
             let frame = self.frames.last_mut().unwrap();
-            let op = frame.closure.proto.chunk.code[frame.ip];
-            let line = frame.closure.proto.chunk.lines[frame.ip];
+            let op_ip = frame.ip;
+            let op = frame.closure.proto.chunk.code[op_ip];
+            let line = frame.closure.proto.chunk.lines[op_ip];
+            let proto_ptr = Rc::as_ptr(&frame.closure.proto) as usize;
             frame.ip += 1;
-            (op, line)
+            (op, line, proto_ptr, op_ip)
         };
 
         match op {
@@ -808,22 +1291,43 @@ impl VM {
                 self.stack.pop();
             }
             Op::GetGlobal(idx) => {
+                let ic_idx = (proto_ptr.wrapping_mul(31) ^ op_ip) & 1023;
+                let cached = self.global_ic[ic_idx];
+                if cached.0 == self.ic_epoch
+                    && cached.1 == proto_ptr
+                    && cached.2 == op_ip
+                    && cached.3 < self.global_values.len()
+                {
+                    self.stack.push(self.global_values[cached.3].clone());
+                } else {
+                    let frame = self.frames.last().unwrap();
+                    let name = match &frame.closure.proto.chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.as_str(),
+                        _ => unreachable!(),
+                    };
+                    let slot = *self
+                        .global_slots
+                        .get(name)
+                        .ok_or_else(|| format!("[line {}] Undefined variable '{}'", line, name))?;
+                    self.global_ic[ic_idx] = (self.ic_epoch, proto_ptr, op_ip, slot);
+                    self.stack.push(self.global_values[slot].clone());
+                }
+            }
+            Op::DefineGlobal(idx) => {
+                let val = self.stack.pop().unwrap();
                 let frame = self.frames.last().unwrap();
                 let name = match &frame.closure.proto.chunk.constants[idx as usize] {
                     Constant::Str(s) => s.as_str(),
                     _ => unreachable!(),
                 };
-                let val = self
-                    .globals
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| format!("[line {}] Undefined variable '{}'", line, name))?;
-                self.stack.push(val);
-            }
-            Op::DefineGlobal(idx) => {
-                let name = self.read_string(idx);
-                let val = self.stack.pop().unwrap();
-                self.globals.insert(name, val);
+                if let Some(&slot) = self.global_slots.get(name) {
+                    self.global_values[slot] = val;
+                } else {
+                    let slot = self.global_values.len();
+                    let name_owned = name.to_string();
+                    self.global_values.push(val);
+                    self.global_slots.insert(name_owned, slot);
+                }
             }
             Op::SetGlobal(idx) => {
                 let frame = self.frames.last().unwrap();
@@ -832,55 +1336,92 @@ impl VM {
                     _ => unreachable!(),
                 };
                 let val = self.stack.last().unwrap().clone();
-                match self.globals.get_mut(name) {
-                    Some(slot) => *slot = val,
-                    None => {
-                        return Err(format!("[line {}] Undefined variable '{}'", line, name));
-                    }
-                }
+                let Some(&slot) = self.global_slots.get(name) else {
+                    return Err(format!("[line {}] Undefined variable '{}'", line, name));
+                };
+                self.global_values[slot] = val;
             }
             Op::Add => {
-                let b = self.stack.pop().unwrap();
-                let a = self.stack.pop().unwrap();
-                let res = match (a, b) {
-                    (Value::Int(x), Value::Int(y)) => Value::Int(x.wrapping_add(y)),
-                    (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
-                    (Value::Int(x), Value::Float(y)) => Value::Float((x as f64) + y),
-                    (Value::Float(x), Value::Int(y)) => Value::Float(x + (y as f64)),
-                    (Value::Str(x), Value::Str(y)) => {
-                        if x.len().saturating_add(y.len()) > 64 * 1024 * 1024 {
+                let len = self.stack.len();
+                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
+                {
+                    let res = x.wrapping_add(*y);
+                    self.stack[len - 2] = Value::Int(res);
+                    self.stack.pop();
+                } else {
+                    let b = self.stack.pop().unwrap();
+                    let a = self.stack.pop().unwrap();
+                    let res = match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => Value::Int(x.wrapping_add(y)),
+                        (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
+                        (Value::Int(x), Value::Float(y)) => Value::Float((x as f64) + y),
+                        (Value::Float(x), Value::Int(y)) => Value::Float(x + (y as f64)),
+                        (Value::Str(x), Value::Str(y)) => {
+                            let new_len = x.len().saturating_add(y.len());
+                            if new_len > 64 * 1024 * 1024 {
+                                return Err(format!(
+                                    "[line {}] String size limit (64 MiB) exceeded",
+                                    line
+                                ));
+                            }
+                            self.charge_alloc(new_len)?;
+                            Value::Str(format!("{}{}", x, y))
+                        }
+                        (Value::Bytes(x), Value::Bytes(y)) => {
+                            let new_len = x.len().saturating_add(y.len());
+                            if new_len > 64 * 1024 * 1024 {
+                                return Err(format!(
+                                    "[line {}] Bytes size limit (64 MiB) exceeded",
+                                    line
+                                ));
+                            }
+                            self.charge_alloc(new_len)?;
+                            let mut out = Vec::with_capacity(new_len);
+                            out.extend_from_slice(x.as_slice());
+                            out.extend_from_slice(y.as_slice());
+                            Value::Bytes(Rc::new(out))
+                        }
+                        (Value::List(x), Value::List(y)) => {
+                            let (x_ref, y_ref) = (x.borrow(), y.borrow());
+                            let new_len = x_ref.len().saturating_add(y_ref.len());
+                            if new_len > 10_000_000 {
+                                return Err(format!(
+                                    "[line {}] List size limit (10,000,000) exceeded",
+                                    line
+                                ));
+                            }
+                            let mut combined = Vec::new();
+                            combined.extend(x_ref.iter().cloned());
+                            combined.extend(y_ref.iter().cloned());
+                            drop((x_ref, y_ref));
+                            self.charge_alloc(
+                                new_len.saturating_mul(std::mem::size_of::<Value>()),
+                            )?;
+                            Value::List(Rc::new(RefCell::new(combined)))
+                        }
+                        (l, r) => {
                             return Err(format!(
-                                "[line {}] String size limit (64 MiB) exceeded",
-                                line
+                                "[line {}] Cannot add '{}' and '{}'",
+                                line,
+                                l.type_name(),
+                                r.type_name()
                             ));
                         }
-                        Value::Str(format!("{}{}", x, y))
-                    }
-                    (Value::List(x), Value::List(y)) => {
-                        let x_ref = x.borrow();
-                        let y_ref = y.borrow();
-                        if x_ref.len().saturating_add(y_ref.len()) > 10_000_000 {
-                            return Err(format!(
-                                "[line {}] List size limit (10,000,000) exceeded",
-                                line
-                            ));
-                        }
-                        let mut combined = x_ref.clone();
-                        combined.extend(y_ref.iter().cloned());
-                        Value::List(Rc::new(RefCell::new(combined)))
-                    }
-                    (l, r) => {
-                        return Err(format!(
-                            "[line {}] Cannot add '{}' and '{}'",
-                            line,
-                            l.type_name(),
-                            r.type_name()
-                        ));
-                    }
-                };
-                self.stack.push(res);
+                    };
+                    self.stack.push(res);
+                }
             }
-            Op::Sub => self.numeric_op(line, i64::wrapping_sub, |a, b| a - b, "subtract")?,
+            Op::Sub => {
+                let len = self.stack.len();
+                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
+                {
+                    let res = x.wrapping_sub(*y);
+                    self.stack[len - 2] = Value::Int(res);
+                    self.stack.pop();
+                } else {
+                    self.numeric_op(line, i64::wrapping_sub, |a, b| a - b, "subtract")?;
+                }
+            }
             Op::Mul => self.numeric_op(line, i64::wrapping_mul, |a, b| a * b, "multiply")?,
             Op::Div => {
                 let b = self.stack.pop().unwrap();
@@ -970,18 +1511,79 @@ impl VM {
                 let a = self.stack.pop().unwrap();
                 self.stack.push(Value::Bool(!a.equals(&b)));
             }
-            Op::Lt => self.cmp_op(line, |a, b| a < b, |a, b| a < b, |a, b| a < b)?,
-            Op::Le => self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?,
-            Op::Gt => self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?,
-            Op::Ge => self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?,
+            Op::Lt => {
+                let len = self.stack.len();
+                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
+                {
+                    let res = *x < *y;
+                    self.stack[len - 2] = Value::Bool(res);
+                    self.stack.pop();
+                } else {
+                    self.cmp_op(line, |a, b| a < b, |a, b| a < b, |a, b| a < b)?;
+                }
+            }
+            Op::Le => {
+                let len = self.stack.len();
+                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
+                {
+                    let res = *x <= *y;
+                    self.stack[len - 2] = Value::Bool(res);
+                    self.stack.pop();
+                } else {
+                    self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?;
+                }
+            }
+            Op::Gt => {
+                let len = self.stack.len();
+                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
+                {
+                    let res = *x > *y;
+                    self.stack[len - 2] = Value::Bool(res);
+                    self.stack.pop();
+                } else {
+                    self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?;
+                }
+            }
+            Op::Ge => {
+                let len = self.stack.len();
+                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
+                {
+                    let res = *x >= *y;
+                    self.stack[len - 2] = Value::Bool(res);
+                    self.stack.pop();
+                } else {
+                    self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?;
+                }
+            }
             Op::In => {
                 let container = self.stack.pop().unwrap();
                 let needle = self.stack.pop().unwrap();
                 let found = match (needle, container) {
                     (Value::Str(sub), Value::Str(s)) => s.contains(&sub),
+                    (Value::Int(byte), Value::Bytes(b)) => {
+                        (0..=255).contains(&byte) && b.contains(&(byte as u8))
+                    }
+                    (Value::Bytes(sub), Value::Bytes(b)) => {
+                        sub.is_empty() || b.windows(sub.len()).any(|w| w == sub.as_slice())
+                    }
                     (val, Value::List(l)) => l.borrow().iter().any(|item| item.equals(&val)),
+                    (val, Value::Set(s)) => s.borrow().contains(&val),
                     (Value::Str(k), Value::Dict(d)) => d.borrow().contains_key(&k),
                     (Value::Int(n), Value::Range { start, end }) => n >= start && n < end,
+                    (val, Value::StructInstance(inst)) => {
+                        let Some(method) = inst.def.methods.get("contains").cloned() else {
+                            return Err(format!(
+                                "[line {}] Cannot check '{}' in '{}'",
+                                line,
+                                val.type_name(),
+                                inst.def.name
+                            ));
+                        };
+                        let res = self
+                            .call_value(method, &[Value::StructInstance(inst), val])
+                            .map_err(|e| format!("[line {}] {}", line, e))?;
+                        res.is_truthy()
+                    }
                     (n, c) => {
                         return Err(format!(
                             "[line {}] Cannot check '{}' in '{}'",
@@ -1022,6 +1624,12 @@ impl VM {
                     self.frames.last_mut().unwrap().ip = target;
                 }
             }
+            Op::JumpIfArgPresent(arg_idx, target) => {
+                let frame = self.frames.last_mut().unwrap();
+                if arg_is_present(&frame.arg_bits, arg_idx as usize) {
+                    frame.ip = target;
+                }
+            }
             Op::Call(argc) => {
                 let argc = argc as usize;
                 let callee_idx = self.stack.len() - 1 - argc;
@@ -1034,28 +1642,342 @@ impl VM {
                                 line, MAX_CALL_DEPTH
                             ));
                         }
-                        if closure.proto.arity as usize != argc {
-                            return Err(format!(
-                                "[line {}] Expected {} arguments to '{}', got {}",
-                                line, closure.proto.arity, closure.proto.name, argc
-                            ));
+                        if closure.proto.arity as usize == argc && !closure.proto.is_variadic {
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            self.frames.push(CallFrame {
+                                closure,
+                                ip: 0,
+                                base: callee_idx,
+                                arg_bits: make_positional_arg_bits(argc),
+                                enter_step,
+                                enter_time,
+                            });
+                        } else {
+                            let pos_args = self.stack[callee_idx + 1..].to_vec();
+                            let (slots, bits) = self
+                                .build_closure_slots(&closure, &pos_args, None)
+                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                            self.stack.truncate(callee_idx + 1);
+                            self.stack.extend(slots);
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            self.frames.push(CallFrame {
+                                closure,
+                                ip: 0,
+                                base: callee_idx,
+                                arg_bits: bits,
+                                enter_step,
+                                enter_time,
+                            });
                         }
-                        self.frames.push(CallFrame {
-                            closure,
-                            ip: 0,
-                            base: callee_idx,
-                        });
                     }
                     Value::NativeFn(native) => {
                         let args = self.stack[callee_idx + 1..].to_vec();
                         self.stack.truncate(callee_idx);
+                        let enter_step = self.step_counter;
+                        let enter_time = if self.profile_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
                         let res = (native.func)(self, &args)
+                            .map_err(|e| format!("[line {}] {}", line, e));
+                        self.record_profile(native.name, enter_step, enter_time);
+                        self.stack.push(res?);
+                    }
+                    Value::BoundMethod(m) => {
+                        let mut combined = Vec::with_capacity(1 + argc);
+                        combined.push(m.receiver.clone());
+                        combined.extend_from_slice(&self.stack[callee_idx + 1..]);
+                        self.stack.truncate(callee_idx);
+                        let func = m.func.clone();
+                        match func {
+                            Value::Closure(closure) => {
+                                if self.frames.len() >= MAX_CALL_DEPTH {
+                                    return Err(format!(
+                                        "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                        line, MAX_CALL_DEPTH
+                                    ));
+                                }
+                                let (slots, bits) = self
+                                    .build_closure_slots(&closure, &combined, None)
+                                    .map_err(|e| format!("[line {}] {}", line, e))?;
+                                self.stack.push(Value::Closure(closure.clone()));
+                                self.stack.extend(slots);
+                                let enter_step = self.step_counter;
+                                let enter_time = if self.profile_enabled {
+                                    Some(Instant::now())
+                                } else {
+                                    None
+                                };
+                                self.frames.push(CallFrame {
+                                    closure,
+                                    ip: 0,
+                                    base: callee_idx,
+                                    arg_bits: bits,
+                                    enter_step,
+                                    enter_time,
+                                });
+                            }
+                            other => {
+                                let res = self
+                                    .call_value(other, &combined)
+                                    .map_err(|e| format!("[line {}] {}", line, e))?;
+                                self.stack.push(res);
+                            }
+                        }
+                    }
+                    Value::StructDef(def) => {
+                        let args = self.stack[callee_idx + 1..].to_vec();
+                        self.stack.truncate(callee_idx);
+                        if args.len() > def.field_names.len() {
+                            return Err(format!(
+                                "[line {}] Struct '{}' takes at most {} positional arguments, got {}",
+                                line,
+                                def.name,
+                                def.field_names.len(),
+                                args.len()
+                            ));
+                        }
+                        let names = def.field_names[..args.len()].to_vec();
+                        let res = self
+                            .instantiate_struct(&def, None, &names, &args)
                             .map_err(|e| format!("[line {}] {}", line, e))?;
                         self.stack.push(res);
                     }
                     other => {
                         return Err(format!(
                             "[line {}] Cannot call value of type '{}'",
+                            line,
+                            other.type_name()
+                        ));
+                    }
+                }
+            }
+            Op::TailCall(argc) => {
+                let argc = argc as usize;
+                let callee_idx = self.stack.len() - 1 - argc;
+                let callee = self.stack[callee_idx].clone();
+                if let Value::Closure(closure) = callee {
+                    if self.frames.len() < 16 {
+                        if closure.proto.arity as usize == argc && !closure.proto.is_variadic {
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            self.frames.push(CallFrame {
+                                closure,
+                                ip: 0,
+                                base: callee_idx,
+                                arg_bits: make_positional_arg_bits(argc),
+                                enter_step,
+                                enter_time,
+                            });
+                        } else {
+                            let pos_args = self.stack[callee_idx + 1..].to_vec();
+                            let (slots, bits) = self
+                                .build_closure_slots(&closure, &pos_args, None)
+                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                            self.stack.truncate(callee_idx + 1);
+                            self.stack.extend(slots);
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            self.frames.push(CallFrame {
+                                closure,
+                                ip: 0,
+                                base: callee_idx,
+                                arg_bits: bits,
+                                enter_step,
+                                enter_time,
+                            });
+                        }
+                        return Ok(None);
+                    }
+                    let cur_frame = self.frames.last().unwrap();
+                    let cur_base = cur_frame.base;
+                    if self.profile_enabled {
+                        let prev_name = cur_frame.closure.proto.name.clone();
+                        let prev_step = cur_frame.enter_step;
+                        let prev_time = cur_frame.enter_time;
+                        self.record_profile(&prev_name, prev_step, prev_time);
+                    }
+                    let (slots, bits) =
+                        if closure.proto.arity as usize == argc && !closure.proto.is_variadic {
+                            (
+                                self.stack[callee_idx + 1..].to_vec(),
+                                make_positional_arg_bits(argc),
+                            )
+                        } else {
+                            let pos_args = self.stack[callee_idx + 1..].to_vec();
+                            self.build_closure_slots(&closure, &pos_args, None)
+                                .map_err(|e| format!("[line {}] {}", line, e))?
+                        };
+                    self.close_upvalues_from(cur_base);
+                    self.stack.truncate(cur_base);
+                    self.stack.push(Value::Closure(closure.clone()));
+                    self.stack.extend(slots);
+                    let enter_step = self.step_counter;
+                    let enter_time = if self.profile_enabled {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let frame = self.frames.last_mut().unwrap();
+                    frame.closure = closure;
+                    frame.ip = 0;
+                    frame.arg_bits = bits;
+                    frame.enter_step = enter_step;
+                    frame.enter_time = enter_time;
+                } else {
+                    let args = self.stack[callee_idx + 1..].to_vec();
+                    self.stack.truncate(callee_idx);
+                    let res = self
+                        .call_value(callee, &args)
+                        .map_err(|e| format!("[line {}] {}", line, e))?;
+                    let frame = self.frames.pop().unwrap();
+                    if self.profile_enabled {
+                        self.record_profile(
+                            &frame.closure.proto.name,
+                            frame.enter_step,
+                            frame.enter_time,
+                        );
+                    }
+                    while self
+                        .try_handlers
+                        .last()
+                        .is_some_and(|h| h.frame_depth > self.frames.len())
+                    {
+                        self.try_handlers.pop();
+                    }
+                    self.close_upvalues_from(frame.base);
+                    self.stack.truncate(frame.base);
+                    if self.frames.len() == target_depth {
+                        return Ok(Some(res));
+                    }
+                    self.stack.push(res);
+                }
+            }
+            Op::CallNamed(pos_argc, kw_idx) => {
+                let pos_argc = pos_argc as usize;
+                let kw_names = self.frames.last().unwrap().closure.proto.chunk.kw_lists
+                    [kw_idx as usize]
+                    .clone();
+                let kw_len = kw_names.len();
+                let total_argc = pos_argc + kw_len;
+                let callee_idx = self.stack.len() - 1 - total_argc;
+                let callee = self.stack[callee_idx].clone();
+                let pos_args = self.stack[callee_idx + 1..callee_idx + 1 + pos_argc].to_vec();
+                let kw_vals = self.stack[callee_idx + 1 + pos_argc..].to_vec();
+                self.stack.truncate(callee_idx);
+                match callee {
+                    Value::Closure(closure) => {
+                        if self.frames.len() >= MAX_CALL_DEPTH {
+                            return Err(format!(
+                                "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                line, MAX_CALL_DEPTH
+                            ));
+                        }
+                        let (slots, bits) = self
+                            .build_closure_slots(&closure, &pos_args, Some((&kw_names, &kw_vals)))
+                            .map_err(|e| format!("[line {}] {}", line, e))?;
+                        self.stack.push(Value::Closure(closure.clone()));
+                        self.stack.extend(slots);
+                        let enter_step = self.step_counter;
+                        let enter_time = if self.profile_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        self.frames.push(CallFrame {
+                            closure,
+                            ip: 0,
+                            base: callee_idx,
+                            arg_bits: bits,
+                            enter_step,
+                            enter_time,
+                        });
+                    }
+                    Value::BoundMethod(m) => {
+                        let mut combined = Vec::with_capacity(1 + pos_args.len());
+                        combined.push(m.receiver.clone());
+                        combined.extend(pos_args);
+                        match m.func.clone() {
+                            Value::Closure(closure) => {
+                                if self.frames.len() >= MAX_CALL_DEPTH {
+                                    return Err(format!(
+                                        "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                        line, MAX_CALL_DEPTH
+                                    ));
+                                }
+                                let (slots, bits) = self
+                                    .build_closure_slots(
+                                        &closure,
+                                        &combined,
+                                        Some((&kw_names, &kw_vals)),
+                                    )
+                                    .map_err(|e| format!("[line {}] {}", line, e))?;
+                                self.stack.push(Value::Closure(closure.clone()));
+                                self.stack.extend(slots);
+                                let enter_step = self.step_counter;
+                                let enter_time = if self.profile_enabled {
+                                    Some(Instant::now())
+                                } else {
+                                    None
+                                };
+                                self.frames.push(CallFrame {
+                                    closure,
+                                    ip: 0,
+                                    base: callee_idx,
+                                    arg_bits: bits,
+                                    enter_step,
+                                    enter_time,
+                                });
+                            }
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Named arguments are not supported for '{}'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        }
+                    }
+                    Value::StructDef(def) => {
+                        if pos_args.len() > def.field_names.len() {
+                            return Err(format!(
+                                "[line {}] Struct '{}' takes at most {} positional arguments",
+                                line,
+                                def.name,
+                                def.field_names.len()
+                            ));
+                        }
+                        let mut names = def.field_names[..pos_args.len()].to_vec();
+                        let mut vals = pos_args;
+                        names.extend(kw_names);
+                        vals.extend(kw_vals);
+                        let res = self
+                            .instantiate_struct(&def, None, &names, &vals)
+                            .map_err(|e| format!("[line {}] {}", line, e))?;
+                        self.stack.push(res);
+                    }
+                    other => {
+                        return Err(format!(
+                            "[line {}] Named arguments are not supported for '{}'",
                             line,
                             other.type_name()
                         ));
@@ -1084,17 +2006,23 @@ impl VM {
                         upvalues.push(uv);
                     }
                 }
-                self.stack
-                    .push(Value::Closure(Rc::new(Closure { proto, upvalues })));
+                let base_dir = self.frames.last().unwrap().closure.base_dir.clone();
+                self.stack.push(Value::Closure(Rc::new(Closure {
+                    proto,
+                    upvalues,
+                    base_dir,
+                })));
             }
             Op::MakeList(count) => {
                 let count = count as usize;
+                self.charge_alloc(count.saturating_mul(std::mem::size_of::<Value>()))?;
                 let start = self.stack.len() - count;
                 let items = self.stack.drain(start..).collect::<Vec<_>>();
                 self.stack.push(Value::List(Rc::new(RefCell::new(items))));
             }
             Op::MakeDict(count) => {
                 let count = count as usize;
+                self.charge_alloc(count.saturating_mul(64))?;
                 let start = self.stack.len() - count * 2;
                 let drained: Vec<Value> = self.stack.drain(start..).collect();
                 let mut map = HashMap::with_capacity(count);
@@ -1112,6 +2040,74 @@ impl VM {
                     map.insert(key, pair[1].clone());
                 }
                 self.stack.push(Value::Dict(Rc::new(RefCell::new(map))));
+            }
+            Op::MakeStructDef(idx) => {
+                let st_proto = match &self.frames.last().unwrap().closure.proto.chunk.constants
+                    [idx as usize]
+                {
+                    Constant::Struct(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                let default_count = st_proto
+                    .fields
+                    .iter()
+                    .filter(|(_, has_def)| *has_def)
+                    .count();
+                let method_count = st_proto.methods.len();
+                let total = default_count + method_count;
+                let start = self.stack.len() - total;
+                let popped: Vec<Value> = self.stack.drain(start..).collect();
+                let mut field_names = Vec::with_capacity(st_proto.fields.len());
+                let mut field_index = HashMap::with_capacity(st_proto.fields.len());
+                let mut field_defaults = Vec::with_capacity(st_proto.fields.len());
+                let mut p_idx = 0usize;
+                for (i, (fname, has_def)) in st_proto.fields.iter().enumerate() {
+                    field_names.push(fname.clone());
+                    field_index.insert(fname.clone(), i);
+                    if *has_def {
+                        field_defaults.push(Some(popped[p_idx].clone()));
+                        p_idx += 1;
+                    } else {
+                        field_defaults.push(None);
+                    }
+                }
+                let mut methods = HashMap::with_capacity(method_count);
+                for mname in &st_proto.methods {
+                    methods.insert(mname.clone(), popped[p_idx].clone());
+                    p_idx += 1;
+                }
+                self.stack.push(Value::StructDef(Rc::new(StructDef {
+                    name: st_proto.name.clone(),
+                    field_names,
+                    field_index,
+                    field_defaults,
+                    methods,
+                })));
+            }
+            Op::InitStruct(has_spread, kw_idx) => {
+                let field_names = self.frames.last().unwrap().closure.proto.chunk.kw_lists
+                    [kw_idx as usize]
+                    .clone();
+                let field_count = field_names.len();
+                let fstart = self.stack.len() - field_count;
+                let field_vals: Vec<Value> = self.stack.drain(fstart..).collect();
+                let spread = if has_spread != 0 {
+                    Some(self.stack.pop().unwrap())
+                } else {
+                    None
+                };
+                let target = self.stack.pop().unwrap();
+                let Value::StructDef(def) = target else {
+                    return Err(format!(
+                        "[line {}] Expected struct type before '{{ ... }}', got '{}'",
+                        line,
+                        target.type_name()
+                    ));
+                };
+                let inst = self
+                    .instantiate_struct(&def, spread, &field_names, &field_vals)
+                    .map_err(|e| format!("[line {}] {}", line, e))?;
+                self.stack.push(inst);
             }
             Op::GetIndex => {
                 let idx_val = self.stack.pop().unwrap();
@@ -1140,6 +2136,17 @@ impl VM {
                             ));
                         }
                         Value::Str(chars[actual as usize].to_string())
+                    }
+                    (Value::Bytes(b), Value::Int(i)) => {
+                        let len = b.len() as i64;
+                        let actual = if i < 0 { len + i } else { i };
+                        if actual < 0 || actual >= len {
+                            return Err(format!(
+                                "[line {}] Index {} out of bounds for bytes of length {}",
+                                line, i, len
+                            ));
+                        }
+                        Value::Int(b[actual as usize] as i64)
                     }
                     (Value::Dict(dict), Value::Str(key)) => {
                         dict.borrow().get(&key).cloned().unwrap_or(Value::Unit)
@@ -1208,10 +2215,14 @@ impl VM {
                 };
                 let res = match obj_val {
                     Value::List(list) => {
-                        let borrowed = list.borrow();
-                        let (s, e) = resolve_bounds(borrowed.len() as i64)?;
-                        let sliced = if s < e {
-                            borrowed[s..e].to_vec()
+                        let (s, e) = {
+                            let borrowed = list.borrow();
+                            resolve_bounds(borrowed.len() as i64)?
+                        };
+                        let slice_len = e.saturating_sub(s);
+                        self.charge_alloc(slice_len.saturating_mul(std::mem::size_of::<Value>()))?;
+                        let sliced = if slice_len > 0 {
+                            list.borrow()[s..e].to_vec()
                         } else {
                             Vec::new()
                         };
@@ -1225,7 +2236,19 @@ impl VM {
                         } else {
                             String::new()
                         };
+                        self.charge_alloc(sliced.len())?;
                         Value::Str(sliced)
+                    }
+                    Value::Bytes(bytes) => {
+                        let (s, e) = resolve_bounds(bytes.len() as i64)?;
+                        let slice_len = e.saturating_sub(s);
+                        self.charge_alloc(slice_len)?;
+                        let sliced = if slice_len > 0 {
+                            bytes[s..e].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        Value::Bytes(Rc::new(sliced))
                     }
                     Value::Range { start, end } => {
                         let len = if end > start {
@@ -1283,28 +2306,37 @@ impl VM {
                 self.stack.push(val);
             }
             Op::GetAttr(idx) => {
-                let attr = self.read_string(idx);
-                let obj = self.stack.pop().unwrap();
-                match obj {
-                    Value::Module { name, exports } => {
-                        let val = exports.borrow().get(&attr).cloned().ok_or_else(|| {
-                            format!("[line {}] Module '{}' has no export '{}'", line, name, attr)
-                        })?;
-                        self.stack.push(val);
+                let len = self.stack.len();
+                let ic_idx = (proto_ptr.wrapping_mul(31) ^ op_ip) & 1023;
+                if let Value::StructInstance(inst) = &self.stack[len - 1] {
+                    let cached = self.attr_ic[ic_idx];
+                    let def_ptr = Rc::as_ptr(&inst.def) as usize;
+                    if cached.0 == self.ic_epoch
+                        && cached.1 == proto_ptr
+                        && cached.2 == op_ip
+                        && cached.3 == def_ptr
+                    {
+                        let val = inst.fields.borrow()[cached.4].clone();
+                        self.stack[len - 1] = val;
+                        return Ok(None);
                     }
-                    Value::Dict(dict) => {
-                        let val = dict.borrow().get(&attr).cloned().unwrap_or(Value::Unit);
-                        self.stack.push(val);
-                    }
-                    other => {
-                        return Err(format!(
-                            "[line {}] Cannot access '.{}' on '{}'",
-                            line,
-                            attr,
-                            other.type_name()
-                        ));
+                    let frame = self.frames.last().unwrap();
+                    let attr_name = match &frame.closure.proto.chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.as_str(),
+                        _ => unreachable!(),
+                    };
+                    if let Some(&field_idx) = inst.def.field_index.get(attr_name) {
+                        self.attr_ic[ic_idx] =
+                            (self.ic_epoch, proto_ptr, op_ip, def_ptr, field_idx);
+                        let val = inst.fields.borrow()[field_idx].clone();
+                        self.stack[len - 1] = val;
+                        return Ok(None);
                     }
                 }
+                let attr = self.read_string(idx);
+                let obj = self.stack.pop().unwrap();
+                let val = self.get_attr_value(obj, &attr, line, ".")?;
+                self.stack.push(val);
             }
             Op::OptGetAttr(idx) => {
                 let obj = self.stack.pop().unwrap();
@@ -1312,29 +2344,123 @@ impl VM {
                     self.stack.push(Value::Unit);
                 } else {
                     let attr = self.read_string(idx);
-                    match obj {
-                        Value::Module { name, exports } => {
-                            let val = exports.borrow().get(&attr).cloned().ok_or_else(|| {
-                                format!(
-                                    "[line {}] Module '{}' has no export '{}'",
-                                    line, name, attr
-                                )
-                            })?;
-                            self.stack.push(val);
-                        }
-                        Value::Dict(dict) => {
-                            let val = dict.borrow().get(&attr).cloned().unwrap_or(Value::Unit);
-                            self.stack.push(val);
-                        }
-                        other => {
-                            return Err(format!(
-                                "[line {}] Cannot access '?.{}' on '{}'",
-                                line,
-                                attr,
-                                other.type_name()
-                            ));
-                        }
+                    let val = self.get_attr_value(obj, &attr, line, "?.")?;
+                    self.stack.push(val);
+                }
+            }
+            Op::ForPrep(slot, exit_ip) => {
+                let base = self.frames.last().unwrap().base;
+                let iter_pos = base + slot as usize;
+                let iter_val = self.stack[iter_pos].clone();
+                let (normalized, start_i, end_i) = match iter_val {
+                    Value::Range { start, end } => (None, start, end),
+                    Value::List(ref l) => (None, 0, l.borrow().len() as i64),
+                    Value::Bytes(ref b) => (None, 0, b.len() as i64),
+                    Value::Str(ref s) => {
+                        let chars: Vec<Value> =
+                            s.chars().map(|c| Value::Str(c.to_string())).collect();
+                        let len = chars.len() as i64;
+                        self.charge_alloc(
+                            chars.len().saturating_mul(std::mem::size_of::<Value>()),
+                        )?;
+                        (Some(Value::List(Rc::new(RefCell::new(chars)))), 0, len)
                     }
+                    Value::Set(ref s) => {
+                        let items = s.borrow().items.clone();
+                        let len = items.len() as i64;
+                        self.charge_alloc(
+                            items.len().saturating_mul(std::mem::size_of::<Value>()),
+                        )?;
+                        (Some(Value::List(Rc::new(RefCell::new(items)))), 0, len)
+                    }
+                    Value::StructInstance(inst) => {
+                        let Some(iter_fn) = inst.def.methods.get("iter").cloned() else {
+                            return Err(format!(
+                                "[line {}] Struct '{}' does not implement iter()",
+                                line, inst.def.name
+                            ));
+                        };
+                        let ret = self
+                            .call_value(iter_fn, &[Value::StructInstance(inst)])
+                            .map_err(|e| format!("[line {}] {}", line, e))?;
+                        let (norm_val, s, e) = match &ret {
+                            Value::Range { start, end } => (ret.clone(), *start, *end),
+                            Value::List(l) => (ret.clone(), 0, l.borrow().len() as i64),
+                            Value::Bytes(b) => (ret.clone(), 0, b.len() as i64),
+                            Value::Str(st) => {
+                                let chars: Vec<Value> =
+                                    st.chars().map(|c| Value::Str(c.to_string())).collect();
+                                let len = chars.len() as i64;
+                                self.charge_alloc(
+                                    chars.len().saturating_mul(std::mem::size_of::<Value>()),
+                                )?;
+                                (Value::List(Rc::new(RefCell::new(chars))), 0, len)
+                            }
+                            Value::Set(st) => {
+                                let items = st.borrow().items.clone();
+                                let len = items.len() as i64;
+                                self.charge_alloc(
+                                    items.len().saturating_mul(std::mem::size_of::<Value>()),
+                                )?;
+                                (Value::List(Rc::new(RefCell::new(items))), 0, len)
+                            }
+                            other => {
+                                return Err(format!(
+                                    "[line {}] iter() returned non-iterable '{}'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        };
+                        (Some(norm_val), s, e)
+                    }
+                    other => {
+                        return Err(format!(
+                            "[line {}] Cannot iterate over '{}'",
+                            line,
+                            other.type_name()
+                        ));
+                    }
+                };
+                if let Some(norm) = normalized {
+                    self.stack[iter_pos] = norm;
+                }
+                if start_i >= end_i {
+                    self.frames.last_mut().unwrap().ip = exit_ip;
+                } else {
+                    self.stack[iter_pos + 1] = Value::Int(start_i);
+                    self.stack[iter_pos + 2] = Value::Int(end_i);
+                }
+            }
+            Op::ForIter(slot, exit_ip) => {
+                let base = self.frames.last().unwrap().base;
+                let iter_pos = base + slot as usize;
+                let (Value::Int(idx), Value::Int(end)) =
+                    (&self.stack[iter_pos + 1], &self.stack[iter_pos + 2])
+                else {
+                    unreachable!();
+                };
+                let idx = *idx;
+                let end = *end;
+                if idx >= end {
+                    self.frames.last_mut().unwrap().ip = exit_ip;
+                } else {
+                    let next_idx = idx.saturating_add(1);
+                    let item = match &self.stack[iter_pos] {
+                        Value::Range { .. } => Value::Int(idx),
+                        Value::List(l) => {
+                            let b = l.borrow();
+                            if (idx as usize) >= b.len() {
+                                self.frames.last_mut().unwrap().ip = exit_ip;
+                                return Ok(None);
+                            }
+                            b[idx as usize].clone()
+                        }
+                        Value::Bytes(b) => Value::Int(b[idx as usize] as i64),
+                        _ => unreachable!(),
+                    };
+                    self.stack[iter_pos + 1] = Value::Int(next_idx);
+                    self.stack.push(item);
                 }
             }
             Op::SetAttr(idx) => {
@@ -1344,6 +2470,16 @@ impl VM {
                 match obj {
                     Value::Dict(dict) => {
                         dict.borrow_mut().insert(attr, val.clone());
+                        self.stack.push(val);
+                    }
+                    Value::StructInstance(inst) => {
+                        let Some(&field_idx) = inst.def.field_index.get(&attr) else {
+                            return Err(format!(
+                                "[line {}] Struct '{}' has no field '{}'",
+                                line, inst.def.name, attr
+                            ));
+                        };
+                        inst.fields.borrow_mut()[field_idx] = val.clone();
                         self.stack.push(val);
                     }
                     other => {
@@ -1396,6 +2532,13 @@ impl VM {
             Op::Return => {
                 let result = self.stack.pop().unwrap();
                 let frame = self.frames.pop().unwrap();
+                if self.profile_enabled {
+                    self.record_profile(
+                        &frame.closure.proto.name,
+                        frame.enter_step,
+                        frame.enter_time,
+                    );
+                }
                 while self
                     .try_handlers
                     .last()
@@ -1420,8 +2563,9 @@ impl VM {
             Constant::Int(v) => Value::Int(*v),
             Constant::Float(v) => Value::Float(*v),
             Constant::Str(s) => Value::Str(s.clone()),
-            Constant::Function(_) => {
-                unreachable!("Function constant must be loaded via Op::Closure")
+            Constant::Bytes(b) => Value::Bytes(Rc::new(b.clone())),
+            Constant::Function(_) | Constant::Struct(_) => {
+                unreachable!("Function/struct constant cannot be loaded via Op::Constant")
             }
         }
     }
@@ -1479,11 +2623,33 @@ impl VM {
             }
         }
 
-        let mut file_path = PathBuf::from(source);
-        if file_path.extension().is_none() {
-            file_path.set_extension("ask");
-        }
-        let file_path = self.resolve_read_path(&file_path.to_string_lossy())?;
+        let import_base = self
+            .frames
+            .last()
+            .and_then(|f| f.closure.base_dir.clone())
+            .unwrap_or_else(|| self.current_dir.clone());
+
+        let raw_path = PathBuf::from(source);
+        let file_path = if raw_path.extension().is_none() {
+            let mod_candidate = raw_path.join("mod.ask");
+            if let Ok(resolved_mod) =
+                self.resolve_read_path_from(&import_base, &mod_candidate.to_string_lossy())
+            {
+                if resolved_mod.is_file() {
+                    resolved_mod
+                } else {
+                    let mut ask_path = raw_path;
+                    ask_path.set_extension("ask");
+                    self.resolve_read_path_from(&import_base, &ask_path.to_string_lossy())?
+                }
+            } else {
+                let mut ask_path = raw_path;
+                ask_path.set_extension("ask");
+                self.resolve_read_path_from(&import_base, &ask_path.to_string_lossy())?
+            }
+        } else {
+            self.resolve_read_path_from(&import_base, &raw_path.to_string_lossy())?
+        };
 
         let cache_key = fs::canonicalize(&file_path)
             .unwrap_or_else(|_| file_path.clone())
@@ -1529,11 +2695,12 @@ impl VM {
             }
         };
 
+        let mod_dir = file_path.parent().map(|p| p.to_path_buf());
         let prev_dir = self.current_dir.clone();
-        if let Some(parent) = file_path.parent() {
-            self.current_dir = parent.to_path_buf();
+        if let Some(parent) = &mod_dir {
+            self.current_dir = parent.clone();
         }
-        let result = self.run(proto);
+        let result = self.run_with_base_dir(proto, mod_dir);
         self.current_dir = prev_dir;
         self.loading_modules.remove(&cache_key);
 
@@ -1599,23 +2766,23 @@ impl VM {
     }
 }
 
-fn native_print(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_print(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
             print!(" ");
         }
-        print!("{}", arg);
+        print!("{}", vm.format_value_protocol(arg)?);
     }
     let _ = io::stdout().flush();
     Ok(Value::Unit)
 }
 
-fn native_println(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_println(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
             print!(" ");
         }
-        print!("{}", arg);
+        print!("{}", vm.format_value_protocol(arg)?);
     }
     println!();
     Ok(Value::Unit)
@@ -1627,8 +2794,10 @@ fn native_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+        Value::Bytes(b) => Ok(Value::Int(b.len() as i64)),
         Value::List(l) => Ok(Value::Int(l.borrow().len() as i64)),
         Value::Dict(d) => Ok(Value::Int(d.borrow().len() as i64)),
+        Value::Set(s) => Ok(Value::Int(s.borrow().items.len() as i64)),
         Value::Range { start, end } => {
             let len = if end > start {
                 (*end as i128) - (*start as i128)
@@ -1641,7 +2810,7 @@ fn native_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn native_push(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_push(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("push() expects 2 arguments, got {}", args.len()));
     }
@@ -1650,6 +2819,7 @@ fn native_push(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             if l.borrow().len() >= 10_000_000 {
                 return Err("push() list size exceeds maximum limit of 10,000,000".to_string());
             }
+            vm.charge_alloc(std::mem::size_of::<Value>())?;
             l.borrow_mut().push(args[1].clone());
             Ok(args[0].clone())
         }
@@ -1682,20 +2852,69 @@ fn native_range(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Range { start, end })
 }
 
-fn collect_iterable(val: &Value, fn_name: &str) -> Result<Vec<Value>, String> {
+fn collect_iterable(vm: &mut VM, val: &Value, fn_name: &str) -> Result<Vec<Value>, String> {
+    collect_iterable_inner(vm, val, fn_name, true)
+}
+
+fn collect_iterable_inner(
+    vm: &mut VM,
+    val: &Value,
+    fn_name: &str,
+    allow_struct_iter: bool,
+) -> Result<Vec<Value>, String> {
     match val {
-        Value::List(l) => Ok(l.borrow().clone()),
+        Value::List(l) => {
+            let len = l.borrow().len();
+            vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
+            Ok(l.borrow().clone())
+        }
+        Value::Set(s) => {
+            let len = s.borrow().items.len();
+            vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
+            Ok(s.borrow().items.clone())
+        }
+        Value::Str(s) => {
+            let len = s.chars().count();
+            vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
+            Ok(s.chars().map(|c| Value::Str(c.to_string())).collect())
+        }
+        Value::Bytes(b) => {
+            if b.len() > 10_000_000 {
+                return Err(format!(
+                    "{}() bytes size exceeds maximum limit of 10,000,000",
+                    fn_name
+                ));
+            }
+            vm.charge_alloc(b.len().saturating_mul(std::mem::size_of::<Value>()))?;
+            Ok(b.iter().map(|&x| Value::Int(x as i64)).collect())
+        }
         Value::Range { start, end } => {
-            if *end > *start && (*end as i128 - *start as i128) > 10_000_000 {
+            let count = if *end > *start {
+                (*end as i128 - *start as i128) as u128
+            } else {
+                0
+            };
+            if count > 10_000_000 {
                 return Err(format!(
                     "{}() range size exceeds maximum limit of 10,000,000",
                     fn_name
                 ));
             }
+            vm.charge_alloc((count as usize).saturating_mul(std::mem::size_of::<Value>()))?;
             Ok((*start..*end).map(Value::Int).collect())
         }
+        Value::StructInstance(inst) if allow_struct_iter => {
+            let Some(iter_fn) = inst.def.methods.get("iter").cloned() else {
+                return Err(format!(
+                    "{}() expects an iterable collection, got '{}'",
+                    fn_name, inst.def.name
+                ));
+            };
+            let next_val = vm.call_value(iter_fn, &[val.clone()])?;
+            collect_iterable_inner(vm, &next_val, fn_name, false)
+        }
         other => Err(format!(
-            "{}() expects a list or range, got '{}'",
+            "{}() expects a list, set, bytes, or range, got '{}'",
             fn_name,
             other.type_name()
         )),
@@ -1706,7 +2925,7 @@ fn native_map(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("map() expects 2 arguments, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "map")?;
+    let items = collect_iterable(vm, &args[0], "map")?;
     let func = args[1].clone();
     let mut out = Vec::with_capacity(items.len());
     for (i, item) in items.into_iter().enumerate() {
@@ -1722,7 +2941,7 @@ fn native_filter(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("filter() expects 2 arguments, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "filter")?;
+    let items = collect_iterable(vm, &args[0], "filter")?;
     let func = args[1].clone();
     let mut out = Vec::new();
     for (i, item) in items.into_iter().enumerate() {
@@ -1741,7 +2960,7 @@ fn native_reduce(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err(format!("reduce() expects 3 arguments, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "reduce")?;
+    let items = collect_iterable(vm, &args[0], "reduce")?;
     let mut acc = args[1].clone();
     let func = args[2].clone();
     for (i, item) in items.into_iter().enumerate() {
@@ -1753,11 +2972,11 @@ fn native_reduce(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(acc)
 }
 
-fn native_str(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_str(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(format!("str() expects 1 argument, got {}", args.len()));
     }
-    Ok(Value::Str(format!("{}", args[0])))
+    Ok(Value::Str(vm.format_value_protocol(&args[0])?))
 }
 
 fn native_int(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -1790,6 +3009,31 @@ fn native_float(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .map(Value::Float)
             .map_err(|_| format!("Cannot convert {:?} to float", s)),
         other => Err(format!("Cannot convert '{}' to float", other.type_name())),
+    }
+}
+
+fn native_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("bytes() expects 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::Bytes(b) => Ok(Value::Bytes(b.clone())),
+        Value::Int(n) => {
+            if *n < 0 || *n > 64 * 1024 * 1024 {
+                return Err("bytes() length must be between 0 and 64 MiB".to_string());
+            }
+            let len = *n as usize;
+            vm.charge_alloc(len)?;
+            Ok(Value::Bytes(Rc::new(vec![0u8; len])))
+        }
+        other => {
+            let raw = other.as_bytes_cow("bytes()")?;
+            if raw.len() > 64 * 1024 * 1024 {
+                return Err("bytes() size exceeds 64 MiB limit".to_string());
+            }
+            vm.charge_alloc(raw.len())?;
+            Ok(Value::Bytes(Rc::new(raw.into_owned())))
+        }
     }
 }
 
@@ -2002,14 +3246,15 @@ fn native_clock(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Float(vm.start_time.elapsed().as_secs_f64()))
 }
 
-fn native_enumerate(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_enumerate(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(format!(
             "enumerate() expects 1 argument, got {}",
             args.len()
         ));
     }
-    let items = collect_iterable(&args[0], "enumerate")?;
+    let items = collect_iterable(vm, &args[0], "enumerate")?;
+    vm.charge_alloc(items.len().saturating_mul(std::mem::size_of::<Value>() * 2))?;
     let out: Vec<Value> = items
         .into_iter()
         .enumerate()
@@ -2018,12 +3263,14 @@ fn native_enumerate(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
-fn native_zip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_zip(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("zip() expects 2 arguments, got {}", args.len()));
     }
-    let a = collect_iterable(&args[0], "zip")?;
-    let b = collect_iterable(&args[1], "zip")?;
+    let a = collect_iterable(vm, &args[0], "zip")?;
+    let b = collect_iterable(vm, &args[1], "zip")?;
+    let pairs = a.len().min(b.len());
+    vm.charge_alloc(pairs.saturating_mul(std::mem::size_of::<Value>() * 2))?;
     let out: Vec<Value> = a
         .into_iter()
         .zip(b)
@@ -2032,7 +3279,7 @@ fn native_zip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
-fn native_take(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_take(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("take() expects 2 arguments, got {}", args.len()));
     }
@@ -2049,21 +3296,30 @@ fn native_take(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 return Ok(Value::List(Rc::new(RefCell::new(Vec::new()))));
             }
             let max_end = (*start as i128 + n as i128).min(*end as i128) as i64;
+            let count = (max_end as i128 - *start as i128).max(0) as usize;
+            vm.charge_alloc(count.saturating_mul(std::mem::size_of::<Value>()))?;
             let out: Vec<Value> = (*start..max_end).map(Value::Int).collect();
             Ok(Value::List(Rc::new(RefCell::new(out))))
         }
         Value::List(l) => {
+            let take_n = l.borrow().len().min(n);
+            vm.charge_alloc(take_n.saturating_mul(std::mem::size_of::<Value>()))?;
             let out: Vec<Value> = l.borrow().iter().take(n).cloned().collect();
             Ok(Value::List(Rc::new(RefCell::new(out))))
         }
+        Value::Bytes(b) => {
+            let take_n = b.len().min(n);
+            vm.charge_alloc(take_n)?;
+            Ok(Value::Bytes(Rc::new(b[..take_n].to_vec())))
+        }
         other => Err(format!(
-            "take() expects a list or range, got '{}'",
+            "take() expects a list, bytes, or range, got '{}'",
             other.type_name()
         )),
     }
 }
 
-fn native_skip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_skip(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("skip() expects 2 arguments, got {}", args.len()));
     }
@@ -2080,11 +3336,19 @@ fn native_skip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             })
         }
         Value::List(l) => {
+            let rem = l.borrow().len().saturating_sub(n);
+            vm.charge_alloc(rem.saturating_mul(std::mem::size_of::<Value>()))?;
             let out: Vec<Value> = l.borrow().iter().skip(n).cloned().collect();
             Ok(Value::List(Rc::new(RefCell::new(out))))
         }
+        Value::Bytes(b) => {
+            let start = n.min(b.len());
+            let rem = b.len() - start;
+            vm.charge_alloc(rem)?;
+            Ok(Value::Bytes(Rc::new(b[start..].to_vec())))
+        }
         other => Err(format!(
-            "skip() expects a list or range, got '{}'",
+            "skip() expects a list, bytes, or range, got '{}'",
             other.type_name()
         )),
     }
@@ -2094,7 +3358,7 @@ fn native_any(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("any() expects 2 arguments, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "any")?;
+    let items = collect_iterable(vm, &args[0], "any")?;
     let func = args[1].clone();
     for (i, item) in items.into_iter().enumerate() {
         if (i & 1023) == 0 {
@@ -2111,7 +3375,7 @@ fn native_all(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("all() expects 2 arguments, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "all")?;
+    let items = collect_iterable(vm, &args[0], "all")?;
     let func = args[1].clone();
     for (i, item) in items.into_iter().enumerate() {
         if (i & 1023) == 0 {
@@ -2128,7 +3392,7 @@ fn native_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("find() expects 2 arguments, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "find")?;
+    let items = collect_iterable(vm, &args[0], "find")?;
     let func = args[1].clone();
     for (i, item) in items.into_iter().enumerate() {
         if (i & 1023) == 0 {
@@ -2163,19 +3427,13 @@ fn native_unique(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err(format!("unique() expects 1 argument, got {}", args.len()));
     }
     vm.check_timeout()?;
-    let items = collect_iterable(&args[0], "unique")?;
+    let items = collect_iterable(vm, &args[0], "unique")?;
     let mut out: Vec<Value> = Vec::new();
-    let mut cmp_count = 0usize;
-    for (i, item) in items.into_iter().enumerate() {
-        if (i & 1023) == 0 {
-            vm.check_timeout()?;
-        }
+    for item in items {
         let mut seen = false;
+        let cmp_work = out.len().max(1) as u64;
+        vm.charge_work(cmp_work)?;
         for existing in &out {
-            cmp_count += 1;
-            if (cmp_count & 4095) == 0 {
-                vm.check_timeout()?;
-            }
             if existing.equals(&item) {
                 seen = true;
                 break;
@@ -2193,7 +3451,7 @@ fn native_flatten(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err(format!("flatten() expects 1 argument, got {}", args.len()));
     }
     vm.check_timeout()?;
-    let items = collect_iterable(&args[0], "flatten")?;
+    let items = collect_iterable(vm, &args[0], "flatten")?;
     let mut out = Vec::new();
     for (i, item) in items.into_iter().enumerate() {
         if (i & 1023) == 0 {
@@ -2207,7 +3465,11 @@ fn native_flatten(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                         "flatten() list size exceeds maximum limit of 10,000,000".to_string()
                     );
                 }
-                out.extend(b.iter().cloned());
+                let add_len = b.len();
+                let cloned = b.clone();
+                drop(b);
+                vm.charge_alloc(add_len.saturating_mul(std::mem::size_of::<Value>()))?;
+                out.extend(cloned);
             }
             other => {
                 if out.len() >= 10_000_000 {
@@ -2215,6 +3477,7 @@ fn native_flatten(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                         "flatten() list size exceeds maximum limit of 10,000,000".to_string()
                     );
                 }
+                vm.charge_alloc(std::mem::size_of::<Value>())?;
                 out.push(other);
             }
         }
@@ -2222,15 +3485,16 @@ fn native_flatten(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
-fn native_chunk(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_chunk(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!("chunk() expects 2 arguments, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "chunk")?;
+    let items = collect_iterable(vm, &args[0], "chunk")?;
     let size = match &args[1] {
         Value::Int(n) if *n > 0 => *n as usize,
         _ => return Err("chunk() size must be a positive integer".to_string()),
     };
+    vm.charge_alloc(items.len().saturating_mul(std::mem::size_of::<Value>()))?;
     let out: Vec<Value> = items
         .chunks(size)
         .map(|c| Value::List(Rc::new(RefCell::new(c.to_vec()))))
@@ -2238,11 +3502,12 @@ fn native_chunk(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
-fn native_sum(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn native_sum(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(format!("sum() expects 1 argument, got {}", args.len()));
     }
-    let items = collect_iterable(&args[0], "sum")?;
+    let items = collect_iterable(vm, &args[0], "sum")?;
+    vm.charge_work((items.len() as u64) / 16 + 1)?;
     let mut int_acc: i64 = 0;
     let mut float_acc: f64 = 0.0;
     let mut is_float = false;
@@ -2275,4 +3540,326 @@ fn native_sum(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     } else {
         Value::Int(int_acc)
     })
+}
+
+fn native_is_main(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!("is_main() expects 0 arguments, got {}", args.len()));
+    }
+    Ok(Value::Bool(
+        vm.frames.last().is_none_or(|f| f.closure.proto.is_main),
+    ))
+}
+
+fn native_set(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(format!(
+            "set() expects 0 or 1 arguments, got {}",
+            args.len()
+        ));
+    }
+    let mut set = AskaneSet::default();
+    if let Some(arg) = args.first() {
+        let items = collect_iterable(vm, arg, "set")?;
+        for item in items {
+            if set.insert(item)? {
+                vm.charge_alloc(std::mem::size_of::<Value>())?;
+            }
+        }
+    }
+    Ok(Value::Set(Rc::new(RefCell::new(set))))
+}
+
+fn native_dict(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(format!(
+            "dict() expects 0 or 1 arguments, got {}",
+            args.len()
+        ));
+    }
+    let Some(arg) = args.first() else {
+        return Ok(Value::Dict(Rc::new(RefCell::new(HashMap::new()))));
+    };
+    match arg {
+        Value::StructInstance(inst) => {
+            let vals = inst.fields.borrow();
+            let mut map = HashMap::with_capacity(inst.def.field_names.len());
+            for (k, v) in inst.def.field_names.iter().zip(vals.iter()) {
+                map.insert(k.clone(), v.clone());
+            }
+            vm.charge_alloc(map.len().saturating_mul(64).max(32))?;
+            Ok(Value::Dict(Rc::new(RefCell::new(map))))
+        }
+        Value::Dict(d) => {
+            let cloned = d.borrow().clone();
+            vm.charge_alloc(cloned.len().saturating_mul(64).max(32))?;
+            Ok(Value::Dict(Rc::new(RefCell::new(cloned))))
+        }
+        other => Err(format!(
+            "dict() expects a struct instance or dict, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn resolve_builtin_method(
+    val: &Value,
+    attr: &str,
+) -> Option<(&'static str, fn(&mut VM, &[Value]) -> Result<Value, String>)> {
+    match val {
+        Value::Str(_) => match attr {
+            "trim" => Some(("str.trim", modules::strings::str_trim)),
+            "trim_start" => Some(("str.trim_start", modules::strings::str_trim_start)),
+            "trim_end" => Some(("str.trim_end", modules::strings::str_trim_end)),
+            "split" => Some(("str.split", modules::strings::str_split)),
+            "replace" => Some(("str.replace", modules::strings::str_replace)),
+            "contains" | "has" => Some(("str.contains", modules::strings::str_contains)),
+            "starts_with" => Some(("str.starts_with", modules::strings::str_starts_with)),
+            "ends_with" => Some(("str.ends_with", modules::strings::str_ends_with)),
+            "upper" => Some(("str.upper", modules::strings::str_upper)),
+            "lower" => Some(("str.lower", modules::strings::str_lower)),
+            "find" => Some(("str.find", modules::strings::str_find)),
+            "repeat" => Some(("str.repeat", modules::strings::str_repeat)),
+            "lines" => Some(("str.lines", modules::strings::str_lines)),
+            "pad_start" => Some(("str.pad_start", modules::strings::str_pad_start)),
+            "pad_end" => Some(("str.pad_end", modules::strings::str_pad_end)),
+            "slice" => Some(("str.slice", modules::strings::str_slice)),
+            "len" => Some(("str.len", native_len)),
+            "to_bytes" => Some(("str.to_bytes", native_bytes)),
+            "chars" => Some(("str.chars", method_str_chars)),
+            _ => None,
+        },
+        Value::List(_) => match attr {
+            "push" => Some(("list.push", native_push)),
+            "pop" => Some(("list.pop", native_pop)),
+            "len" => Some(("list.len", native_len)),
+            "remove" => Some(("list.remove", native_remove)),
+            "clear" => Some(("list.clear", method_list_clear)),
+            "contains" | "has" => Some(("list.contains", method_list_contains)),
+            "join" => Some(("list.join", modules::strings::str_join)),
+            "sort" => Some(("list.sort", native_sort)),
+            "reverse" => Some(("list.reverse", native_reverse)),
+            "unique" => Some(("list.unique", native_unique)),
+            "flatten" => Some(("list.flatten", native_flatten)),
+            "map" => Some(("list.map", native_map)),
+            "filter" => Some(("list.filter", native_filter)),
+            "reduce" => Some(("list.reduce", native_reduce)),
+            "any" => Some(("list.any", native_any)),
+            "all" => Some(("list.all", native_all)),
+            "find" => Some(("list.find", native_find)),
+            "sum" => Some(("list.sum", native_sum)),
+            "chunk" => Some(("list.chunk", native_chunk)),
+            "take" => Some(("list.take", native_take)),
+            "skip" => Some(("list.skip", native_skip)),
+            _ => None,
+        },
+        Value::Set(_) => match attr {
+            "add" => Some(("set.add", method_set_add)),
+            "remove" => Some(("set.remove", method_set_remove)),
+            "has" | "contains" => Some(("set.has", method_set_has)),
+            "len" => Some(("set.len", native_len)),
+            "clear" => Some(("set.clear", method_set_clear)),
+            "to_list" => Some(("set.to_list", method_set_to_list)),
+            "union" => Some(("set.union", method_set_union)),
+            "intersect" => Some(("set.intersect", method_set_intersect)),
+            "diff" => Some(("set.diff", method_set_diff)),
+            _ => None,
+        },
+        Value::Bytes(_) => match attr {
+            "len" => Some(("bytes.len", native_len)),
+            "to_list" => Some(("bytes.to_list", method_bytes_to_list)),
+            "to_utf8" => Some(("bytes.to_utf8", method_bytes_to_utf8)),
+            _ => None,
+        },
+        Value::Dict(_) => match attr {
+            "keys" => Some(("dict.keys", native_keys)),
+            "values" => Some(("dict.values", native_values)),
+            "entries" => Some(("dict.entries", native_entries)),
+            "has" => Some(("dict.has", native_has)),
+            "get" => Some(("dict.get", native_get)),
+            "remove" => Some(("dict.remove", native_remove)),
+            "len" => Some(("dict.len", native_len)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn method_str_chars(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("str.chars() expects 0 arguments".to_string());
+    }
+    let Value::Str(s) = &args[0] else {
+        return Err("str.chars() expects a string".to_string());
+    };
+    let list: Vec<Value> = s.chars().map(|c| Value::Str(c.to_string())).collect();
+    Ok(Value::List(Rc::new(RefCell::new(list))))
+}
+
+fn method_list_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("list.clear() expects 0 arguments".to_string());
+    }
+    let Value::List(l) = &args[0] else {
+        return Err("list.clear() expects a list".to_string());
+    };
+    l.borrow_mut().clear();
+    Ok(Value::Unit)
+}
+
+fn method_list_contains(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("list.contains() expects 1 argument".to_string());
+    }
+    let Value::List(l) = &args[0] else {
+        return Err("list.contains() expects a list".to_string());
+    };
+    Ok(Value::Bool(l.borrow().iter().any(|x| x.equals(&args[1]))))
+}
+
+fn method_bytes_to_list(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("bytes.to_list() expects 0 arguments".to_string());
+    }
+    let Value::Bytes(b) = &args[0] else {
+        return Err("bytes.to_list() expects bytes".to_string());
+    };
+    vm.charge_alloc(b.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    let out: Vec<Value> = b.iter().map(|&x| Value::Int(x as i64)).collect();
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+fn method_bytes_to_utf8(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("bytes.to_utf8() expects 0 arguments".to_string());
+    }
+    let Value::Bytes(b) = &args[0] else {
+        return Err("bytes.to_utf8() expects bytes".to_string());
+    };
+    let s = std::str::from_utf8(b).map_err(|e| format!("bytes.to_utf8() invalid UTF-8: {}", e))?;
+    Ok(Value::Str(s.to_string()))
+}
+
+fn method_set_add(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("set.add() expects 1 argument".to_string());
+    }
+    let Value::Set(s) = &args[0] else {
+        return Err("set.add() expects a set".to_string());
+    };
+    if s.borrow_mut().insert(args[1].clone())? {
+        vm.charge_alloc(std::mem::size_of::<Value>())?;
+    }
+    Ok(args[0].clone())
+}
+
+fn method_set_remove(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("set.remove() expects 1 argument".to_string());
+    }
+    let Value::Set(s) = &args[0] else {
+        return Err("set.remove() expects a set".to_string());
+    };
+    Ok(Value::Bool(s.borrow_mut().remove(&args[1])?))
+}
+
+fn method_set_has(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("set.has() expects 1 argument".to_string());
+    }
+    let Value::Set(s) = &args[0] else {
+        return Err("set.has() expects a set".to_string());
+    };
+    Ok(Value::Bool(s.borrow().contains(&args[1])))
+}
+
+fn method_set_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("set.clear() expects 0 arguments".to_string());
+    }
+    let Value::Set(s) = &args[0] else {
+        return Err("set.clear() expects a set".to_string());
+    };
+    let mut borrowed = s.borrow_mut();
+    borrowed.items.clear();
+    borrowed.index.clear();
+    Ok(Value::Unit)
+}
+
+fn method_set_to_list(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("set.to_list() expects 0 arguments".to_string());
+    }
+    let Value::Set(s) = &args[0] else {
+        return Err("set.to_list() expects a set".to_string());
+    };
+    let items = s.borrow().items.clone();
+    vm.charge_alloc(items.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    Ok(Value::List(Rc::new(RefCell::new(items))))
+}
+
+fn expect_other_set<'a>(v: &'a Value, method: &str) -> Result<&'a Rc<RefCell<AskaneSet>>, String> {
+    match v {
+        Value::Set(s) => Ok(s),
+        other => Err(format!(
+            "set.{}() expects a set argument, got '{}'",
+            method,
+            other.type_name()
+        )),
+    }
+}
+
+fn method_set_union(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("set.union() expects 1 argument".to_string());
+    }
+    let a = expect_other_set(&args[0], "union")?;
+    let b = expect_other_set(&args[1], "union")?;
+    let mut out = a.borrow().clone();
+    for item in &b.borrow().items {
+        let _ = out.insert(item.clone())?;
+    }
+    vm.charge_alloc(out.items.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    Ok(Value::Set(Rc::new(RefCell::new(out))))
+}
+
+fn method_set_intersect(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("set.intersect() expects 1 argument".to_string());
+    }
+    let a = expect_other_set(&args[0], "intersect")?;
+    let b = expect_other_set(&args[1], "intersect")?;
+    let mut out = AskaneSet::default();
+    let b_ref = b.borrow();
+    for item in &a.borrow().items {
+        if b_ref.contains(item) {
+            let _ = out.insert(item.clone())?;
+        }
+    }
+    vm.charge_alloc(out.items.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    Ok(Value::Set(Rc::new(RefCell::new(out))))
+}
+
+fn method_set_diff(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("set.diff() expects 1 argument".to_string());
+    }
+    let a = expect_other_set(&args[0], "diff")?;
+    let b = expect_other_set(&args[1], "diff")?;
+    let mut out = AskaneSet::default();
+    let b_ref = b.borrow();
+    for item in &a.borrow().items {
+        if !b_ref.contains(item) {
+            let _ = out.insert(item.clone())?;
+        }
+    }
+    vm.charge_alloc(out.items.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    Ok(Value::Set(Rc::new(RefCell::new(out))))
+}
+
+fn method_struct_to_dict(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("struct.to_dict() expects 0 arguments".to_string());
+    }
+    native_dict(vm, args)
 }

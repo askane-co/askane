@@ -440,6 +440,7 @@ mod win32_gui {
                 || flag.starts_with("--allow-env=")
                 || flag.starts_with("--allow-exec=")
                 || flag.starts_with("--max-steps=")
+                || flag.starts_with("--max-mem=")
                 || flag.starts_with("--timeout="))
     }
 

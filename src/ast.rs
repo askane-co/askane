@@ -13,31 +13,97 @@ pub enum ImportSource {
 }
 
 #[derive(Debug, Clone)]
+pub struct FnParam {
+    pub name: String,
+    pub default: Option<Expr>,
+    pub is_variadic: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: String,
+    pub default: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallNamedExpr {
+    pub callee: Box<Expr>,
+    pub pos_args: Vec<Expr>,
+    pub named_args: Vec<(String, Expr)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructInitExpr {
+    pub target: Box<Expr>,
+    pub fields: Vec<(String, Expr)>,
+    pub spread: Option<Box<Expr>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainedCmpExpr {
+    pub first: Box<Expr>,
+    pub comparisons: Vec<(BinaryOp, Expr)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructMethod {
+    pub name: String,
+    pub params: Vec<FnParam>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportItem {
+    pub name: String,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum Stmt {
     Import {
         source: ImportSource,
         alias: String,
         span: Span,
     },
+    ImportFrom {
+        source: ImportSource,
+        items: Vec<ImportItem>,
+        span: Span,
+    },
     Let {
         name: String,
         value: Expr,
+        is_pub: bool,
         span: Span,
     },
     LetList {
         names: Vec<String>,
         value: Expr,
+        is_pub: bool,
         span: Span,
     },
     LetDict {
         fields: Vec<String>,
         value: Expr,
+        is_pub: bool,
         span: Span,
     },
     FnDecl {
         name: String,
-        params: Vec<String>,
+        params: Vec<FnParam>,
         body: Expr,
+        is_pub: bool,
+        span: Span,
+    },
+    StructDecl {
+        name: String,
+        is_pub: bool,
+        fields: Vec<StructField>,
+        methods: Vec<StructMethod>,
         span: Span,
     },
     While {
@@ -72,6 +138,7 @@ pub enum Expr {
     Int(i64, Span),
     Float(f64, Span),
     Str(String, Span),
+    Bytes(Vec<u8>, Span),
     Bool(bool, Span),
     Unit(Span),
     Ident(String, Span),
@@ -111,7 +178,7 @@ pub enum Expr {
         span: Span,
     },
     Fn {
-        params: Vec<String>,
+        params: Vec<FnParam>,
         body: Box<Expr>,
         span: Span,
     },
@@ -120,6 +187,9 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    CallNamed(Box<CallNamedExpr>),
+    StructInit(Box<StructInitExpr>),
+    ChainedCmp(Box<ChainedCmpExpr>),
     Index {
         object: Box<Expr>,
         index: Box<Expr>,
@@ -172,6 +242,7 @@ impl Expr {
             Expr::Int(_, s)
             | Expr::Float(_, s)
             | Expr::Str(_, s)
+            | Expr::Bytes(_, s)
             | Expr::Bool(_, s)
             | Expr::Unit(s)
             | Expr::Ident(_, s)
@@ -193,6 +264,9 @@ impl Expr {
             | Expr::NullCoalesce { span, .. }
             | Expr::TryCatch { span, .. }
             | Expr::Throw { span, .. } => *span,
+            Expr::CallNamed(c) => c.span,
+            Expr::StructInit(s) => s.span,
+            Expr::ChainedCmp(c) => c.span,
         }
     }
 }
@@ -224,6 +298,7 @@ pub enum BinaryOp {
     Gt,
     Ge,
     In,
+    NotIn,
     And,
     Or,
 }

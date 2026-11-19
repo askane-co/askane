@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::process;
 use std::rc::Rc;
@@ -17,6 +18,7 @@ pub fn module() -> Value {
             ("os", sys_os),
             ("arch", sys_arch),
             ("sleep", sys_sleep),
+            ("budget", sys_budget),
         ],
         &[],
     )
@@ -88,4 +90,33 @@ fn sys_sleep(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err("sys.sleep() expects a non-negative integer".to_string()),
     }
+}
+
+fn sys_budget(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("sys.budget() expects 0 arguments".to_string());
+    }
+    let (mem_used, mem_limit, io_used, io_limit, steps_left) = vm.budget_snapshot();
+    let mut map = HashMap::new();
+    map.insert("memory_used".to_string(), Value::Int(mem_used as i64));
+    map.insert(
+        "memory_limit".to_string(),
+        mem_limit
+            .map(|v| Value::Int(v as i64))
+            .unwrap_or(Value::Unit),
+    );
+    map.insert("io_used".to_string(), Value::Int(io_used as i64));
+    map.insert(
+        "io_limit".to_string(),
+        io_limit
+            .map(|v| Value::Int(v as i64))
+            .unwrap_or(Value::Unit),
+    );
+    map.insert(
+        "instructions_left".to_string(),
+        steps_left
+            .map(|v| Value::Int(v as i64))
+            .unwrap_or(Value::Unit),
+    );
+    Ok(Value::Dict(Rc::new(RefCell::new(map))))
 }
