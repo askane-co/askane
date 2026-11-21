@@ -1,1 +1,1 @@
-*.ask linguist-language=Rust
+*.ask linguist-detectable=true
