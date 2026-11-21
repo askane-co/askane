@@ -1,0 +1,95 @@
+// Benchmark 01: Game Simulation (Weight: 15%)
+// Deterministic 2D entity physics, circle collision checks, AI steering, and combat ticks.
+
+fn abs_i(x) {
+    if x < 0 { -x } else { x }
+}
+
+fn run_game_bench() {
+    let entity_count = 64;
+    let frames = 280;
+    let entities = [];
+    let seed = 1337;
+
+    let i = 0;
+    while i < entity_count {
+        seed = (seed * 1103515245 + 12345) % 2147483647;
+        let px = seed % 800;
+        seed = (seed * 1103515245 + 12345) % 2147483647;
+        let py = seed % 600;
+        let vx = (i % 7) - 3;
+        if vx == 0 { vx = 2; }
+        let vy = ((i * 3) % 7) - 3;
+        if vy == 0 { vy = -2; }
+        push(entities, #{ id: i, x: px, y: py, vx: vx, vy: vy, hp: 100, cd: 0 });
+        i = i + 1;
+    }
+
+    let collisions = 0;
+    let total_dmg = 0;
+    let f = 0;
+    while f < frames {
+        let a = 0;
+        while a < entity_count {
+            let e = entities[a];
+            let nx = e.x + e.vx;
+            let ny = e.y + e.vy;
+            if nx < 0 || nx > 800 {
+                e.vx = -e.vx;
+                nx = e.x + e.vx;
+            }
+            if ny < 0 || ny > 600 {
+                e.vy = -e.vy;
+                ny = e.y + e.vy;
+            }
+            e.x = nx;
+            e.y = ny;
+            if e.cd > 0 {
+                e.cd = e.cd - 1;
+            }
+            a = a + 1;
+        }
+
+        let j = 0;
+        while j < entity_count {
+            let e1 = entities[j];
+            let k = j + 1;
+            while k < entity_count {
+                let e2 = entities[k];
+                let dx = e1.x - e2.x;
+                let dy = e1.y - e2.y;
+                if abs_i(dx) < 28 && abs_i(dy) < 28 {
+                    if dx * dx + dy * dy < 784 {
+                        collisions = collisions + 1;
+                        if e1.cd == 0 {
+                            let dmg = 3 + ((f + j + k) % 5);
+                            e2.hp = e2.hp - dmg;
+                            if e2.hp <= 0 {
+                                e2.hp = 100;
+                            }
+                            e1.cd = 4;
+                            total_dmg = total_dmg + dmg;
+                        }
+                    }
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        f = f + 1;
+    }
+
+    let pos_sum = 0;
+    let idx = 0;
+    while idx < entity_count {
+        let e = entities[idx];
+        pos_sum = pos_sum + e.x + e.y + e.hp;
+        idx = idx + 1;
+    }
+    collisions * 100000 + total_dmg * 100 + (pos_sum % 100000)
+}
+
+let t0 = clock();
+let checksum = run_game_bench();
+let elapsed = (clock() - t0) * 1000.0;
+println("BENCH_RESULT 01_game " + str(elapsed) + " " + str(checksum));

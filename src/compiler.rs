@@ -18,6 +18,7 @@ struct LoopContext {
     break_stack_height: usize,
     continue_stack_height: usize,
     try_depth: usize,
+    scope_depth: usize,
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
 }
@@ -32,6 +33,7 @@ struct FunctionCompiler {
     scope_depth: usize,
     temp_depth: usize,
     try_depth: usize,
+    cleanup_scopes: Vec<usize>,
     loops: Vec<LoopContext>,
 }
 
@@ -54,6 +56,7 @@ impl FunctionCompiler {
             scope_depth: 0,
             temp_depth: 0,
             try_depth: 0,
+            cleanup_scopes: Vec::new(),
             loops: Vec::new(),
         }
     }
@@ -65,6 +68,7 @@ impl FunctionCompiler {
 
 pub struct Compiler {
     frames: Vec<FunctionCompiler>,
+    include_specs: bool,
 }
 
 impl Compiler {
@@ -72,7 +76,16 @@ impl Compiler {
         let mut max = minimum.saturating_sub(1);
         for op in &chunk.code {
             let slot = match op {
-                crate::bytecode::Op::GetLocal(i) | crate::bytecode::Op::SetLocal(i) => Some(*i),
+                crate::bytecode::Op::GetLocal(i)
+                | crate::bytecode::Op::SetLocal(i)
+                | crate::bytecode::Op::AddLocalInt(i, _)
+                | crate::bytecode::Op::SubLocalInt(i, _)
+                | crate::bytecode::Op::LtLocalInt(i, _)
+                | crate::bytecode::Op::LeLocalInt(i, _)
+                | crate::bytecode::Op::IncLocalPop(i, _) => Some(*i),
+                crate::bytecode::Op::AddLocals(a, b)
+                | crate::bytecode::Op::SubLocals(a, b)
+                | crate::bytecode::Op::LtLocals(a, b) => Some((*a).max(*b)),
                 crate::bytecode::Op::ForPrep(i, _) | crate::bytecode::Op::ForIter(i, _) => {
                     Some(i.saturating_add(2))
                 }
@@ -92,8 +105,20 @@ impl Compiler {
         max.saturating_add(1)
     }
     pub fn compile(program: &Program) -> Result<Rc<FunctionProto>, String> {
+        Self::compile_with_mode(program, false)
+    }
+
+    pub fn compile_with_specs(program: &Program) -> Result<Rc<FunctionProto>, String> {
+        Self::compile_with_mode(program, true)
+    }
+
+    fn compile_with_mode(
+        program: &Program,
+        include_specs: bool,
+    ) -> Result<Rc<FunctionProto>, String> {
         let mut compiler = Self {
             frames: vec![FunctionCompiler::new("<script>".to_string(), 0, true)],
+            include_specs,
         };
 
         for stmt in &program.stmts {
@@ -103,9 +128,15 @@ impl Compiler {
         if let Some(tail) = &program.tail {
             compiler.compile_expr(tail)?;
             let line = tail.span().line;
+            if !compiler.current().cleanup_scopes.is_empty() {
+                compiler.emit(Op::RunCleanups(0), line);
+            }
             compiler.emit(Op::Return, line);
         } else {
             compiler.emit(Op::Unit, 0);
+            if !compiler.current().cleanup_scopes.is_empty() {
+                compiler.emit(Op::RunCleanups(0), 0);
+            }
             compiler.emit(Op::Return, 0);
         }
 
@@ -136,6 +167,7 @@ impl Compiler {
                 0,
                 false,
             )],
+            include_specs: false,
         };
         compiler.current().scope_depth = 1;
 
@@ -172,6 +204,9 @@ impl Compiler {
 
         let mod_name_idx = compiler.current().chunk.add_string_constant(module_name);
         compiler.emit(Op::MakeModule(mod_name_idx, count), 0);
+        if !compiler.current().cleanup_scopes.is_empty() {
+            compiler.emit(Op::RunCleanups(0), 0);
+        }
         compiler.emit(Op::Return, 0);
 
         let frame = compiler.frames.pop().unwrap();
@@ -215,6 +250,15 @@ impl Compiler {
     fn end_scope(&mut self, line: usize) {
         let target_depth = self.current().scope_depth - 1;
         self.current().scope_depth = target_depth;
+        if self
+            .current()
+            .cleanup_scopes
+            .iter()
+            .any(|&d| d > target_depth)
+        {
+            self.emit(Op::RunCleanups((target_depth + 1) as u16), line);
+            self.current().cleanup_scopes.retain(|&d| d <= target_depth);
+        }
 
         while let Some(local) = self.current().locals.last() {
             if local.depth <= target_depth {
@@ -519,10 +563,12 @@ impl Compiler {
                 let loop_start = self.current_ip();
                 let stack_height = self.current().stack_height();
                 let loop_try_depth = self.current().try_depth;
+                let loop_scope_depth = self.current().scope_depth;
                 self.current().loops.push(LoopContext {
                     break_stack_height: stack_height,
                     continue_stack_height: stack_height,
                     try_depth: loop_try_depth,
+                    scope_depth: loop_scope_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                 });
@@ -567,10 +613,12 @@ impl Compiler {
 
                 let continue_stack_height = self.current().stack_height();
                 let loop_try_depth = self.current().try_depth;
+                let loop_scope_depth = self.current().scope_depth;
                 self.current().loops.push(LoopContext {
                     break_stack_height,
                     continue_stack_height,
                     try_depth: loop_try_depth,
+                    scope_depth: loop_scope_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                 });
@@ -634,10 +682,12 @@ impl Compiler {
 
                 let continue_stack_height = self.current().stack_height();
                 let loop_try_depth = self.current().try_depth;
+                let loop_scope_depth = self.current().scope_depth;
                 self.current().loops.push(LoopContext {
                     break_stack_height,
                     continue_stack_height,
                     try_depth: loop_try_depth,
+                    scope_depth: loop_scope_depth,
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(),
                 });
@@ -695,10 +745,14 @@ impl Compiler {
                     ));
                 }
                 if let Some(expr) = value {
-                    let in_tail = self.current().try_depth == 0;
+                    let in_tail =
+                        self.current().try_depth == 0 && self.current().cleanup_scopes.is_empty();
                     self.compile_expr_inner(expr, in_tail)?;
                 } else {
                     self.emit(Op::Unit, span.line);
+                }
+                if !self.current().cleanup_scopes.is_empty() {
+                    self.emit(Op::RunCleanups(0), span.line);
                 }
                 self.emit(Op::Return, span.line);
                 Ok(())
@@ -710,10 +764,18 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let (target_height, loop_try_depth) = {
+                let (target_height, loop_try_depth, loop_scope_depth) = {
                     let l = self.current().loops.last().unwrap();
-                    (l.break_stack_height, l.try_depth)
+                    (l.break_stack_height, l.try_depth, l.scope_depth)
                 };
+                if self
+                    .current()
+                    .cleanup_scopes
+                    .iter()
+                    .any(|&d| d > loop_scope_depth)
+                {
+                    self.emit(Op::RunCleanups((loop_scope_depth + 1) as u16), span.line);
+                }
                 for _ in loop_try_depth..self.current().try_depth {
                     self.emit(Op::PopTry, span.line);
                 }
@@ -729,10 +791,18 @@ impl Compiler {
                         span.line, span.col
                     ));
                 }
-                let (target_height, loop_try_depth) = {
+                let (target_height, loop_try_depth, loop_scope_depth) = {
                     let l = self.current().loops.last().unwrap();
-                    (l.continue_stack_height, l.try_depth)
+                    (l.continue_stack_height, l.try_depth, l.scope_depth)
                 };
+                if self
+                    .current()
+                    .cleanup_scopes
+                    .iter()
+                    .any(|&d| d > loop_scope_depth)
+                {
+                    self.emit(Op::RunCleanups((loop_scope_depth + 1) as u16), span.line);
+                }
                 for _ in loop_try_depth..self.current().try_depth {
                     self.emit(Op::PopTry, span.line);
                 }
@@ -746,7 +816,103 @@ impl Compiler {
                     .push(j);
                 Ok(())
             }
+            Stmt::Needs { caps, span } => {
+                let helper_idx = self.current().chunk.add_string_constant("__check_needs");
+                self.emit(Op::GetGlobal(helper_idx), span.line);
+                self.push_temps(1);
+                let cap_count = caps.len();
+                for (name, args) in caps {
+                    let nidx = self.current().chunk.add_string_constant(name);
+                    self.emit(Op::Constant(nidx), span.line);
+                    self.push_temps(1);
+                    for a in args {
+                        let aidx = self.current().chunk.add_string_constant(a);
+                        self.emit(Op::Constant(aidx), span.line);
+                        self.push_temps(1);
+                    }
+                    self.pop_temps(args.len());
+                    self.emit(Op::MakeList(args.len() as u16), span.line);
+                    self.push_temps(1);
+                    self.pop_temps(2);
+                    self.emit(Op::MakeList(2), span.line);
+                    self.push_temps(1);
+                }
+                self.pop_temps(cap_count);
+                self.emit(Op::MakeList(cap_count as u16), span.line);
+                self.pop_temps(1);
+                self.emit(Op::Call(1), span.line);
+                self.emit(Op::Pop, span.line);
+                Ok(())
+            }
+            Stmt::Defer { body, span } => {
+                self.compile_function("<defer>".to_string(), &[], body, *span)?;
+                let depth = self.current().scope_depth;
+                self.current().cleanup_scopes.push(depth);
+                self.emit(Op::PushDefer(depth as u16), span.line);
+                Ok(())
+            }
+            Stmt::Every {
+                interval,
+                body,
+                span,
+            } => {
+                let loop_start = self.current_ip();
+                let stack_height = self.current().stack_height();
+                let loop_try_depth = self.current().try_depth;
+                let loop_scope_depth = self.current().scope_depth;
+                self.current().loops.push(LoopContext {
+                    break_stack_height: stack_height,
+                    continue_stack_height: stack_height,
+                    try_depth: loop_try_depth,
+                    scope_depth: loop_scope_depth,
+                    break_jumps: Vec::new(),
+                    continue_jumps: Vec::new(),
+                });
+
+                self.compile_expr(body)?;
+                self.emit(Op::Pop, span.line);
+
+                let continue_target = self.current_ip();
+                let ctx = self.current().loops.pop().unwrap();
+                for j in ctx.continue_jumps {
+                    self.current().chunk.patch_jump(j, continue_target);
+                }
+
+                let sleep_idx = self.current().chunk.add_string_constant("__sleep_checked");
+                self.emit(Op::GetGlobal(sleep_idx), span.line);
+                self.push_temps(1);
+                self.compile_expr(interval)?;
+                self.pop_temps(1);
+                self.emit(Op::Call(1), span.line);
+                self.emit(Op::Pop, span.line);
+
+                self.emit(Op::Jump(loop_start), span.line);
+                for j in ctx.break_jumps {
+                    self.patch_jump(j);
+                }
+                Ok(())
+            }
+            Stmt::Spec { name, body, span } => {
+                if !self.include_specs {
+                    return Ok(());
+                }
+                let run_idx = self.current().chunk.add_string_constant("__run_spec");
+                self.emit(Op::GetGlobal(run_idx), span.line);
+                self.push_temps(1);
+                let name_idx = self.current().chunk.add_string_constant(name);
+                self.emit(Op::Constant(name_idx), span.line);
+                self.push_temps(1);
+                self.compile_function(format!("<spec {}>", name), &[], body, *span)?;
+                self.pop_temps(2);
+                self.emit(Op::Call(2), span.line);
+                self.emit(Op::Pop, span.line);
+                Ok(())
+            }
             Stmt::Expr(expr) => {
+                if let Some((slot, delta, line)) = self.match_local_inc_pop(expr) {
+                    self.emit(Op::IncLocalPop(slot, delta), line);
+                    return Ok(());
+                }
                 self.compile_expr(expr)?;
                 self.emit(Op::Pop, expr.span().line);
                 Ok(())
@@ -801,8 +967,12 @@ impl Compiler {
     fn compile_expr_inner(&mut self, expr: &Expr, in_tail: bool) -> Result<(), String> {
         match expr {
             Expr::Int(v, span) => {
-                let idx = self.current().chunk.add_constant(Constant::Int(*v));
-                self.emit(Op::Constant(idx), span.line);
+                if let Ok(imm) = i32::try_from(*v) {
+                    self.emit(Op::ConstInt(imm), span.line);
+                } else {
+                    let idx = self.current().chunk.add_constant(Constant::Int(*v));
+                    self.emit(Op::Constant(idx), span.line);
+                }
                 Ok(())
             }
             Expr::Float(v, span) => {
@@ -894,6 +1064,11 @@ impl Compiler {
                     self.emit(Op::Pop, span.line);
                     self.compile_expr(right)?;
                     self.patch_jump(end_jump);
+                    return Ok(());
+                }
+
+                if let Some(specialized) = self.match_local_binary(left, *op, right) {
+                    self.emit(specialized, span.line);
                     return Ok(());
                 }
 
@@ -1031,7 +1206,11 @@ impl Compiler {
             },
             Expr::Block { stmts, tail, span } => {
                 if let Some(tail_expr) = tail {
-                    if in_tail && stmts.is_empty() && self.current().try_depth == 0 {
+                    if in_tail
+                        && stmts.is_empty()
+                        && self.current().try_depth == 0
+                        && self.current().cleanup_scopes.is_empty()
+                    {
                         return self.compile_expr_inner(tail_expr, true);
                     }
                     self.emit(Op::Unit, span.line);
@@ -1112,6 +1291,254 @@ impl Compiler {
                 self.compile_expr(value)?;
                 self.emit(Op::Throw, span.line);
                 Ok(())
+            }
+            Expr::SafePipe(p) => {
+                let (left, param, apply, span) = (&p.left, &p.param, &p.apply, p.span);
+                self.emit(Op::Unit, span.line);
+                let res_slot = self.add_local(String::new());
+                self.begin_scope();
+                self.compile_expr(left)?;
+                let val_slot = self.add_local(param.clone());
+                self.emit(Op::GetLocal(val_slot), span.line);
+                let apply_jump = self.emit(Op::JumpIfNotUnitPeek(0), span.line);
+                self.emit(Op::Pop, span.line);
+                let end_jump = self.emit(Op::Jump(0), span.line);
+                self.patch_jump(apply_jump);
+                self.emit(Op::Pop, span.line);
+                self.compile_expr(apply)?;
+                self.emit(Op::SetLocal(res_slot), span.line);
+                self.emit(Op::Pop, span.line);
+                self.patch_jump(end_jump);
+                self.end_scope(span.line);
+                self.current().locals.pop();
+                Ok(())
+            }
+            Expr::MapPipe { left, mapper, span } => {
+                let idx = self.current().chunk.add_string_constant("__pipe_map");
+                self.emit(Op::GetGlobal(idx), span.line);
+                self.push_temps(1);
+                self.compile_expr(left)?;
+                self.push_temps(1);
+                self.compile_expr(mapper)?;
+                self.pop_temps(2);
+                self.emit(Op::Call(2), span.line);
+                Ok(())
+            }
+            Expr::PipeAssign(p) => {
+                let (target, param, stages, span) = (&p.target, &p.param, &p.stages, p.span);
+                self.emit(Op::Unit, span.line);
+                let res_slot = self.add_local(String::new());
+                self.begin_scope();
+                match target.as_ref() {
+                    AssignTarget::Var(name) => {
+                        let frame_idx = self.frames.len() - 1;
+                        if let Some((_, slot)) = Self::resolve_local(&self.frames[frame_idx], name)
+                        {
+                            self.emit(Op::GetLocal(slot), span.line);
+                        } else if let Some(upval) = self.resolve_upvalue(frame_idx, name) {
+                            self.emit(Op::GetUpvalue(upval), span.line);
+                        } else {
+                            let idx = self.current().chunk.add_string_constant(name);
+                            self.emit(Op::GetGlobal(idx), span.line);
+                        }
+                        let val_slot = self.add_local(param.clone());
+                        for stage in stages {
+                            self.compile_expr(stage)?;
+                            self.emit(Op::SetLocal(val_slot), span.line);
+                            self.emit(Op::Pop, span.line);
+                        }
+                        self.emit(Op::GetLocal(val_slot), span.line);
+                        if let Some((_, slot)) = Self::resolve_local(&self.frames[frame_idx], name)
+                        {
+                            self.emit(Op::SetLocal(slot), span.line);
+                        } else if let Some(upval) = self.resolve_upvalue(frame_idx, name) {
+                            self.emit(Op::SetUpvalue(upval), span.line);
+                        } else {
+                            let idx = self.current().chunk.add_string_constant(name);
+                            self.emit(Op::SetGlobal(idx), span.line);
+                        }
+                        self.emit(Op::SetLocal(res_slot), span.line);
+                        self.emit(Op::Pop, span.line);
+                    }
+                    AssignTarget::Index { object, index } => {
+                        self.compile_expr(object)?;
+                        let obj_slot = self.add_local(String::new());
+                        self.compile_expr(index)?;
+                        let idx_slot = self.add_local(String::new());
+                        self.emit(Op::GetLocal(obj_slot), span.line);
+                        self.emit(Op::GetLocal(idx_slot), span.line);
+                        self.emit(Op::GetIndex, span.line);
+                        let val_slot = self.add_local(param.clone());
+                        for stage in stages {
+                            self.compile_expr(stage)?;
+                            self.emit(Op::SetLocal(val_slot), span.line);
+                            self.emit(Op::Pop, span.line);
+                        }
+                        self.emit(Op::GetLocal(obj_slot), span.line);
+                        self.emit(Op::GetLocal(idx_slot), span.line);
+                        self.emit(Op::GetLocal(val_slot), span.line);
+                        self.emit(Op::SetIndex, span.line);
+                        self.emit(Op::SetLocal(res_slot), span.line);
+                        self.emit(Op::Pop, span.line);
+                    }
+                    AssignTarget::Attr { object, name } => {
+                        self.compile_expr(object)?;
+                        let obj_slot = self.add_local(String::new());
+                        let attr_idx = self.current().chunk.add_string_constant(name);
+                        self.emit(Op::GetLocal(obj_slot), span.line);
+                        self.emit(Op::GetAttr(attr_idx), span.line);
+                        let val_slot = self.add_local(param.clone());
+                        for stage in stages {
+                            self.compile_expr(stage)?;
+                            self.emit(Op::SetLocal(val_slot), span.line);
+                            self.emit(Op::Pop, span.line);
+                        }
+                        self.emit(Op::GetLocal(obj_slot), span.line);
+                        self.emit(Op::GetLocal(val_slot), span.line);
+                        self.emit(Op::SetAttr(attr_idx), span.line);
+                        self.emit(Op::SetLocal(res_slot), span.line);
+                        self.emit(Op::Pop, span.line);
+                    }
+                }
+                self.end_scope(span.line);
+                self.current().locals.pop();
+                Ok(())
+            }
+            Expr::TaggedTemplate(t) => {
+                let (tag, parts, exprs, expr_labels, span) =
+                    (&t.tag, &t.parts, &t.exprs, &t.expr_labels, t.span);
+                let frame_idx = self.frames.len() - 1;
+                let has_local_tag = Self::resolve_local(&self.frames[frame_idx], tag).is_some()
+                    || self.resolve_upvalue(frame_idx, tag).is_some();
+                let use_builtin_dispatch = !has_local_tag && (tag == "log" || tag == "sql");
+                if use_builtin_dispatch {
+                    let helper_idx = self.current().chunk.add_string_constant("__tag_eval");
+                    self.emit(Op::GetGlobal(helper_idx), span.line);
+                    self.push_temps(1);
+                    let tag_idx = self.current().chunk.add_string_constant(tag);
+                    self.emit(Op::Constant(tag_idx), span.line);
+                    self.push_temps(1);
+                    let part_count = parts.len();
+                    for p in parts {
+                        let pidx = self.current().chunk.add_string_constant(p);
+                        self.emit(Op::Constant(pidx), span.line);
+                        self.push_temps(1);
+                    }
+                    self.pop_temps(part_count);
+                    self.emit(Op::MakeList(part_count as u16), span.line);
+                    self.push_temps(1);
+                    let expr_count = exprs.len();
+                    for e in exprs {
+                        self.compile_expr(e)?;
+                        self.push_temps(1);
+                    }
+                    self.pop_temps(expr_count);
+                    self.emit(Op::MakeList(expr_count as u16), span.line);
+                    self.push_temps(1);
+                    for lbl in expr_labels {
+                        let lidx = self.current().chunk.add_string_constant(lbl);
+                        self.emit(Op::Constant(lidx), span.line);
+                        self.push_temps(1);
+                    }
+                    self.pop_temps(expr_labels.len());
+                    self.emit(Op::MakeList(expr_labels.len() as u16), span.line);
+                    self.pop_temps(4);
+                    self.emit(Op::Call(4), span.line);
+                } else {
+                    if let Some((_, slot)) = Self::resolve_local(&self.frames[frame_idx], tag) {
+                        self.emit(Op::GetLocal(slot), span.line);
+                    } else if let Some(upval) = self.resolve_upvalue(frame_idx, tag) {
+                        self.emit(Op::GetUpvalue(upval), span.line);
+                    } else {
+                        let idx = self.current().chunk.add_string_constant(tag);
+                        self.emit(Op::GetGlobal(idx), span.line);
+                    }
+                    self.push_temps(1);
+                    let part_count = parts.len();
+                    for p in parts {
+                        let pidx = self.current().chunk.add_string_constant(p);
+                        self.emit(Op::Constant(pidx), span.line);
+                        self.push_temps(1);
+                    }
+                    self.pop_temps(part_count);
+                    self.emit(Op::MakeList(part_count as u16), span.line);
+                    self.push_temps(1);
+                    let expr_count = exprs.len();
+                    for e in exprs {
+                        self.compile_expr(e)?;
+                        self.push_temps(1);
+                    }
+                    self.pop_temps(expr_count);
+                    self.emit(Op::MakeList(expr_count as u16), span.line);
+                    self.pop_temps(2);
+                    self.emit(Op::Call(2), span.line);
+                }
+                Ok(())
+            }
+            Expr::With(w) => {
+                let span = w.span;
+                self.emit(Op::Unit, span.line);
+                let res_slot = self.add_local(String::new());
+                self.begin_scope();
+                let with_depth = self.current().scope_depth;
+                self.compile_expr(&w.resource)?;
+                let res_name = w.alias.clone().unwrap_or_else(|| "$with_res".to_string());
+                self.add_local(res_name.clone());
+
+                let defer_call = Expr::Call {
+                    callee: Box::new(Expr::Ident("__close_resource".to_string(), span)),
+                    args: vec![Expr::Ident(res_name, span)],
+                    span,
+                };
+                self.compile_function("<with_close>".to_string(), &[], &defer_call, span)?;
+                self.current().cleanup_scopes.push(with_depth);
+                self.emit(Op::PushDefer(with_depth as u16), span.line);
+
+                self.compile_expr(&w.body)?;
+                self.emit(Op::SetLocal(res_slot), span.line);
+                self.emit(Op::Pop, span.line);
+                self.end_scope(span.line);
+                self.current().locals.pop();
+                Ok(())
+            }
+            Expr::Sandbox(s) => {
+                let span = s.span;
+                self.emit(Op::Unit, span.line);
+                let res_slot = self.add_local(String::new());
+                self.begin_scope();
+                let sb_depth = self.current().scope_depth;
+                if s.policy.is_empty() {
+                    self.emit(Op::Unit, span.line);
+                } else {
+                    for (k, v) in &s.policy {
+                        let kidx = self.current().chunk.add_string_constant(k);
+                        self.emit(Op::Constant(kidx), span.line);
+                        self.push_temps(1);
+                        self.compile_expr(v)?;
+                        self.push_temps(1);
+                    }
+                    self.pop_temps(s.policy.len() * 2);
+                    self.emit(Op::MakeDict(s.policy.len() as u16), span.line);
+                }
+                self.current().cleanup_scopes.push(sb_depth);
+                self.emit(Op::EnterSandbox(sb_depth as u16), span.line);
+
+                self.compile_expr(&s.body)?;
+                self.emit(Op::SetLocal(res_slot), span.line);
+                self.emit(Op::Pop, span.line);
+                self.end_scope(span.line);
+                self.current().locals.pop();
+                Ok(())
+            }
+            Expr::After { delay, body, span } => {
+                let sleep_idx = self.current().chunk.add_string_constant("__sleep_checked");
+                self.emit(Op::GetGlobal(sleep_idx), span.line);
+                self.push_temps(1);
+                self.compile_expr(delay)?;
+                self.pop_temps(1);
+                self.emit(Op::Call(1), span.line);
+                self.emit(Op::Pop, span.line);
+                self.compile_expr_inner(body, in_tail)
             }
             Expr::Match {
                 subject,
@@ -1301,7 +1728,10 @@ impl Compiler {
                     self.push_temps(1);
                 }
                 self.pop_temps(1 + args.len());
-                if in_tail && self.current().try_depth == 0 {
+                if in_tail
+                    && self.current().try_depth == 0
+                    && self.current().cleanup_scopes.is_empty()
+                {
                     self.emit(Op::TailCall(args.len() as u8), span.line);
                 } else {
                     self.emit(Op::Call(args.len() as u8), span.line);
@@ -1520,6 +1950,9 @@ impl Compiler {
             }
         }
         self.compile_expr_inner(body, true)?;
+        if !self.current().cleanup_scopes.is_empty() {
+            self.emit(Op::RunCleanups(0), span.line);
+        }
         self.emit(Op::Return, span.line);
         let compiled = self.frames.pop().unwrap();
         if compiled.chunk.limit_exceeded {
@@ -1613,6 +2046,97 @@ impl Compiler {
                 self.emit(Op::SetAttr(idx), span.line);
                 Ok(())
             }
+        }
+    }
+
+    fn match_local_slot(&self, name: &str) -> Option<u16> {
+        let frame_idx = self.frames.len() - 1;
+        Self::resolve_local(&self.frames[frame_idx], name).map(|(_, slot)| slot)
+    }
+
+    fn match_local_binary(&self, left: &Expr, op: BinaryOp, right: &Expr) -> Option<Op> {
+        if let (Expr::Ident(name, _), Expr::Int(imm, _)) = (left, right) {
+            if let (Some(slot), Ok(v)) = (self.match_local_slot(name), i32::try_from(*imm)) {
+                return match op {
+                    BinaryOp::Add => Some(Op::AddLocalInt(slot, v)),
+                    BinaryOp::Sub => Some(Op::SubLocalInt(slot, v)),
+                    BinaryOp::Lt => Some(Op::LtLocalInt(slot, v)),
+                    BinaryOp::Le => Some(Op::LeLocalInt(slot, v)),
+                    _ => None,
+                };
+            }
+        }
+        if let (Expr::Ident(lhs, _), Expr::Ident(rhs, _)) = (left, right) {
+            if let (Some(a), Some(b)) = (self.match_local_slot(lhs), self.match_local_slot(rhs)) {
+                return match op {
+                    BinaryOp::Add => Some(Op::AddLocals(a, b)),
+                    BinaryOp::Sub => Some(Op::SubLocals(a, b)),
+                    BinaryOp::Lt => Some(Op::LtLocals(a, b)),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    fn match_local_inc_pop(&self, expr: &Expr) -> Option<(u16, i32, usize)> {
+        let Expr::Assign {
+            target,
+            op,
+            value,
+            span,
+        } = expr
+        else {
+            return None;
+        };
+        let AssignTarget::Var(target_name) = target.as_ref() else {
+            return None;
+        };
+        let slot = self.match_local_slot(target_name)?;
+        match op {
+            Some(BinaryOp::Add) => {
+                if let Expr::Int(k, _) = value.as_ref() {
+                    return i32::try_from(*k).ok().map(|d| (slot, d, span.line));
+                }
+                None
+            }
+            Some(BinaryOp::Sub) => {
+                if let Expr::Int(k, _) = value.as_ref() {
+                    return k
+                        .checked_neg()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .map(|d| (slot, d, span.line));
+                }
+                None
+            }
+            None => {
+                if let Expr::Binary {
+                    left,
+                    op: bin_op,
+                    right,
+                    ..
+                } = value.as_ref()
+                {
+                    if let (Expr::Ident(lhs_name, _), Expr::Int(k, _)) =
+                        (left.as_ref(), right.as_ref())
+                    {
+                        if lhs_name == target_name {
+                            return match bin_op {
+                                BinaryOp::Add => {
+                                    i32::try_from(*k).ok().map(|d| (slot, d, span.line))
+                                }
+                                BinaryOp::Sub => k
+                                    .checked_neg()
+                                    .and_then(|n| i32::try_from(n).ok())
+                                    .map(|d| (slot, d, span.line)),
+                                _ => None,
+                            };
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 }

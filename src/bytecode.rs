@@ -53,6 +53,7 @@ pub struct FunctionProto {
 #[derive(Debug, Clone, Copy)]
 pub enum Op {
     Constant(u16),
+    ConstInt(i32),
     Unit,
     True,
     False,
@@ -62,6 +63,14 @@ pub enum Op {
 
     GetLocal(u16),
     SetLocal(u16),
+    AddLocalInt(u16, i32),
+    SubLocalInt(u16, i32),
+    LtLocalInt(u16, i32),
+    LeLocalInt(u16, i32),
+    AddLocals(u16, u16),
+    SubLocals(u16, u16),
+    LtLocals(u16, u16),
+    IncLocalPop(u16, i32),
     GetUpvalue(u16),
     SetUpvalue(u16),
     CloseUpvalue,
@@ -117,6 +126,9 @@ pub enum Op {
     SetupTry(usize),
     PopTry,
     Throw,
+    PushDefer(u16),
+    EnterSandbox(u16),
+    RunCleanups(u16),
 
     Return,
 }
@@ -294,11 +306,25 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
 
     for (ip, op) in chunk.code.iter().enumerate() {
         match *op {
-            Op::GetLocal(idx) | Op::SetLocal(idx) => {
+            Op::GetLocal(idx)
+            | Op::SetLocal(idx)
+            | Op::AddLocalInt(idx, _)
+            | Op::SubLocalInt(idx, _)
+            | Op::LtLocalInt(idx, _)
+            | Op::LeLocalInt(idx, _)
+            | Op::IncLocalPop(idx, _) => {
                 if idx >= proto.local_count {
                     return Err(format!(
                         "Bytecode verification failed in '{}': local {} out of bounds at ip {}",
                         proto.name, idx, ip
+                    ));
+                }
+            }
+            Op::AddLocals(a, b) | Op::SubLocals(a, b) | Op::LtLocals(a, b) => {
+                if a >= proto.local_count || b >= proto.local_count {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': local ({}, {}) out of bounds at ip {}",
+                        proto.name, a, b, ip
                     ));
                 }
             }

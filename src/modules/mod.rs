@@ -1,22 +1,32 @@
+mod archive;
 mod audio;
 mod base64;
+mod binary;
 mod bytes;
+mod cli;
 mod clipboard;
+mod collections;
+pub(crate) mod compress;
 mod csv;
 mod datetime;
 mod dialog;
+mod diff;
 mod fs;
-mod gfx;
+pub(crate) mod gfx;
 mod glob;
 mod hash;
 mod hex;
+mod html;
 mod http;
 mod ini;
+mod input;
 mod json;
-mod log;
+pub(crate) mod log;
 mod math;
 mod mem;
+mod os;
 mod path;
+mod pprint;
 mod process;
 mod random;
 mod regex;
@@ -25,14 +35,17 @@ mod sys;
 mod term;
 mod test;
 mod time;
+mod toml;
+mod ui;
 mod url;
 mod uuid;
+mod xml;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::value::{NativeFunction, Value};
+use crate::value::{ModuleData, NativeFunction, Value};
 use crate::vm::VM;
 
 pub type NativeFnPtr = fn(&mut VM, &[Value]) -> Result<Value, String>;
@@ -55,14 +68,16 @@ pub fn build_module(
     for (k, v) in consts {
         exports.insert((*k).to_string(), v.clone());
     }
-    Value::Module {
+    Value::Module(Rc::new(ModuleData {
         name: name.to_string(),
         exports: Rc::new(RefCell::new(exports)),
-    }
+    }))
 }
 
 pub fn reset_runtime_state() {
     gfx::reset_state();
+    input::reset_state();
+    ui::reset_state();
 }
 
 pub fn get_builtin_module(name: &str) -> Option<Value> {
@@ -96,6 +111,19 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "regex" => Some(regex::module()),
         "dialog" => Some(dialog::module()),
         "process" => Some(process::module()),
+        "toml" => Some(toml::module()),
+        "binary" => Some(binary::module()),
+        "collections" => Some(collections::module()),
+        "compress" => Some(compress::module()),
+        "archive" => Some(archive::module()),
+        "os" => Some(os::module()),
+        "cli" => Some(cli::module()),
+        "diff" => Some(diff::module()),
+        "pprint" => Some(pprint::module()),
+        "html" => Some(html::module()),
+        "xml" => Some(xml::module()),
+        "input" => Some(input::module()),
+        "ui" => Some(ui::module()),
         _ => None,
     }
 }

@@ -1,0 +1,91 @@
+// Benchmark 04: Visual Software Rasterizer (Weight: 15%)
+// Headless 80x48 RGB pixel-buffer rendering across multiple animation frames (circles, lines, blending).
+
+fn clamp_byte(v) {
+    if v < 0 { 0 } else { if v > 255 { 255 } else { v } }
+}
+
+fn run_visual_bench() {
+    let w = 120;
+    let h = 72;
+    let total_pixels = w * h;
+    let buf_r = [];
+    let buf_g = [];
+    let buf_b = [];
+
+    let init = 0;
+    while init < total_pixels {
+        push(buf_r, 0);
+        push(buf_g, 0);
+        push(buf_b, 0);
+        init = init + 1;
+    }
+
+    let frames = 28;
+    let frame = 0;
+    let pixel_hash = 0;
+
+    while frame < frames {
+        let cx1 = 22 + frame * 3;
+        let cy1 = 24 + ((frame % 4) * 2);
+        let cx2 = 58 - frame * 2;
+        let cy2 = 20 + ((frame % 3) * 3);
+
+        let y = 0;
+        while y < h {
+            let row_off = y * w;
+            let x = 0;
+            while x < w {
+                let bg_r = (x * 3 + frame * 5) % 256;
+                let bg_g = (y * 5 + frame * 3) % 256;
+                let bg_b = 40 + ((x + y) % 120);
+
+                let dx1 = x - cx1;
+                let dy1 = y - cy1;
+                let d1 = dx1 * dx1 + dy1 * dy1;
+                if d1 < 196 {
+                    let shade = 255 - d1;
+                    bg_r = clamp_byte((bg_r + shade) / 2);
+                    bg_g = clamp_byte((bg_g + shade / 3) / 2);
+                }
+
+                let dx2 = x - cx2;
+                let dy2 = y - cy2;
+                let d2 = dx2 * dx2 + dy2 * dy2;
+                if d2 < 144 {
+                    let alpha = 200 - d2;
+                    bg_g = clamp_byte((bg_g + alpha) / 2);
+                    bg_b = clamp_byte((bg_b + 240) / 2);
+                }
+
+                // Checkerboard + diagonal scanline accent
+                if x == y || (x + y == 70) {
+                    bg_r = 255;
+                    bg_g = 255;
+                    bg_b = 255;
+                }
+
+                let idx = row_off + x;
+                buf_r[idx] = bg_r;
+                buf_g[idx] = bg_g;
+                buf_b[idx] = bg_b;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+
+        let k = 0;
+        while k < total_pixels {
+            pixel_hash = (pixel_hash * 31 + buf_r[k] * 3 + buf_g[k] * 5 + buf_b[k] * 7) % 1000000007;
+            k = k + 23;
+        }
+        frame = frame + 1;
+    }
+
+    pixel_hash
+}
+
+let t0 = clock();
+let checksum = run_visual_bench();
+let elapsed = (clock() - t0) * 1000.0;
+println("BENCH_RESULT 04_visual " + str(elapsed) + " " + str(checksum));

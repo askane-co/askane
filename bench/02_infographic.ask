@@ -1,0 +1,71 @@
+// Benchmark 02: Infographic & Data Pipeline (Weight: 15%)
+// Builds synthetic telemetry JSON, parses it, aggregates categories, sorts metrics, renders bars.
+
+import json;
+
+fn make_bar(val, max_val, width) {
+    let filled = (val * width) / max_val;
+    let out = "[";
+    let i = 0;
+    while i < width {
+        if i < filled {
+            out = out + "#";
+        } else {
+            out = out + ".";
+        }
+        i = i + 1;
+    }
+    out + "]"
+}
+
+fn run_infographic_bench() {
+    let cats = ["compute", "io", "network", "render", "script", "cache"];
+    let raw_rows = [];
+    let i = 0;
+    while i < 600 {
+        let c = cats[i % 6];
+        let val = 10 + ((i * 37 + 13) % 90);
+        let ok = (i % 5) != 0;
+        push(raw_rows, #{ cat: c, score: val, ok: ok, rank: i % 11 });
+        i = i + 1;
+    }
+
+    let payload = json.stringify(#{ title: "Askane Metrics", count: len(raw_rows), rows: raw_rows });
+    let totals = #{ compute: 0, io: 0, network: 0, render: 0, script: 0, cache: 0 };
+    let counts = #{ compute: 0, io: 0, network: 0, render: 0, script: 0, cache: 0 };
+    let bars_len = 0;
+
+    let round = 0;
+    while round < 320 {
+        let decoded = json.parse(payload);
+        let rows = decoded.rows;
+        let idx = 0;
+        let n = len(rows);
+        while idx < n {
+            let r = rows[idx];
+            if r.ok {
+                let k = r.cat;
+                totals[k] = (totals[k] + r.score) % 1000000;
+                counts[k] = counts[k] + 1;
+            }
+            idx = idx + 1;
+        }
+        let c_idx = 0;
+        while c_idx < 6 {
+            let cname = cats[c_idx];
+            let avg = (totals[cname] % 100) + 1;
+            let bar = cname + ": " + make_bar(avg, 100, 20) + " " + str(avg);
+            bars_len = bars_len + len(bar);
+            c_idx = c_idx + 1;
+        }
+        round = round + 1;
+    }
+
+    let sum_all = totals.compute + totals.io + totals.network + totals.render + totals.script + totals.cache;
+    sum_all * 100 + bars_len + len(payload)
+}
+
+let t0 = clock();
+let checksum = run_infographic_bench();
+let elapsed = (clock() - t0) * 1000.0;
+println("BENCH_RESULT 02_infographic " + str(elapsed) + " " + str(checksum));

@@ -9,6 +9,8 @@ pub fn module() -> Value {
         "log",
         &[
             ("set_level", log_set_level),
+            ("json", log_set_json),
+            ("format", log_format),
             ("debug", log_debug),
             ("info", log_info),
             ("warn", log_warn),
@@ -21,6 +23,18 @@ pub fn module() -> Value {
 thread_local! {
     // 0=debug, 1=info, 2=warn, 3=error
     static LOG_LEVEL: Cell<u8> = const { Cell::new(1) };
+    static LOG_JSON: Cell<bool> = const { Cell::new(false) };
+}
+
+fn log_set_json(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("log.json() expects 1 boolean argument".to_string());
+    }
+    let Value::Bool(b) = args[0] else {
+        return Err("log.json() expects a bool".to_string());
+    };
+    LOG_JSON.with(|c| c.set(b));
+    Ok(Value::Unit)
 }
 
 fn log_set_level(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -48,7 +62,7 @@ fn log_set_level(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-fn redact_secrets(text: &str) -> String {
+pub(crate) fn redact_secrets(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     let lower = text.to_ascii_lowercase();
@@ -87,16 +101,89 @@ fn redact_secrets(text: &str) -> String {
     out
 }
 
+fn is_secret_field_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("private_key")
+        || lower.contains("auth")
+}
+
+fn format_structured(tag: &str, args: &[Value], as_json: bool) -> String {
+    if args.len() == 2 {
+        if let Value::Dict(fields_rc) = &args[1] {
+            let msg = redact_secrets(&args[0].to_string());
+            let map = fields_rc.borrow();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            if as_json {
+                let mut pairs = Vec::with_capacity(keys.len());
+                for k in keys {
+                    let safe_v = if is_secret_field_key(k) {
+                        "\"[REDACTED]\"".to_string()
+                    } else {
+                        match &map[k] {
+                            Value::Int(i) => i.to_string(),
+                            Value::Float(f) if f.is_finite() => f.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            Value::Unit => "null".to_string(),
+                            other => format!("{:?}", redact_secrets(&other.to_string())),
+                        }
+                    };
+                    pairs.push(format!("{:?}:{}", k, safe_v));
+                }
+                return format!(
+                    "{{\"level\":{:?},\"msg\":{:?},\"fields\":{{{}}}}}",
+                    tag,
+                    msg,
+                    pairs.join(",")
+                );
+            } else {
+                let mut kvs = Vec::with_capacity(keys.len());
+                for k in keys {
+                    let safe_v = if is_secret_field_key(k) {
+                        "[REDACTED]".to_string()
+                    } else {
+                        redact_secrets(&map[k].to_string())
+                    };
+                    kvs.push(format!("{}={}", k, safe_v));
+                }
+                return format!("[{}] {} {}", tag, msg, kvs.join(" "));
+            }
+        }
+    }
+    let parts: Vec<String> = args.iter().map(|v| format!("{}", v)).collect();
+    let msg = redact_secrets(&parts.join(" "));
+    if as_json {
+        format!("{{\"level\":{:?},\"msg\":{:?}}}", tag, msg)
+    } else {
+        format!("[{}] {}", tag, msg)
+    }
+}
+
+fn log_format(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err("log.format() expects (level, msg, fields?)".to_string());
+    }
+    let tag = args[0].to_string().to_ascii_uppercase();
+    let as_json = LOG_JSON.with(|c| c.get());
+    Ok(Value::Str(format_structured(&tag, &args[1..], as_json)))
+}
+
 fn emit_log(level: u8, tag: &str, args: &[Value]) {
     if LOG_LEVEL.with(|c| c.get()) > level {
         return;
     }
-    let parts: Vec<String> = args.iter().map(|v| format!("{}", v)).collect();
-    let msg = redact_secrets(&parts.join(" "));
+    let as_json = LOG_JSON.with(|c| c.get());
+    let line = format_structured(tag, args, as_json);
     if level >= 2 {
-        eprintln!("[{}] {}", tag, msg);
+        eprintln!("{}", line);
     } else {
-        println!("[{}] {}", tag, msg);
+        println!("{}", line);
     }
 }
 

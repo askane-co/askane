@@ -456,6 +456,7 @@ mod win32_gfx {
         pub width: i32,
         pub height: i32,
         pub pixels: Vec<u32>,
+        pub has_alpha: bool,
     }
 
     thread_local! {
@@ -524,6 +525,7 @@ mod win32_gfx {
             width,
             height,
             pixels,
+            has_alpha: false,
         })
     }
 
@@ -990,7 +992,7 @@ fn gfx_circle_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     use std::io::Read;
     if args.len() != 1 {
-        return Err("gfx.load_image() expects 1 string argument (bmp path)".to_string());
+        return Err("gfx.load_image() expects 1 string argument (bmp/png path)".to_string());
     }
     let path = match &args[0] {
         Value::Str(s) => s.as_str(),
@@ -1010,9 +1012,19 @@ fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         .read_to_end(&mut bytes)
         .map_err(|e| format!("gfx.load_image('{}'): {}", path, e))?;
     if bytes.len() > LIMIT {
-        return Err("gfx.load_image(): BMP file exceeds 32 MiB limit".to_string());
+        return Err("gfx.load_image(): image file exceeds 32 MiB limit".to_string());
     }
-    let img = win32_gfx::parse_bmp_safe(&bytes)?;
+    let img = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let (width, height, pixels) = decode_png(&bytes)?;
+        win32_gfx::BmpImage {
+            width,
+            height,
+            pixels,
+            has_alpha: true,
+        }
+    } else {
+        win32_gfx::parse_bmp_safe(&bytes)?
+    };
     let id = win32_gfx::IMAGES.with(|imgs| -> Result<usize, String> {
         let mut list = imgs.borrow_mut();
         if list.len() >= 256 {
@@ -1022,6 +1034,22 @@ fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         Ok(list.len() - 1)
     })?;
     Ok(Value::Int(id as i64))
+}
+
+#[cfg(windows)]
+fn blend_argb(src_argb: u32, dst_rgb: u32) -> u32 {
+    let a = (src_argb >> 24) & 0xFF;
+    let inv = 255 - a;
+    let sr = (src_argb >> 16) & 0xFF;
+    let sg = (src_argb >> 8) & 0xFF;
+    let sb = src_argb & 0xFF;
+    let dr = (dst_rgb >> 16) & 0xFF;
+    let dg = (dst_rgb >> 8) & 0xFF;
+    let db = dst_rgb & 0xFF;
+    let r = (sr * a + dr * inv + 127) / 255;
+    let g = (sg * a + dg * inv + 127) / 255;
+    let b = (sb * a + db * inv + 127) / 255;
+    (r << 16) | (g << 8) | b
 }
 
 #[cfg(windows)]
@@ -1050,10 +1078,23 @@ fn draw_image_impl(img_id: i64, dx: i32, dy: i32, key: Option<u32>) -> Result<()
                         continue;
                     }
                     let color = img.pixels[(sy * img.width + sx) as usize];
-                    if key == Some(color) {
-                        continue;
+                    let dst_idx = (py * state.width + px) as usize;
+                    if img.has_alpha {
+                        let a = (color >> 24) & 0xFF;
+                        if a == 0 || key == Some(color & 0x00FF_FFFF) {
+                            continue;
+                        }
+                        if a == 255 {
+                            state.buffer[dst_idx] = color & 0x00FF_FFFF;
+                        } else {
+                            state.buffer[dst_idx] = blend_argb(color, state.buffer[dst_idx]);
+                        }
+                    } else {
+                        if key == Some(color) {
+                            continue;
+                        }
+                        state.buffer[dst_idx] = color;
                     }
-                    state.buffer[(py * state.width + px) as usize] = color;
                 }
             }
             Ok(())
@@ -1208,3 +1249,276 @@ use unsupported as gfx_image_height;
 use unsupported as gfx_set_title;
 #[cfg(not(windows))]
 use unsupported as gfx_delta;
+
+fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+    let a = a as i32;
+    let b = b as i32;
+    let c = c as i32;
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
+    }
+}
+
+fn unfilter_png_scanlines(
+    raw: &[u8],
+    row_bytes: usize,
+    height: usize,
+    bpp: usize,
+) -> Result<Vec<u8>, String> {
+    let stride = 1 + row_bytes;
+    if raw.len() != stride * height {
+        return Err(format!(
+            "Invalid decompressed PNG size: expected {} bytes, got {}",
+            stride * height,
+            raw.len()
+        ));
+    }
+    let mut out = vec![0u8; row_bytes * height];
+    for y in 0..height {
+        let src_row = &raw[y * stride..(y + 1) * stride];
+        let filter = src_row[0];
+        let src = &src_row[1..];
+        let dst_offset = y * row_bytes;
+        for x in 0..row_bytes {
+            let left = if x >= bpp {
+                out[dst_offset + x - bpp]
+            } else {
+                0
+            };
+            let up = if y > 0 {
+                out[(y - 1) * row_bytes + x]
+            } else {
+                0
+            };
+            let up_left = if y > 0 && x >= bpp {
+                out[(y - 1) * row_bytes + x - bpp]
+            } else {
+                0
+            };
+            let val = match filter {
+                0 => src[x],
+                1 => src[x].wrapping_add(left),
+                2 => src[x].wrapping_add(up),
+                3 => src[x].wrapping_add((((left as u16) + (up as u16)) / 2) as u8),
+                4 => src[x].wrapping_add(paeth_predictor(left, up, up_left)),
+                other => return Err(format!("Unsupported PNG scanline filter: {}", other)),
+            };
+            out[dst_offset + x] = val;
+        }
+    }
+    Ok(out)
+}
+
+fn unpack_png_sub_byte(row: &[u8], x: usize, bit_depth: u8) -> u8 {
+    let bits = bit_depth as usize;
+    let per_byte = 8 / bits;
+    let byte = row[x / per_byte];
+    let shift = 8 - bits * (1 + (x % per_byte));
+    let mask = (1u8 << bits) - 1;
+    (byte >> shift) & mask
+}
+
+pub(crate) fn decode_png(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {
+    const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < 8 || &data[..8] != SIG {
+        return Err("Invalid PNG signature".to_string());
+    }
+    let mut pos = 8usize;
+    let mut saw_ihdr = false;
+    let mut saw_iend = false;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut bit_depth = 0u8;
+    let mut color_type = 0u8;
+    let mut palette: Vec<[u8; 3]> = Vec::new();
+    let mut trns: Vec<u8> = Vec::new();
+    let mut idat = Vec::new();
+
+    while pos + 12 <= data.len() {
+        let len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let ctype = &data[pos + 4..pos + 8];
+        let body_start = pos + 8;
+        let body_end = body_start
+            .checked_add(len)
+            .ok_or_else(|| "PNG chunk size overflow".to_string())?;
+        let crc_end = body_end
+            .checked_add(4)
+            .ok_or_else(|| "PNG chunk CRC overflow".to_string())?;
+        if crc_end > data.len() {
+            return Err("Truncated PNG chunk".to_string());
+        }
+        let body = &data[body_start..body_end];
+        let expected_crc = u32::from_be_bytes([
+            data[body_end],
+            data[body_end + 1],
+            data[body_end + 2],
+            data[body_end + 3],
+        ]);
+        let actual_crc = crate::modules::compress::crc32_bytes(&data[pos + 4..body_end]);
+        if expected_crc != actual_crc {
+            return Err("Corrupt PNG chunk CRC".to_string());
+        }
+
+        match ctype {
+            b"IHDR" => {
+                if saw_ihdr || body.len() != 13 {
+                    return Err("Invalid PNG IHDR chunk".to_string());
+                }
+                saw_ihdr = true;
+                width = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                height = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                bit_depth = body[8];
+                color_type = body[9];
+                if body[10] != 0 || body[11] != 0 {
+                    return Err("Unsupported PNG compression or filter method".to_string());
+                }
+                if body[12] != 0 {
+                    return Err("Interlaced PNG images are not supported".to_string());
+                }
+                if width == 0
+                    || height == 0
+                    || width > 4096
+                    || height > 4096
+                    || (width as u64) * (height as u64) > 16_777_216
+                {
+                    return Err("Invalid or oversized PNG dimensions".to_string());
+                }
+            }
+            b"PLTE" => {
+                if body.len() % 3 != 0 || body.len() > 256 * 3 {
+                    return Err("Invalid PNG PLTE chunk".to_string());
+                }
+                palette.clear();
+                for chunk in body.chunks_exact(3) {
+                    palette.push([chunk[0], chunk[1], chunk[2]]);
+                }
+            }
+            b"tRNS" => {
+                trns = body.to_vec();
+            }
+            b"IDAT" => {
+                if !saw_ihdr {
+                    return Err("PNG IDAT before IHDR".to_string());
+                }
+                if idat.len() + body.len() > 64 * 1024 * 1024 {
+                    return Err("PNG IDAT exceeds 64 MiB limit".to_string());
+                }
+                idat.extend_from_slice(body);
+            }
+            b"IEND" => {
+                saw_iend = true;
+                break;
+            }
+            _ => {}
+        }
+        pos = crc_end;
+    }
+
+    if !saw_ihdr || !saw_iend || idat.is_empty() {
+        return Err("Incomplete PNG stream".to_string());
+    }
+
+    let channels = match color_type {
+        0 => 1usize,
+        2 => 3usize,
+        3 => 1usize,
+        4 => 2usize,
+        6 => 4usize,
+        other => return Err(format!("Unsupported PNG color type: {}", other)),
+    };
+    let valid_depth = match color_type {
+        0 | 3 => matches!(bit_depth, 1 | 2 | 4 | 8),
+        2 | 4 | 6 => bit_depth == 8,
+        _ => false,
+    };
+    if !valid_depth {
+        return Err(format!(
+            "Unsupported PNG bit depth {} for color type {}",
+            bit_depth, color_type
+        ));
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+    let bits_per_pixel = channels * (bit_depth as usize);
+    let row_bytes = (w * bits_per_pixel).div_ceil(8);
+    let bpp = bits_per_pixel.div_ceil(8).max(1);
+    let expected_raw = (1 + row_bytes)
+        .checked_mul(h)
+        .ok_or_else(|| "PNG buffer overflow".to_string())?;
+
+    let raw = crate::modules::compress::inflate_zlib(&idat, expected_raw, None)?;
+    let unfiltered = unfilter_png_scanlines(&raw, row_bytes, h, bpp)?;
+
+    let trns_gray = if color_type == 0 && trns.len() >= 2 {
+        Some(u16::from_be_bytes([trns[0], trns[1]]) as u8)
+    } else {
+        None
+    };
+    let trns_rgb = if color_type == 2 && trns.len() >= 6 {
+        Some([trns[1], trns[3], trns[5]])
+    } else {
+        None
+    };
+
+    let mut pixels = vec![0u32; w * h];
+    for y in 0..h {
+        let row = &unfiltered[y * row_bytes..(y + 1) * row_bytes];
+        for x in 0..w {
+            let (a, r, g, b) = match color_type {
+                0 => {
+                    let gval = if bit_depth == 8 {
+                        row[x]
+                    } else {
+                        let sample = unpack_png_sub_byte(row, x, bit_depth);
+                        let max_v = ((1u16 << bit_depth) - 1) as u16;
+                        ((sample as u16 * 255) / max_v) as u8
+                    };
+                    let a = if trns_gray == Some(gval) { 0 } else { 255 };
+                    (a, gval, gval, gval)
+                }
+                2 => {
+                    let p = x * 3;
+                    let rgb = [row[p], row[p + 1], row[p + 2]];
+                    let a = if trns_rgb == Some(rgb) { 0 } else { 255 };
+                    (a, rgb[0], rgb[1], rgb[2])
+                }
+                3 => {
+                    let idx = if bit_depth == 8 {
+                        row[x] as usize
+                    } else {
+                        unpack_png_sub_byte(row, x, bit_depth) as usize
+                    };
+                    let c = *palette
+                        .get(idx)
+                        .ok_or_else(|| "PNG palette index out of bounds".to_string())?;
+                    let a = *trns.get(idx).unwrap_or(&255);
+                    (a, c[0], c[1], c[2])
+                }
+                4 => {
+                    let p = x * 2;
+                    let gval = row[p];
+                    (row[p + 1], gval, gval, gval)
+                }
+                6 => {
+                    let p = x * 4;
+                    (row[p + 3], row[p], row[p + 1], row[p + 2])
+                }
+                _ => unreachable!(),
+            };
+            pixels[y * w + x] =
+                ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        }
+    }
+
+    Ok((width as i32, height as i32, pixels))
+}

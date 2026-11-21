@@ -1,0 +1,84 @@
+// Benchmark 03: Math & Numerical Compute (Weight: 20%)
+// Sieve of Eratosthenes + trig/float accumulation + integer modular arithmetic.
+
+import math;
+
+fn sieve_count(limit) {
+    let flags = [];
+    let i = 0;
+    while i <= limit {
+        push(flags, true);
+        i = i + 1;
+    }
+    flags[0] = false;
+    flags[1] = false;
+
+    let p = 2;
+    while p * p <= limit {
+        if flags[p] {
+            let m = p * p;
+            while m <= limit {
+                flags[m] = false;
+                m = m + p;
+            }
+        }
+        p = p + 1;
+    }
+
+    let count = 0;
+    let k = 2;
+    while k <= limit {
+        if flags[k] {
+            count = count + 1;
+        }
+        k = k + 1;
+    }
+    count
+}
+
+fn float_series(steps) {
+    let acc = 0.0;
+    let i = 1;
+    while i <= steps {
+        let x = float(i) * 0.001;
+        acc = acc + math.sqrt(x * x + 1.0) + math.sin(x) * math.cos(x);
+        i = i + 1;
+    }
+    int(acc * 100.0)
+}
+
+fn mod_pow(base, exp, modulus) {
+    let res = 1;
+    let b = base % modulus;
+    let e = exp;
+    while e > 0 {
+        if e % 2 == 1 {
+            res = (res * b) % modulus;
+        }
+        b = (b * b) % modulus;
+        e = e / 2;
+    }
+    res
+}
+
+fn run_math_bench() {
+    let primes = 0;
+    let r = 0;
+    while r < 24 {
+        primes = primes + sieve_count(18000);
+        r = r + 1;
+    }
+    let trig = float_series(60000);
+    let mod_acc = 0;
+    let j = 1;
+    while j <= 20000 {
+        mod_acc = (mod_acc + mod_pow(j + 7, (j % 31) + 5, 1000000007)) % 1000000007;
+        j = j + 1;
+    }
+    primes + (trig % 100000) + (mod_acc % 100000)
+}
+
+let t0 = clock();
+let checksum = run_math_bench();
+let elapsed = (clock() - t0) * 1000.0;
+println("BENCH_RESULT 03_math " + str(elapsed) + " " + str(checksum));

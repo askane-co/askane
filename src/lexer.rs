@@ -13,6 +13,8 @@ pub enum TokenKind {
     InterpStart(String),
     InterpMid(String),
     InterpEnd(String),
+    TaggedTemplate(String),
+    DebugEq(String),
     Bool(bool),
     Ident(String),
 
@@ -36,6 +38,7 @@ pub enum TokenKind {
     Try,
     Catch,
     Throw,
+    Recover,
     Unit,
 
     LParen,
@@ -73,6 +76,9 @@ pub enum TokenKind {
     Bang,
     Bar,
     Pipe,
+    PipeSafe,
+    PipeMap,
+    PipeAssign,
     DoubleQuestion,
     QuestionDot,
     FatArrow,
@@ -91,7 +97,7 @@ pub struct Lexer {
     pos: usize,
     line: usize,
     col: usize,
-    interp_braces: Vec<usize>,
+    interp_braces: Vec<(usize, usize)>,
 }
 
 impl Lexer {
@@ -180,7 +186,20 @@ impl Lexer {
             }
 
             if ch.is_ascii_alphabetic() || ch == '_' {
-                tokens.push(self.lex_ident_or_keyword(span));
+                let tok = self.lex_ident_or_keyword(span);
+                if let TokenKind::Ident(tag) = &tok.kind {
+                    if self.peek() == Some('"')
+                        && !(self.peek_next() == Some('"')
+                            && self.chars.get(self.pos + 2) == Some(&'"'))
+                    {
+                        tokens.push(Token {
+                            kind: TokenKind::TaggedTemplate(tag.clone()),
+                            span,
+                        });
+                        continue;
+                    }
+                }
+                tokens.push(tok);
                 continue;
             }
 
@@ -210,20 +229,41 @@ impl Lexer {
                 }
                 '{' => {
                     self.advance();
-                    if let Some(depth) = self.interp_braces.last_mut() {
-                        *depth += 1;
+                    if let Some(pair) = self.interp_braces.last_mut() {
+                        pair.0 += 1;
                     }
                     TokenKind::LBrace
                 }
                 '}' => {
+                    let brace_pos = self.pos;
                     self.advance();
-                    if let Some(&depth) = self.interp_braces.last() {
+                    if let Some(&(depth, expr_start)) = self.interp_braces.last() {
                         if depth == 0 {
                             self.interp_braces.pop();
+                            if tokens
+                                .last()
+                                .is_some_and(|t| matches!(t.kind, TokenKind::Assign))
+                            {
+                                tokens.pop();
+                                let mut eq_pos = brace_pos;
+                                while eq_pos > expr_start && self.chars[eq_pos - 1].is_whitespace()
+                                {
+                                    eq_pos -= 1;
+                                }
+                                if eq_pos > expr_start && self.chars[eq_pos - 1] == '=' {
+                                    eq_pos -= 1;
+                                }
+                                let raw_label: String =
+                                    self.chars[expr_start..eq_pos].iter().collect();
+                                tokens.push(Token {
+                                    kind: TokenKind::DebugEq(raw_label.trim().to_string()),
+                                    span,
+                                });
+                            }
                             tokens.push(self.lex_string_part(span, true)?);
                             continue;
-                        } else if let Some(d) = self.interp_braces.last_mut() {
-                            *d -= 1;
+                        } else if let Some(pair) = self.interp_braces.last_mut() {
+                            pair.0 -= 1;
                         }
                     }
                     TokenKind::RBrace
@@ -364,7 +404,20 @@ impl Lexer {
                         TokenKind::Or
                     } else if self.peek() == Some('>') {
                         self.advance();
-                        TokenKind::Pipe
+                        if self.peek() == Some('=') {
+                            self.advance();
+                            TokenKind::PipeAssign
+                        } else {
+                            TokenKind::Pipe
+                        }
+                    } else if self.peek() == Some('?') && self.peek_next() == Some('>') {
+                        self.advance();
+                        self.advance();
+                        TokenKind::PipeSafe
+                    } else if self.peek() == Some('*') && self.peek_next() == Some('>') {
+                        self.advance();
+                        self.advance();
+                        TokenKind::PipeMap
                     } else {
                         TokenKind::Bar
                     }
@@ -423,7 +476,55 @@ impl Lexer {
             }
         }
 
-        let kind = if is_float {
+        let dur_factor = match (
+            self.peek(),
+            self.peek_next(),
+            self.chars.get(self.pos + 2).copied(),
+        ) {
+            (Some('m'), Some('s'), next)
+                if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                self.advance();
+                self.advance();
+                Some(1.0_f64)
+            }
+            (Some('s'), next, _)
+                if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                self.advance();
+                Some(1_000.0_f64)
+            }
+            (Some('m'), next, _)
+                if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                self.advance();
+                Some(60_000.0_f64)
+            }
+            (Some('h'), next, _)
+                if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                self.advance();
+                Some(3_600_000.0_f64)
+            }
+            _ => None,
+        };
+
+        let kind = if let Some(factor) = dur_factor {
+            let base: f64 = raw.parse().map_err(|_| {
+                format!(
+                    "[{}:{}] Invalid duration literal '{}'",
+                    span.line, span.col, raw
+                )
+            })?;
+            let ms = (base * factor).round();
+            if !ms.is_finite() || ms < 0.0 || ms > (i64::MAX as f64) {
+                return Err(format!(
+                    "[{}:{}] Duration literal out of range",
+                    span.line, span.col
+                ));
+            }
+            TokenKind::Int(ms as i64)
+        } else if is_float {
             let val: f64 = raw.parse().map_err(|_| {
                 format!(
                     "[{}:{}] Invalid float literal '{}'",
@@ -476,6 +577,7 @@ impl Lexer {
             "try" => TokenKind::Try,
             "catch" => TokenKind::Catch,
             "throw" => TokenKind::Throw,
+            "recover" => TokenKind::Recover,
             "true" => TokenKind::Bool(true),
             "false" => TokenKind::Bool(false),
             "unit" => TokenKind::Unit,
@@ -503,7 +605,7 @@ impl Lexer {
             if c == '$' && self.peek_next() == Some('{') {
                 self.advance();
                 self.advance();
-                self.interp_braces.push(0);
+                self.interp_braces.push((0, self.pos));
                 return Ok(Token {
                     kind: if in_interp {
                         TokenKind::InterpMid(out)

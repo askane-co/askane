@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.15.0";
+const VERSION: &str = "0.16.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -38,7 +38,10 @@ pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String,
     Ok(text)
 }
 
-fn compile_source(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, String> {
+fn compile_source_mode(
+    source: &str,
+    include_specs: bool,
+) -> Result<std::rc::Rc<bytecode::FunctionProto>, String> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err("Source size limit exceeded".to_string());
     }
@@ -46,7 +49,19 @@ fn compile_source(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, 
     let tokens = lexer.tokenize()?;
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
-    Compiler::compile(&program)
+    if include_specs {
+        Compiler::compile_with_specs(&program)
+    } else {
+        Compiler::compile(&program)
+    }
+}
+
+fn compile_source(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, String> {
+    compile_source_mode(source, false)
+}
+
+fn compile_source_with_specs(source: &str) -> Result<std::rc::Rc<bytecode::FunctionProto>, String> {
+    compile_source_mode(source, true)
 }
 
 fn format_error_with_source(source: &str, err: &str) -> String {
@@ -79,6 +94,7 @@ fn format_error_with_source(source: &str, err: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn run_file_with_root(
     path: &str,
     dump_bytecode: bool,
@@ -120,9 +136,32 @@ fn run_file_with_options(
     permissions: Permissions,
     sandbox_root_override: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    run_file_core(
+        path,
+        dump_bytecode,
+        profile,
+        false,
+        permissions,
+        sandbox_root_override,
+    )
+}
+
+fn run_file_core(
+    path: &str,
+    dump_bytecode: bool,
+    profile: bool,
+    include_specs: bool,
+    permissions: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+) -> Result<(), String> {
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
-    let proto = compile_source(&source).map_err(|e| format_error_with_source(&source, &e))?;
+    let proto = if include_specs {
+        compile_source_with_specs(&source)
+    } else {
+        compile_source(&source)
+    }
+    .map_err(|e| format_error_with_source(&source, &e))?;
     if dump_bytecode {
         print!("{}", proto.chunk.disassemble(&proto.name));
         return Ok(());
@@ -150,6 +189,21 @@ fn run_file_with_options(
         vm.run(proto)
     };
     run_result.map_err(|e| format_error_with_source(&source, &e))?;
+    if include_specs && !vm.spec_results().is_empty() {
+        let mut failed_specs = 0usize;
+        for (name, res) in vm.spec_results() {
+            match res {
+                Ok(()) => println!("  spec \"{}\" ... ok", name),
+                Err(e) => {
+                    eprintln!("  spec \"{}\" ... FAIL: {}", name, e);
+                    failed_specs += 1;
+                }
+            }
+        }
+        if failed_specs > 0 {
+            return Err(format!("{} spec(s) failed", failed_specs));
+        }
+    }
     if profile {
         print_profile_report(&vm);
     }
@@ -383,6 +437,48 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
         ast::Expr::GetAttr { object, .. } | ast::Expr::OptGetAttr { object, .. } => {
             collect_imports_expr(object, imports);
         }
+        ast::Expr::SafePipe(p) => {
+            collect_imports_expr(&p.left, imports);
+            collect_imports_expr(&p.apply, imports);
+        }
+        ast::Expr::MapPipe { left, mapper, .. } => {
+            collect_imports_expr(left, imports);
+            collect_imports_expr(mapper, imports);
+        }
+        ast::Expr::PipeAssign(p) => {
+            match p.target.as_ref() {
+                ast::AssignTarget::Var(_) => {}
+                ast::AssignTarget::Index { object, index } => {
+                    collect_imports_expr(object, imports);
+                    collect_imports_expr(index, imports);
+                }
+                ast::AssignTarget::Attr { object, .. } => {
+                    collect_imports_expr(object, imports);
+                }
+            }
+            for st in &p.stages {
+                collect_imports_expr(st, imports);
+            }
+        }
+        ast::Expr::TaggedTemplate(t) => {
+            for e in &t.exprs {
+                collect_imports_expr(e, imports);
+            }
+        }
+        ast::Expr::With(w) => {
+            collect_imports_expr(&w.resource, imports);
+            collect_imports_expr(&w.body, imports);
+        }
+        ast::Expr::Sandbox(s) => {
+            for (_, v) in &s.policy {
+                collect_imports_expr(v, imports);
+            }
+            collect_imports_expr(&s.body, imports);
+        }
+        ast::Expr::After { delay, body, .. } => {
+            collect_imports_expr(delay, imports);
+            collect_imports_expr(body, imports);
+        }
     }
 }
 
@@ -434,7 +530,17 @@ fn collect_imports_stmt(stmt: &ast::Stmt, imports: &mut Vec<ast::ImportSource>) 
                 collect_imports_expr(v, imports);
             }
         }
-        ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
+        ast::Stmt::Break(_) | ast::Stmt::Continue(_) | ast::Stmt::Needs { .. } => {}
+        ast::Stmt::Defer { body, .. } => {
+            collect_imports_expr(body, imports);
+        }
+        ast::Stmt::Every { interval, body, .. } => {
+            collect_imports_expr(interval, imports);
+            collect_imports_expr(body, imports);
+        }
+        ast::Stmt::Spec { body, .. } => {
+            collect_imports_expr(body, imports);
+        }
         ast::Stmt::Expr(e) => {
             collect_imports_expr(e, imports);
         }
@@ -470,6 +576,16 @@ fn inspect_permissions_file(
 
     let mut imports = Vec::new();
     for stmt in &program.stmts {
+        if let ast::Stmt::Needs { caps, .. } = stmt {
+            for (name, args) in caps {
+                let label = if args.is_empty() {
+                    format!("needs: {}", name)
+                } else {
+                    format!("needs: {}({})", name, args.join(", "))
+                };
+                push_unique(capabilities, label);
+            }
+        }
         collect_imports_stmt(stmt, &mut imports);
     }
     if let Some(tail) = &program.tail {
@@ -483,13 +599,23 @@ fn inspect_permissions_file(
                     "fs" => Some(
                         "fs (sandboxed to script dir; --allow-read / --allow-write for external dirs)",
                     ),
+                    "archive" => Some(
+                        "archive (ZIP read/write, sandboxed to script dir; --allow-read / --allow-write)",
+                    ),
                     "http" => Some("http (blocked by default; requires --allow-net[=host])"),
                     "sys" => {
                         Some("sys (sys.env requires --allow-env, sys.args requires --allow-args)")
                     }
+                    "os" => Some(
+                        "os (os.env requires --allow-env, os.args requires --allow-args, os.cwd/dirs require read)",
+                    ),
                     "clipboard" => {
                         Some("clipboard (blocked by default; requires --allow-clipboard)")
                     }
+                    "input" => {
+                        Some("input (global key/mouse state requires --allow-input or --unsafe)")
+                    }
+                    "ui" => Some("ui (declarative 2D Win32 GUI window & widgets)"),
                     "process" => Some("process (blocked by default; requires --allow-exec[=cmd])"),
                     "dialog" => Some("dialog (Win32 modal message/file dialogs)"),
                     "audio" => Some("audio (Win32 WAV playback, sandbox-checked)"),
@@ -629,7 +755,14 @@ fn run_tests_cmd(
     let mut failed = 0usize;
     for file in &files {
         let label = file.display().to_string();
-        match run_file_with_root(&label, false, perms.clone(), sandbox_root_override) {
+        match run_file_core(
+            &label,
+            false,
+            false,
+            true,
+            perms.clone(),
+            sandbox_root_override,
+        ) {
             Ok(()) => {
                 println!("PASS {}", label);
                 passed += 1;
@@ -1139,6 +1272,7 @@ fn print_help() {
     println!("  --allow-env[=vars]           Allow sys.env() (optionally comma-separated names)");
     println!("  --allow-args                 Allow sys.args()");
     println!("  --allow-clipboard            Allow clipboard.get_text() / set_text()");
+    println!("  --allow-input                Allow global keyboard/mouse state in input module");
     println!(
         "  --allow-exec[=cmds]          Allow process.run() (optionally comma-separated commands)"
     );
@@ -1227,14 +1361,119 @@ struct FmtTok {
 fn is_fmt_keyword_unary_lhs(w: &str) -> bool {
     matches!(
         w,
-        "return" | "throw" | "in" | "if" | "while" | "match" | "else" | "catch" | "not"
+        "return"
+            | "throw"
+            | "in"
+            | "if"
+            | "while"
+            | "match"
+            | "else"
+            | "catch"
+            | "not"
+            | "recover"
+            | "after"
+            | "every"
+            | "with"
     )
 }
 
 fn is_fmt_space_before_lparen(w: &str) -> bool {
     matches!(
         w,
-        "if" | "while" | "match" | "return" | "throw" | "in" | "else" | "for"
+        "if" | "while"
+            | "match"
+            | "return"
+            | "throw"
+            | "in"
+            | "else"
+            | "for"
+            | "recover"
+            | "after"
+            | "every"
+            | "with"
+    )
+}
+
+fn scan_interp_str_end(chars: &[char], open_quote: usize) -> usize {
+    let mut i = open_quote + 1;
+    let mut esc = false;
+    let mut interp: Vec<usize> = Vec::new();
+    while i < chars.len() {
+        let ch = chars[i];
+        if !interp.is_empty() {
+            if ch == '"' {
+                i += 1;
+                let mut s_esc = false;
+                while i < chars.len() {
+                    let sc = chars[i];
+                    i += 1;
+                    if s_esc {
+                        s_esc = false;
+                    } else if sc == '\\' {
+                        s_esc = true;
+                    } else if sc == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if ch == '{' {
+                *interp.last_mut().unwrap() += 1;
+            } else if ch == '}' {
+                if *interp.last().unwrap() == 0 {
+                    interp.pop();
+                } else {
+                    *interp.last_mut().unwrap() -= 1;
+                }
+            }
+            i += 1;
+        } else if esc {
+            esc = false;
+            i += 1;
+        } else if ch == '\\' {
+            esc = true;
+            i += 1;
+        } else if ch == '$' && chars.get(i + 1).copied() == Some('{') {
+            interp.push(0);
+            i += 2;
+        } else if ch == '"' {
+            i += 1;
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn is_fmt_non_tag_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "let"
+            | "fn"
+            | "struct"
+            | "if"
+            | "else"
+            | "match"
+            | "while"
+            | "loop"
+            | "for"
+            | "in"
+            | "import"
+            | "from"
+            | "pub"
+            | "as"
+            | "return"
+            | "break"
+            | "continue"
+            | "try"
+            | "catch"
+            | "throw"
+            | "recover"
+            | "true"
+            | "false"
+            | "unit"
+            | "spec"
     )
 }
 
@@ -1338,54 +1577,7 @@ fn format_line_tokens(line: &str) -> Vec<FmtTok> {
                 });
             } else {
                 let start = i;
-                i += 1;
-                let mut esc = false;
-                let mut interp: Vec<usize> = Vec::new();
-                while i < chars.len() {
-                    let ch = chars[i];
-                    if !interp.is_empty() {
-                        if ch == '"' {
-                            i += 1;
-                            let mut s_esc = false;
-                            while i < chars.len() {
-                                let sc = chars[i];
-                                i += 1;
-                                if s_esc {
-                                    s_esc = false;
-                                } else if sc == '\\' {
-                                    s_esc = true;
-                                } else if sc == '"' {
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
-                        if ch == '{' {
-                            *interp.last_mut().unwrap() += 1;
-                        } else if ch == '}' {
-                            if *interp.last().unwrap() == 0 {
-                                interp.pop();
-                            } else {
-                                *interp.last_mut().unwrap() -= 1;
-                            }
-                        }
-                        i += 1;
-                    } else if esc {
-                        esc = false;
-                        i += 1;
-                    } else if ch == '\\' {
-                        esc = true;
-                        i += 1;
-                    } else if ch == '$' && chars.get(i + 1).copied() == Some('{') {
-                        interp.push(0);
-                        i += 2;
-                    } else if ch == '"' {
-                        i += 1;
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
+                i = scan_interp_str_end(&chars, i);
                 toks.push(FmtTok {
                     text: chars[start..i].iter().collect(),
                     kind: FmtTokKind::Str,
@@ -1404,8 +1596,21 @@ fn format_line_tokens(line: &str) -> Vec<FmtTok> {
             {
                 i += 1;
             }
+            let word: String = chars[start..i].iter().collect();
+            if !chars[start].is_ascii_digit()
+                && !is_fmt_non_tag_keyword(&word)
+                && chars.get(i).copied() == Some('"')
+                && chars.get(i + 1..i + 3) != Some(&['"', '"'])
+            {
+                i = scan_interp_str_end(&chars, i);
+                toks.push(FmtTok {
+                    text: chars[start..i].iter().collect(),
+                    kind: FmtTokKind::Str,
+                });
+                continue;
+            }
             toks.push(FmtTok {
-                text: chars[start..i].iter().collect(),
+                text: word,
                 kind: FmtTokKind::Word,
             });
             continue;
@@ -1415,6 +1620,14 @@ fn format_line_tokens(line: &str) -> Vec<FmtTok> {
             toks.push(FmtTok {
                 text: "..=".to_string(),
                 kind: FmtTokKind::Range,
+            });
+            i += 3;
+            continue;
+        }
+        if matches!(rest.as_str(), "|?>" | "|*>" | "|>=") {
+            toks.push(FmtTok {
+                text: rest,
+                kind: FmtTokKind::BinOp,
             });
             i += 3;
             continue;
@@ -1876,6 +2089,8 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
             perms.allow_sys_args = true;
         } else if arg == "--allow-clipboard" {
             perms.allow_clipboard = true;
+        } else if arg == "--allow-input" {
+            perms.allow_input = true;
         } else if arg == "--allow-exec" {
             append_csv(&mut perms.allow_exec, None);
         } else if let Some(val) = arg.strip_prefix("--allow-exec=") {
@@ -4511,5 +4726,701 @@ test.assert_eq(models.Point(5, 6).y, 6);
         assert!(run_fmt(&bad_fmt_path.display().to_string(), false).is_err());
         assert_eq!(fs::read_to_string(&bad_fmt_path).unwrap(), "let broken = ;");
         let _ = fs::remove_file(&bad_fmt_path);
+    }
+
+    #[test]
+    fn test_v016_stage2_pipelines_recover_and_templates() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let code = r#"
+import strings;
+import log;
+
+let hits = 0;
+fn bump(v) { hits = hits + 1; v }
+fn pair_sum(a, b) { a * 10 + b }
+
+// 1. Placeholder '_' (single and repeated without double-evaluation)
+let replaced = "banana" |> strings.replace(_, "a", "o");
+let paired = bump(3) |> pair_sum(_, _);
+
+// 2. Unit-safe pipeline '|?>'
+let boom = 0;
+fn fail_if_called(x) { boom = boom + 1; x + 1 }
+let u1 = unit |?> fail_if_called;
+let u2 = 41 |?> (|n| n + 1);
+let u3 = "  hi  " |?> strings.trim |?> strings.upper;
+
+// 3. Elementwise pipeline '|*>'
+let scaled = [1, 2, 3, 4] |*> (|n| n * 10);
+let cleaned = [" a ", " b "] |*> strings.replace(_, " ", "");
+
+// 4. In-place pipeline assignment '|>= '
+let items = [3, 1, 2, 2, 3];
+items |>= sort |>= unique;
+let d = #{ text: "  ok  " };
+d.text |>= strings.trim |>= strings.upper;
+
+// 5. Inline recover expression
+let r1 = (10 / 0) recover err => "caught:" + err;
+let r2 = ("ok" |> strings.upper) recover => "fallback";
+let r3 = (throw "oops") recover => 99;
+
+// 6. Debug interpolation ${expr=}
+let x = 42;
+let a = 5;
+let dbg = "${x=} and ${a + 2=}";
+
+// 7. Tagged templates (log, sql, custom)
+let api_key = "sk-live-secret-999";
+let user = "alice";
+let log_msg = log"Connecting ${user} with ${api_key} token=abc123";
+let q = sql"SELECT * FROM users WHERE name = ${user} AND x = ${x}";
+fn html_tag(parts, vals) {
+    let out = parts[0];
+    for i in range(0, len(vals)) {
+        out = out + "[" + str(vals[i]) + "]" + parts[i + 1];
+    }
+    out
+}
+let custom = html_tag"<p>${user}:${x}</p>";
+
+#{
+    replaced: replaced,
+    paired: paired,
+    hits: hits,
+    u1: u1,
+    u2: u2,
+    u3: u3,
+    boom: boom,
+    scaled: scaled,
+    cleaned: cleaned,
+    items: items,
+    d_text: d.text,
+    r1_ok: strings.contains(r1, "Division by zero"),
+    r2: r2,
+    r3: r3,
+    dbg: dbg,
+    log_msg: log_msg,
+    sql_query: q.query,
+    sql_params: q.params,
+    custom: custom,
+}
+"#;
+        let val = VM::new().run(compile_source(code).unwrap()).unwrap();
+        let Value::Dict(map_rc) = val else {
+            panic!("expected dict");
+        };
+        let map = map_rc.borrow();
+        assert!(map["replaced"].equals(&Value::Str("bonono".to_string())));
+        assert!(map["paired"].equals(&Value::Int(33)));
+        assert!(map["hits"].equals(&Value::Int(1)));
+        assert!(map["u1"].equals(&Value::Unit));
+        assert!(map["u2"].equals(&Value::Int(42)));
+        assert!(map["u3"].equals(&Value::Str("HI".to_string())));
+        assert!(map["boom"].equals(&Value::Int(0)));
+        assert!(map["scaled"].equals(&Value::List(Rc::new(RefCell::new(vec![
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(30),
+            Value::Int(40),
+        ])))));
+        assert!(
+            map["cleaned"].equals(&Value::List(Rc::new(RefCell::new(vec![
+                Value::Str("a".to_string()),
+                Value::Str("b".to_string()),
+            ]))))
+        );
+        assert!(map["items"].equals(&Value::List(Rc::new(RefCell::new(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+        ])))));
+        assert!(map["d_text"].equals(&Value::Str("OK".to_string())));
+        assert!(map["r1_ok"].equals(&Value::Bool(true)));
+        assert!(map["r2"].equals(&Value::Str("OK".to_string())));
+        assert!(map["r3"].equals(&Value::Int(99)));
+        assert!(map["dbg"].equals(&Value::Str("x=42 and a + 2=7".to_string())));
+        let Value::Str(lmsg) = &map["log_msg"] else {
+            panic!("expected log string");
+        };
+        assert!(!lmsg.contains("sk-live-secret-999"));
+        assert!(!lmsg.contains("abc123"));
+        assert!(lmsg.contains("alice"));
+        assert!(lmsg.contains("[REDACTED]"));
+        assert!(map["sql_query"].equals(&Value::Str(
+            "SELECT * FROM users WHERE name = ? AND x = ?".to_string()
+        )));
+        assert!(
+            map["sql_params"].equals(&Value::List(Rc::new(RefCell::new(vec![
+                Value::Str("alice".to_string()),
+                Value::Int(42),
+            ]))))
+        );
+        assert!(map["custom"].equals(&Value::Str("<p>[alice]:[42]</p>".to_string())));
+    }
+
+    #[test]
+    fn test_v016_stage3_contracts_sandbox_defer_with_and_time() {
+        let needs_net = r#"
+needs net("api.example.com");
+42
+"#;
+        let err = VM::new()
+            .run(compile_source(needs_net).unwrap())
+            .unwrap_err();
+        assert!(err.contains("Contract failed"), "got: {err}");
+
+        let mut perms = Permissions::sandboxed();
+        perms.allow_net = Some(vec!["api.example.com".to_string()]);
+        let mut net_vm = VM::new();
+        net_vm.set_permissions(perms);
+        assert!(
+            net_vm
+                .run(compile_source(needs_net).unwrap())
+                .unwrap()
+                .equals(&Value::Int(42))
+        );
+
+        let sandbox_src = r#"
+import fs;
+let denied = false;
+(sandbox { fs.read("Cargo.toml") }) recover err => {
+    denied = true;
+    ""
+};
+let can_after = sandbox { 10 + 5 };
+let restored = fs.exists("Cargo.toml");
+#{
+    denied: denied,
+    can_after: can_after,
+    restored: restored,
+}
+"#;
+        let sb_val = VM::new_with_sandbox(false)
+            .run(compile_source(sandbox_src).unwrap())
+            .unwrap();
+        let Value::Dict(sb_rc) = sb_val else {
+            panic!("expected dict");
+        };
+        let sb = sb_rc.borrow();
+        assert!(sb["denied"].equals(&Value::Bool(true)));
+        assert!(sb["can_after"].equals(&Value::Int(15)));
+        assert!(sb["restored"].equals(&Value::Bool(true)));
+
+        let esc_err = VM::new()
+            .run(compile_source("sandbox(net: true) { 1 }").unwrap())
+            .unwrap_err();
+        assert!(esc_err.contains("escalate"), "got: {esc_err}");
+
+        let core_src = r#"
+let events = [];
+
+fn test_return_defer() {
+    let x = 10;
+    defer { events.push("d1"); x = 99; };
+    defer { events.push("d2"); };
+    return x;
+}
+let ret_v = test_return_defer();
+
+for i in range(0, 2) {
+    defer { events.push("loop_" + str(i)); };
+    if i == 0 { continue; }
+    break;
+}
+
+(try {
+    defer { events.push("try_defer"); };
+    throw "boom";
+} catch e {
+    events.push("caught:" + e);
+});
+
+struct Handle {
+    id,
+    fn close(self) {
+        events.push("closed:" + str(self.id));
+    }
+}
+
+let w1 = with Handle { id: 7 } as h {
+    events.push("use:" + str(h.id));
+    "ok"
+};
+
+let w2 = (with Handle { id: 8 } as h2 {
+    events.push("fail:" + str(h2.id));
+    throw "bad"
+}) recover => "rec";
+
+let d_sum = 10ms + 1.5s + 1m;
+let ticks = 0;
+every 1ms {
+    ticks = ticks + 1;
+    if ticks >= 3 { break; }
+}
+let after_v = after 2ms { ticks + 100 };
+
+#{
+    ret_v: ret_v,
+    events: events,
+    w1: w1,
+    w2: w2,
+    d_sum: d_sum,
+    ticks: ticks,
+    after_v: after_v,
+}
+"#;
+        let core_val = VM::new().run(compile_source(core_src).unwrap()).unwrap();
+        let Value::Dict(c_rc) = core_val else {
+            panic!("expected dict");
+        };
+        let c = c_rc.borrow();
+        assert!(c["ret_v"].equals(&Value::Int(10)));
+        assert!(c["w1"].equals(&Value::Str("ok".to_string())));
+        assert!(c["w2"].equals(&Value::Str("rec".to_string())));
+        assert!(c["d_sum"].equals(&Value::Int(61_510)));
+        assert!(c["ticks"].equals(&Value::Int(3)));
+        assert!(c["after_v"].equals(&Value::Int(103)));
+
+        let expected_events = [
+            "d2",
+            "d1",
+            "loop_0",
+            "loop_1",
+            "try_defer",
+            "caught:boom",
+            "use:7",
+            "closed:7",
+            "fail:8",
+            "closed:8",
+        ];
+        let Value::List(ev_rc) = &c["events"] else {
+            panic!("expected list");
+        };
+        let ev: Vec<String> = ev_rc.borrow().iter().map(|v| v.to_string()).collect();
+        assert_eq!(ev, expected_events);
+    }
+
+    #[test]
+    fn test_v016_stage4_spec_and_fmt() {
+        let src_with_specs = r#"
+import test;
+fn add(a, b) { a + b }
+
+let ran_in_normal = false;
+spec "ok spec" {
+    ran_in_normal = true;
+    test.assert_eq(add(2, 3), 5);
+}
+spec "failing spec" {
+    test.assert_eq(add(1, 1), 3);
+}
+ran_in_normal
+"#;
+        // Normal compilation skips spec blocks completely
+        let normal_val = VM::new()
+            .run(compile_source(src_with_specs).unwrap())
+            .unwrap();
+        assert!(normal_val.equals(&Value::Bool(false)));
+
+        // Test compilation executes all spec blocks and captures individual results
+        let mut test_vm = VM::new();
+        test_vm
+            .run(compile_source_with_specs(src_with_specs).unwrap())
+            .unwrap();
+        let results = test_vm.spec_results();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "ok spec");
+        assert!(results[0].1.is_ok());
+        assert_eq!(results[1].0, "failing spec");
+        assert!(results[1].1.is_err());
+
+        // Formatter handles 0.16 operators and tagged templates idempotently
+        let fmt_corpus = [
+            (
+                "let a=x|?>foo|*>bar;\nitems|>=sort|>=unique;\n",
+                "let a = x |?> foo |*> bar;\nitems |>= sort |>= unique;\n",
+            ),
+            (
+                "let s=log\"user=${name}\";\nlet q=sql\"select ${x=}\";\n",
+                "let s = log\"user=${name}\";\nlet q = sql\"select ${x=}\";\n",
+            ),
+            (
+                "spec \"works\" {\nassert_eq(1+2,3);\n}\n",
+                "spec \"works\" {\n    assert_eq(1 + 2, 3);\n}\n",
+            ),
+        ];
+        for (raw, expected) in fmt_corpus {
+            let out = format_askane_source(raw);
+            assert_eq!(out, expected);
+            assert_eq!(format_askane_source(&out), expected);
+            verify_askane_syntax(&out).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_v016_stage5_stdlib_modules() {
+        let dir = std::env::temp_dir().join(format!("askane_v016_s5_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src = r#"
+import toml;
+import binary;
+import collections;
+import compress;
+import archive;
+import os;
+import cli;
+import diff;
+import pprint;
+import html;
+import xml;
+import log;
+
+// 1. toml
+let parsed_toml = toml.parse("
+title = \"Askane\" # comment
+[server]
+port = 8080
+tls = true
+hosts = [\"a\", \"b\"]
+");
+let toml_round = toml.parse(toml.stringify(parsed_toml));
+
+// 2. binary
+let packed = binary.pack("<HI", [513, 123456]);
+let unpacked = binary.unpack("<HI", packed);
+let be_u32 = binary.read_u32_be(binary.write_u32_be(305419896), 0);
+
+// 3. collections
+let dq = collections.deque([2, 3]);
+dq.push_front(1);
+dq.push_back(4);
+let dq_front = dq.pop_front();
+let dq_list = dq.to_list();
+let cnt = collections.counter(["a", "b", "a", "c", "a", "b"]);
+let pq = collections.priority_queue();
+pq.push(10, "low");
+pq.push(1, "high");
+pq.push(5, "mid");
+let pq_first = pq.pop();
+let grp = collections.groupby([1, 2, 3, 4], fn(x) { x % 2 });
+let win = collections.window([10, 20, 30, 40], 2);
+
+// 4. compress (deflate, zlib, gzip, crc32, adler32)
+let payload = b"askane compress test askane compress test askane compress test!";
+let z = compress.zlib_compress(payload);
+let z_ok = compress.zlib_decompress(z) == payload;
+let g = compress.gzip_compress(payload);
+let g_ok = compress.gzip_decompress(g) == payload;
+let raw_c = compress.deflate(payload);
+let raw_ok = compress.inflate(raw_c) == payload;
+let crc_ok = compress.crc32(b"123456789") == 3421780262;
+let adler_ok = compress.adler32(b"Wikipedia") == 300286872;
+
+// 5. archive pack / list / read_entry + filesystem create/extract
+let zip_bytes = archive.pack(#{
+    "hello.txt": "world!",
+    "sub/data.bin": b"\x01\x02\x03",
+});
+let zip_entries = archive.list(zip_bytes);
+let zip_text = archive.read_entry(zip_bytes, "hello.txt");
+archive.create("bundle.zip", #{ "a.txt": "alpha", "dir/b.txt": "beta" });
+archive.extract("bundle.zip", "extracted");
+import fs;
+let ext_a = fs.read("extracted/a.txt");
+let ext_b = fs.read("extracted/dir/b.txt");
+
+// 6. os, cli, diff, pprint, html, xml, log
+let fam_ok = os.family() == "windows" || os.family() == "unix";
+let cli_res = cli.parse(["build", "-v", "--out=dist", "--threads", "4", "src/main.ask"]);
+let d_lines = diff.lines("a\nb\nc", "a\nx\nc");
+let d_str = diff.format("a\nb\nc", "a\nx\nc");
+let d_val = diff.values(#{ a: 1, b: 2 }, #{ a: 1, b: 3, c: 4 });
+let diff_has_c = any(d_val, fn(e) { e["path"] == "c" && e["kind"] == "added" && e["right"] == 4 });
+let pp = pprint.format(#{ k: [1, 2] });
+let h_doc = html.parse("<div id=\"main\"><p class=\"t\">Hi &amp; Bye</p></div>");
+let h_sel = html.select(h_doc, "p.t");
+let h_txt = html.text(h_sel[0]);
+let x_doc = xml.parse("<root><item key=\"1\">ok</item></root>");
+let x_txt = xml.text(xml.select(x_doc, "item")[0]);
+log.json(true);
+let log_line = log.format("info", "login", #{ user: "bob", api_token: "secret123" });
+log.json(false);
+
+#{
+    title: toml_round["title"],
+    port: toml_round["server"]["port"],
+    unpacked: unpacked,
+    be_u32: be_u32,
+    dq_front: dq_front,
+    dq_list: dq_list,
+    top_count: cnt.most_common(1)[0],
+    pq_first: pq_first,
+    grp_even: grp["0"],
+    win_len: len(win),
+    z_ok: z_ok,
+    g_ok: g_ok,
+    raw_ok: raw_ok,
+    crc_ok: crc_ok,
+    adler_ok: adler_ok,
+    zip_cnt: len(zip_entries),
+    zip_text: zip_text,
+    ext_a: ext_a,
+    ext_b: ext_b,
+    fam_ok: fam_ok,
+    cli_v: cli.has_flag(cli_res, "v"),
+    cli_out: cli_res["options"]["out"],
+    cli_pos: cli_res["positional"],
+    has_diff: ("- b" in d_str) && ("+ x" in d_str) && (len(d_lines) >= 2),
+    diff_added: diff_has_c,
+    has_pp: "k" in pp,
+    h_txt: h_txt,
+    x_txt: x_txt,
+    log_redacted: ("\"level\":\"INFO\"" in log_line) && ("[REDACTED]" in log_line) && !("secret123" in log_line),
+}
+"#;
+        let canon_dir = fs::canonicalize(&dir).unwrap();
+        let mut vm = VM::new();
+        vm.set_current_dir(canon_dir.clone());
+        vm.set_sandbox_root(canon_dir.clone());
+        let res = vm.run(compile_source(src).unwrap()).unwrap();
+        let Value::Dict(m_rc) = res else {
+            panic!("expected dict");
+        };
+        let m = m_rc.borrow();
+        assert!(m["title"].equals(&Value::Str("Askane".to_string())));
+        assert!(m["port"].equals(&Value::Int(8080)));
+        assert!(m["be_u32"].equals(&Value::Int(305419896)));
+        assert!(m["dq_front"].equals(&Value::Int(1)));
+        assert!(m["pq_first"].equals(&Value::Str("high".to_string())));
+        assert!(m["win_len"].equals(&Value::Int(3)));
+        assert!(m["z_ok"].equals(&Value::Bool(true)));
+        assert!(m["g_ok"].equals(&Value::Bool(true)));
+        assert!(m["raw_ok"].equals(&Value::Bool(true)));
+        assert!(m["crc_ok"].equals(&Value::Bool(true)));
+        assert!(m["adler_ok"].equals(&Value::Bool(true)));
+        assert!(m["zip_cnt"].equals(&Value::Int(2)));
+        assert!(m["zip_text"].equals(&Value::Bytes(std::rc::Rc::new(b"world!".to_vec()))));
+        assert!(m["ext_a"].equals(&Value::Str("alpha".to_string())));
+        assert!(m["ext_b"].equals(&Value::Str("beta".to_string())));
+        assert!(m["fam_ok"].equals(&Value::Bool(true)));
+        assert!(m["cli_v"].equals(&Value::Bool(true)));
+        assert!(m["cli_out"].equals(&Value::Str("dist".to_string())));
+        assert!(m["has_diff"].equals(&Value::Bool(true)));
+        assert!(m["diff_added"].equals(&Value::Bool(true)));
+        assert!(m["has_pp"].equals(&Value::Bool(true)));
+        assert!(m["h_txt"].equals(&Value::Str("Hi & Bye".to_string())));
+        assert!(m["x_txt"].equals(&Value::Str("ok".to_string())));
+        assert!(m["log_redacted"].equals(&Value::Bool(true)));
+
+        // Zip bomb guard + Zip Slip rejection
+        let bomb_err = VM::new()
+            .run(
+                compile_source(
+                    r#"
+import compress;
+let s = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+let i = 0;
+while i < 6 { s = s + s; i += 1; }
+let big = compress.zlib_compress(bytes(s));
+compress.zlib_decompress(big, 128);
+"#,
+                )
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert!(bomb_err.contains("limit"), "bomb_err: {}", bomb_err);
+
+        let slip_src = r#"
+import archive;
+let bad = archive.pack(#{ "../escape.txt": "bad" });
+archive.extract(bad, "extracted");
+"#;
+        let mut slip_vm = VM::new();
+        slip_vm.set_current_dir(canon_dir.clone());
+        slip_vm.set_sandbox_root(canon_dir);
+        let slip_err = slip_vm.run(compile_source(slip_src).unwrap()).unwrap_err();
+        assert!(
+            slip_err.contains("..")
+                || slip_err.contains("traversal")
+                || slip_err.contains("invalid")
+                || slip_err.contains("Unsafe"),
+            "slip_err: {}",
+            slip_err
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn build_test_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut png = Vec::from(*b"\x89PNG\r\n\x1a\n");
+        let append_chunk = |out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]| {
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend_from_slice(tag);
+            out.extend_from_slice(body);
+            let crc = modules::compress::crc32_bytes(&out[start..]);
+            out.extend_from_slice(&crc.to_be_bytes());
+        };
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.push(8); // bit depth
+        ihdr.push(6); // RGBA
+        ihdr.push(0);
+        ihdr.push(0);
+        ihdr.push(0);
+        append_chunk(&mut png, b"IHDR", &ihdr);
+
+        let mut scanlines = Vec::new();
+        let row_bytes = (width as usize) * 4;
+        for y in 0..height as usize {
+            scanlines.push(0); // filter None
+            scanlines.extend_from_slice(&rgba[y * row_bytes..(y + 1) * row_bytes]);
+        }
+        let deflated = modules::compress::deflate_raw(&scanlines);
+        let mut zlib = Vec::with_capacity(deflated.len() + 6);
+        zlib.push(0x78);
+        zlib.push(0x01);
+        zlib.extend_from_slice(&deflated);
+        zlib.extend_from_slice(&modules::compress::adler32_bytes(&scanlines).to_be_bytes());
+        append_chunk(&mut png, b"IDAT", &zlib);
+        append_chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn test_v016_stage5_png_input_and_ui() {
+        // 1. Pure-Rust PNG decoding verification (RGBA 2x1: opaque red + semi-transparent green)
+        let png_bytes = build_test_rgba_png(2, 1, &[255, 0, 0, 255, 0, 255, 0, 128]);
+        let (pw, ph, pixels) = modules::gfx::decode_png(&png_bytes).unwrap();
+        assert_eq!((pw, ph), (2, 1));
+        assert_eq!(pixels, vec![0xFF_FF_00_00, 0x80_00_FF_00]);
+
+        let mut bad_crc = png_bytes.clone();
+        let last_idx = bad_crc.len() - 1;
+        bad_crc[last_idx] ^= 0xFF;
+        assert!(modules::gfx::decode_png(&bad_crc).is_err());
+
+        // 2. input sandbox security: vk_code works everywhere, global input denied without --allow-input
+        let safe_input = VM::new()
+            .run(compile_source("import input; input.vk_code(\"space\")").unwrap())
+            .unwrap();
+        assert!(safe_input.equals(&Value::Int(0x20)));
+
+        let denied_input = VM::new()
+            .run(compile_source("needs input;\nimport input; input.key_down(\"a\")").unwrap())
+            .unwrap_err();
+        assert!(
+            denied_input.contains("allow-input"),
+            "err: {}",
+            denied_input
+        );
+
+        let mut perms_allow_input = Permissions::sandboxed();
+        perms_allow_input.allow_input = true;
+        let mut vm_ok = VM::new();
+        vm_ok.set_permissions(perms_allow_input);
+        let ok_needs = vm_ok
+            .run(
+                compile_source("needs input;\nimport input; input.key_name(input.vk_code(\"a\"))")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(ok_needs.equals(&Value::Str("a".to_string())));
+
+        // 3. ui module headless window, layout, themes, events, widgets & callbacks
+        modules::reset_runtime_state();
+        let ui_src = r##"
+import ui;
+
+let dark_c = ui.hex("#171A21");
+let light_t = ui.theme("light");
+ui.window("Demo", 640, 480, #{ headless: true, theme: "dark" });
+
+let clicks = 0;
+let submitted = "";
+let build_tree = fn() {
+    ui.column([
+        ui.label("Header", #{ id: "lbl" }),
+        ui.button("Run", #{ id: "btn", on_click: fn(id) { clicks += 1; } }),
+        ui.checkbox("Agree", false, #{ id: "chk" }),
+        ui.slider(50, 0, 100, #{ id: "sld", width: 200 }),
+        ui.select(["low", "med", "high"], 0, #{ id: "sel", width: 160 }),
+        ui.text_input("", #{ id: "inp", width: 200, on_submit: fn(v) { submitted = v; } }),
+    ], #{ id: "root", spacing: 8 })
+};
+
+let lay1 = ui.layout(build_tree(), 640, 480);
+ui.render(build_tree());
+
+// Click button, checkbox, slider center, select, text_input, then type + enter
+let b = lay1["btn"];
+ui.inject_click(b["x"] + 5, b["y"] + 5);
+let c = lay1["chk"];
+ui.inject_click(c["x"] + 5, c["y"] + 5);
+let s = lay1["sld"];
+ui.inject_click(s["x"] + s["w"] - 8, s["y"] + 5);
+let sel = lay1["sel"];
+ui.inject_click(sel["x"] + 5, sel["y"] + 5);
+let inp = lay1["inp"];
+ui.inject_click(inp["x"] + 5, inp["y"] + 5);
+ui.render(build_tree());
+ui.inject_key("hi!");
+ui.inject_key("backspace");
+ui.inject_key("enter");
+ui.render(build_tree());
+
+let evs = ui.events();
+ui.inject_resize(1024, 720);
+ui.render(build_tree());
+let new_w = ui.width();
+let new_h = ui.height();
+let chk_state = ui.state("chk");
+let inp_state = ui.state("inp");
+let sel_state = ui.state("sel");
+ui.close();
+
+#{
+    dark_c: dark_c,
+    light_bg: light_t["bg"],
+    lbl_y: lay1["lbl"]["y"],
+    btn_y: lay1["btn"]["y"],
+    clicks: clicks,
+    submitted: submitted,
+    chk_state: chk_state,
+    inp_state: inp_state,
+    sel_state: sel_state,
+    ev_count: len(evs),
+    new_w: new_w,
+    new_h: new_h,
+    closed_ok: !ui.is_open(),
+}
+"##;
+        let ui_val = VM::new().run(compile_source(ui_src).unwrap()).unwrap();
+        let Value::Dict(u_rc) = ui_val else {
+            panic!("expected dict");
+        };
+        let u = u_rc.borrow();
+        assert!(u["dark_c"].equals(&Value::Int(0x17_1A_21)));
+        assert!(u["light_bg"].equals(&Value::Int(0xF5_F7_FA)));
+        assert!(matches!(
+            (&u["lbl_y"], &u["btn_y"]),
+            (Value::Int(ly), Value::Int(by)) if by > ly
+        ));
+        assert!(u["clicks"].equals(&Value::Int(1)));
+        assert!(u["submitted"].equals(&Value::Str("hi".to_string())));
+        assert!(u["chk_state"].equals(&Value::Bool(true)));
+        assert!(u["inp_state"].equals(&Value::Str("hi".to_string())));
+        assert!(u["sel_state"].equals(&Value::Int(1)));
+        assert!(matches!(&u["ev_count"], Value::Int(n) if *n >= 5));
+        assert!(u["new_w"].equals(&Value::Int(1024)));
+        assert!(u["new_h"].equals(&Value::Int(720)));
+        assert!(u["closed_ok"].equals(&Value::Bool(true)));
+        modules::reset_runtime_state();
     }
 }

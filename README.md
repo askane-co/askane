@@ -100,12 +100,26 @@ Built-in standard modules (`import <name>;`):
 - `random`: `seed`, `int`, `float`, `bool`, `choice`, `shuffle`, `crypto_int`, `crypto_bytes`
 - `base64`: `encode`, `decode`, `encode_url`, `decode_url`
 - `csv`: `parse`, `parse_dicts`, `stringify`
-- `log`: `set_level`, `debug`, `info`, `warn`, `error`
+- `bytes` (and `b"..."` / `br"..."` literals): `from_hex`, `to_hex`, `from_str`, `to_str`, `concat`, `slice`, `fill`
+- `toml`: `parse`, `stringify`
+- `binary`: `pack`, `unpack`, `read_u16_le`/`be`, `read_u32_le`/`be`, `read_i32_le`/`be`, `read_i64_le`/`be`, `read_f32_le`/`be`, `read_f64_le`/`be`, `write_*`
+- `collections`: `deque`, `counter`, `priority_queue`, `groupby`, `window`
+- `compress`: `deflate`, `inflate`, `zlib_compress`, `zlib_decompress`, `gzip_compress`, `gzip_decompress`, `crc32`, `adler32`
+- `archive`: `pack`, `create`, `list`, `read_entry`, `extract` (with Zip Slip and size guards)
+- `os`: `platform`, `arch`, `family`, `cpu_count`, `pid`, `sep`, `line_ending`, `cwd`, `home_dir`, `temp_dir`, `env`, `args`
+- `cli`: `parse`, `has_flag`
+- `diff`: `lines`, `format`, `values`
+- `pprint`: `format`, `print`
+- `html`: `parse`, `select`, `text`, `escape`, `unescape`
+- `xml`: `parse`, `select`, `text`, `escape`, `unescape`
+- `log`: `set_level`, `json`, `format`, `debug`, `info`, `warn`, `error` (supports structured dict fields and secret redaction)
 - `test`: `assert`, `assert_eq`, `assert_ne`, `assert_err`
 - `hash`: `sha256`, `crc32`, `fnv1a`
 - `ini`: `parse`, `stringify`
 - `datetime`: `utc_now`, `from_timestamp`, `format`, `parse_iso`
 - `clipboard` (Windows): `get_text`, `set_text` (requires `--allow-clipboard` or `--unsafe`)
+- `input`: `vk_code`, `key_name`, plus global `key_down`, `key_pressed`, `hotkey`, `mouse_down`, `mouse_pos` (requires `--allow-input` or `--unsafe`)
+- `ui` (2D Declarative GUI): `window`, `is_open`, `close`, `render`, `events`, `layout`, `column`, `row`, `label`, `button`, `text_input`, `checkbox`, `slider`, `select`, `spacer`, `theme`, `color`, `hex`, `rgb`, `state`, `set_state`
 - `audio` (Windows): `play(wav_path)`, `stop()` (sandbox-checked)
 - `url`: `parse`, `encode`, `decode`, `query_parse`, `query_stringify`
 - `hex`: `encode`, `decode`
@@ -116,11 +130,10 @@ Built-in standard modules (`import <name>;`):
 - `dialog` (Windows): `info`, `confirm`, `open_file`, `save_file`
 - `process`: `run(cmd, [args])` (requires `--allow-exec[=cmd]` or `--unsafe`)
 - `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`, `read_bytes`, `write_bytes`, `copy`, `move`, `size`, `glob`
-- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `rect_outline`, `circle`, `circle_outline`, `line`, `pixel`, `text`, `load_image`, `draw_image`, `draw_image_keyed`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
+- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `rect_outline`, `circle`, `circle_outline`, `line`, `pixel`, `text`, `load_image` (BMP & PNG with alpha), `draw_image`, `draw_image_keyed`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
 - `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`
 - `json`: `parse`, `stringify`
 - `http` (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
-- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `circle`, `line`, `pixel`, `text`, `present`, `key_down`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
 - `mem` (Windows): `current_pid`, `find_pid` (returns `unit` if not found), `open`, `close`, `module_base` (returns `unit` if not found), `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
 
 CLI tools:
@@ -148,6 +161,7 @@ Granular permission flags are supported in addition to `--unsafe`:
 - `--max-steps=N`: override the 10-million sandbox instruction budget
 - `--timeout=MS`: override the 30-second sandbox wall-clock deadline
 - `--allow-clipboard`: allow `clipboard.get_text()` and `clipboard.set_text()`
+- `--allow-input`: allow global `input.key_down()`, `hotkey()`, `mouse_down()`, `mouse_pos()`
 - `--allow-exec[=cmd,...]`: allow `process.run()` for specific executables or any command
 
 `askane --unsafe script.ask` enables unrestricted files, HTTPS network requests and

@@ -12,7 +12,8 @@ use crate::lexer::Lexer;
 use crate::modules;
 use crate::parser::Parser;
 use crate::value::{
-    AskaneSet, BoundMethod, Closure, NativeFunction, StructDef, StructInstance, UpvalueState, Value,
+    AskaneSet, BoundMethod, Closure, ModuleData, NativeFunction, StructDef, StructInstance,
+    UpvalueState, Value,
 };
 
 struct CallFrame {
@@ -33,6 +34,10 @@ pub struct ProfileEntry {
 
 fn make_positional_arg_bits(count: usize) -> [u64; 4] {
     let mut bits = [0u64; 4];
+    if count < 64 {
+        bits[0] = (1u64 << count) - 1;
+        return bits;
+    }
     for i in 0..count.min(256) {
         bits[i >> 6] |= 1u64 << (i & 63);
     }
@@ -53,7 +58,28 @@ fn set_arg_present(bits: &mut [u64; 4], idx: usize) {
 struct TryHandler {
     frame_depth: usize,
     stack_len: usize,
+    cleanup_len: usize,
     catch_ip: usize,
+}
+
+#[derive(Clone)]
+struct SandboxSnapshot {
+    perms: Permissions,
+    sandboxed: bool,
+    saved_instr_extra: Option<u64>,
+}
+
+#[derive(Clone)]
+enum CleanupKind {
+    Defer(Rc<Closure>),
+    Sandbox(SandboxSnapshot),
+}
+
+#[derive(Clone)]
+struct CleanupEntry {
+    frame_depth: usize,
+    scope_depth: u16,
+    kind: CleanupKind,
 }
 
 const MAX_CALL_DEPTH: usize = 1024;
@@ -67,11 +93,13 @@ pub struct Permissions {
     pub allow_env: Option<Vec<String>>,
     pub allow_sys_args: bool,
     pub allow_clipboard: bool,
+    pub allow_input: bool,
     pub allow_exec: Option<Vec<String>>,
     pub max_instructions: Option<u64>,
     pub max_duration_ms: Option<u64>,
     pub max_memory_bytes: Option<u64>,
     pub max_io_bytes: Option<u64>,
+    pub restrict_to_explicit_roots: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -91,11 +119,13 @@ impl Permissions {
             allow_env: None,
             allow_sys_args: false,
             allow_clipboard: false,
+            allow_input: false,
             allow_exec: None,
             max_instructions: Some(10_000_000),
             max_duration_ms: Some(30_000),
             max_memory_bytes: Some(64 * 1024 * 1024),
             max_io_bytes: Some(128 * 1024 * 1024),
+            restrict_to_explicit_roots: false,
         }
     }
 
@@ -108,11 +138,13 @@ impl Permissions {
             allow_env: Some(Vec::new()),
             allow_sys_args: true,
             allow_clipboard: true,
+            allow_input: true,
             allow_exec: Some(Vec::new()),
             max_instructions: None,
             max_duration_ms: None,
             max_memory_bytes: None,
             max_io_bytes: None,
+            restrict_to_explicit_roots: false,
         }
     }
 }
@@ -124,6 +156,7 @@ pub struct VM {
     global_values: Vec<Value>,
     global_ic: Vec<(usize, usize, usize, usize)>,
     attr_ic: Vec<(usize, usize, usize, usize, usize)>,
+    module_ic: Vec<(usize, usize, usize, usize, Value)>,
     ic_epoch: usize,
     open_upvalues: Vec<Rc<RefCell<UpvalueState>>>,
     start_time: Instant,
@@ -138,6 +171,8 @@ pub struct VM {
     budget: ResourceBudget,
     run_start: Instant,
     try_handlers: Vec<TryHandler>,
+    cleanup_stack: Vec<CleanupEntry>,
+    spec_results: Vec<(String, Result<(), String>)>,
     fmt_depth: usize,
     profile_enabled: bool,
     profile_stats: HashMap<String, ProfileEntry>,
@@ -171,6 +206,7 @@ impl VM {
             global_values: Vec::with_capacity(64),
             global_ic: vec![(0, 0, 0, usize::MAX); 1024],
             attr_ic: vec![(0, 0, 0, 0, 0); 1024],
+            module_ic: vec![(0, 0, 0, 0, Value::Unit); 512],
             ic_epoch: 1,
             open_upvalues: Vec::new(),
             start_time: Instant::now(),
@@ -185,6 +221,8 @@ impl VM {
             budget: ResourceBudget::default(),
             run_start: Instant::now(),
             try_handlers: Vec::new(),
+            cleanup_stack: Vec::new(),
+            spec_results: Vec::new(),
             fmt_depth: 0,
             profile_enabled: false,
             profile_stats: HashMap::new(),
@@ -209,6 +247,10 @@ impl VM {
 
     pub fn is_sandboxed(&self) -> bool {
         self.sandboxed
+    }
+
+    pub fn spec_results(&self) -> &[(String, Result<(), String>)] {
+        &self.spec_results
     }
 
     pub fn set_profile(&mut self, enabled: bool) {
@@ -425,6 +467,38 @@ impl VM {
         }
     }
 
+    pub fn check_input(&self) -> Result<(), String> {
+        if self.permissions.allow_all || self.permissions.allow_input {
+            Ok(())
+        } else {
+            Err(
+                "global input access is disabled in sandbox mode (pass --allow-input or --unsafe)"
+                    .to_string(),
+            )
+        }
+    }
+
+    pub fn sleep_checked(&self, ms: u64) -> Result<(), String> {
+        let mut rem = ms;
+        while rem > 0 {
+            self.check_timeout()?;
+            let slice = rem.min(50);
+            if let Some(limit_ms) = self.permissions.max_duration_ms {
+                let elapsed = self.run_start.elapsed().as_millis() as u64;
+                if elapsed.saturating_add(slice) > limit_ms {
+                    let left = limit_ms.saturating_sub(elapsed);
+                    if left > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(left));
+                    }
+                    return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(slice));
+            rem -= slice;
+        }
+        self.check_timeout()
+    }
+
     pub fn check_exec(&self, cmd: &str) -> Result<(), String> {
         if cmd.chars().any(char::is_control) {
             return Err("process.run() command cannot contain control characters".to_string());
@@ -623,16 +697,21 @@ impl VM {
             Some(out)
         };
 
+        if self.permissions.restrict_to_explicit_roots && extra_roots.is_none() {
+            return Err("filesystem access is disabled inside this sandbox block".to_string());
+        }
         let Some(lexical) = normalize_lexical(raw, base_dir) else {
             return Err(format!("path '{}' is outside the sandbox", input));
         };
         let mut lexical_roots = Vec::new();
-        if let Some(r) = normalize_lexical(&self.sandbox_root, base_dir) {
-            lexical_roots.push(r);
-        }
-        if let Ok(canon_root) = fs::canonicalize(&self.sandbox_root) {
-            if let Some(r) = normalize_lexical(&canon_root, &self.current_dir) {
+        if !self.permissions.restrict_to_explicit_roots {
+            if let Some(r) = normalize_lexical(&self.sandbox_root, base_dir) {
                 lexical_roots.push(r);
+            }
+            if let Ok(canon_root) = fs::canonicalize(&self.sandbox_root) {
+                if let Some(r) = normalize_lexical(&canon_root, &self.current_dir) {
+                    lexical_roots.push(r);
+                }
             }
         }
         if let Some(dirs) = extra_roots {
@@ -656,11 +735,13 @@ impl VM {
             return Err(format!("path '{}' is outside the sandbox", input));
         }
 
-        let root =
-            fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
         let mut allowed_roots = Vec::new();
-        if let Some(r) = normalize_lexical(&root, &self.current_dir) {
-            allowed_roots.push(r);
+        if !self.permissions.restrict_to_explicit_roots {
+            let root =
+                fs::canonicalize(&self.sandbox_root).map_err(|e| format!("sandbox root: {}", e))?;
+            if let Some(r) = normalize_lexical(&root, &self.current_dir) {
+                allowed_roots.push(r);
+            }
         }
         if let Some(dirs) = extra_roots {
             for dir in dirs {
@@ -755,6 +836,12 @@ impl VM {
             ("all", native_all),
             ("find", native_find),
             ("__pairs", native_pairs),
+            ("__pipe_map", native_map),
+            ("__tag_eval", native_tag_eval),
+            ("__check_needs", native_check_needs),
+            ("__close_resource", native_close_resource),
+            ("__sleep_checked", native_sleep_checked),
+            ("__run_spec", native_run_spec),
             ("unique", native_unique),
             ("flatten", native_flatten),
             ("chunk", native_chunk),
@@ -797,6 +884,8 @@ impl VM {
             self.budget = ResourceBudget::default();
             self.run_start = Instant::now();
             self.try_handlers.clear();
+            self.cleanup_stack.clear();
+            self.spec_results.clear();
             self.fmt_depth = 0;
             self.ic_epoch = self.ic_epoch.wrapping_add(1).max(1);
             if self.profile_enabled {
@@ -810,6 +899,7 @@ impl VM {
         });
         let base_depth = self.frames.len();
         let stack_base = self.stack.len();
+        let prev_cleanup_len = self.cleanup_stack.len();
         self.stack.push(Value::Closure(closure.clone()));
         let enter_time = if self.profile_enabled {
             Some(Instant::now())
@@ -829,12 +919,16 @@ impl VM {
         match self.execute(base_depth) {
             Ok(v) => Ok(v),
             Err(e) => {
+                let run_defers = !Self::is_unrecoverable_error(&e);
+                let _ = self.unwind_cleanups_to_len(prev_cleanup_len, run_defers);
                 let msg = if base_depth == 0 {
                     self.format_stack_trace(&e)
                 } else {
                     e
                 };
-                self.close_upvalues_from(stack_base);
+                if !self.open_upvalues.is_empty() {
+                    self.close_upvalues_from(stack_base);
+                }
                 self.frames.truncate(base_depth);
                 self.stack.truncate(stack_base);
                 while self
@@ -1047,11 +1141,12 @@ impl VM {
         op_sym: &str,
     ) -> Result<Value, String> {
         match &obj {
-            Value::Module { name, exports } => {
-                exports.borrow().get(attr).cloned().ok_or_else(|| {
-                    format!("[line {}] Module '{}' has no export '{}'", line, name, attr)
-                })
-            }
+            Value::Module(m) => m.exports.borrow().get(attr).cloned().ok_or_else(|| {
+                format!(
+                    "[line {}] Module '{}' has no export '{}'",
+                    line, m.name, attr
+                )
+            }),
             Value::StructDef(def) => def.methods.get(attr).cloned().ok_or_else(|| {
                 format!(
                     "[line {}] Struct '{}' has no static member '{}'",
@@ -1159,6 +1254,7 @@ impl VM {
                 }
                 let base_depth = self.frames.len();
                 let base = self.stack.len();
+                let prev_cleanup_len = self.cleanup_stack.len();
                 let (slots, bits) =
                     if args.len() == closure.proto.arity as usize && !closure.proto.is_variadic {
                         (args.to_vec(), make_positional_arg_bits(args.len()))
@@ -1184,7 +1280,11 @@ impl VM {
                 match self.execute(base_depth) {
                     Ok(v) => Ok(v),
                     Err(e) => {
-                        self.close_upvalues_from(base);
+                        let run_defers = !Self::is_unrecoverable_error(&e);
+                        let _ = self.unwind_cleanups_to_len(prev_cleanup_len, run_defers);
+                        if !self.open_upvalues.is_empty() {
+                            self.close_upvalues_from(base);
+                        }
                         self.frames.truncate(base_depth);
                         self.stack.truncate(base);
                         while self
@@ -1204,32 +1304,29 @@ impl VM {
 
     fn execute(&mut self, target_depth: usize) -> Result<Value, String> {
         loop {
-            self.step_counter = self.step_counter.wrapping_add(1);
-            if self.permissions.max_instructions.is_some() {
-                if self.instructions_left == 0 {
-                    return Err("Sandbox instruction limit exceeded".to_string());
-                }
-                self.instructions_left -= 1;
-            }
-            if let Some(limit_ms) = self.permissions.max_duration_ms {
-                if (self.step_counter & 4095) == 0
-                    && self.run_start.elapsed().as_millis() as u64 > limit_ms
-                {
-                    return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
-                }
-            }
-            match self.step(target_depth) {
-                Ok(Some(val)) => return Ok(val),
-                Ok(None) => {}
-                Err(err) => {
+            match self.execute_fast(target_depth) {
+                Ok(val) => return Ok(val),
+                Err(mut err) => {
                     if Self::is_unrecoverable_error(&err) {
                         return Err(err);
                     }
                     if let Some(handler) = self.try_handlers.last().cloned() {
                         if handler.frame_depth > target_depth {
                             self.try_handlers.pop();
+                            if self.cleanup_stack.len() > handler.cleanup_len {
+                                if let Err(cleanup_err) =
+                                    self.unwind_cleanups_to_len(handler.cleanup_len, true)
+                                {
+                                    if Self::is_unrecoverable_error(&cleanup_err) {
+                                        return Err(cleanup_err);
+                                    }
+                                    err = cleanup_err;
+                                }
+                            }
                             self.frames.truncate(handler.frame_depth);
-                            self.close_upvalues_from(handler.stack_len);
+                            if !self.open_upvalues.is_empty() {
+                                self.close_upvalues_from(handler.stack_len);
+                            }
                             self.stack.truncate(handler.stack_len);
                             self.stack.push(Value::Str(err));
                             self.frames.last_mut().unwrap().ip = handler.catch_ip;
@@ -1242,183 +1339,362 @@ impl VM {
         }
     }
 
-    fn step(&mut self, target_depth: usize) -> Result<Option<Value>, String> {
-        let (op, line, proto_ptr, op_ip) = {
-            let frame = self.frames.last_mut().unwrap();
-            let op_ip = frame.ip;
-            let op = frame.closure.proto.chunk.code[op_ip];
-            let line = frame.closure.proto.chunk.lines[op_ip];
-            let proto_ptr = Rc::as_ptr(&frame.closure.proto) as usize;
-            frame.ip += 1;
-            (op, line, proto_ptr, op_ip)
-        };
+    #[inline(always)]
+    fn check_budget_step(&mut self) -> Result<(), String> {
+        self.step_counter = self.step_counter.wrapping_add(1);
+        if self.permissions.max_instructions.is_some() {
+            if self.instructions_left == 0 {
+                return Err("Sandbox instruction limit exceeded".to_string());
+            }
+            self.instructions_left -= 1;
+        }
+        if let Some(limit_ms) = self.permissions.max_duration_ms {
+            if (self.step_counter & 4095) == 0
+                && self.run_start.elapsed().as_millis() as u64 > limit_ms
+            {
+                return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+            }
+        }
+        Ok(())
+    }
 
-        match op {
-            Op::Constant(idx) => {
-                let val = self.read_constant(idx);
-                self.stack.push(val);
-            }
-            Op::Unit => self.stack.push(Value::Unit),
-            Op::True => self.stack.push(Value::Bool(true)),
-            Op::False => self.stack.push(Value::Bool(false)),
-            Op::Pop => {
-                self.stack.pop();
-            }
-            Op::Dup => {
-                let v = self.stack.last().unwrap().clone();
-                self.stack.push(v);
-            }
-            Op::Dup2 => {
-                let len = self.stack.len();
-                let a = self.stack[len - 2].clone();
-                let b = self.stack[len - 1].clone();
-                self.stack.push(a);
-                self.stack.push(b);
-            }
-            Op::GetLocal(slot) => {
-                let base = self.frames.last().unwrap().base;
-                let val = self.stack[base + slot as usize].clone();
-                self.stack.push(val);
-            }
-            Op::SetLocal(slot) => {
-                let base = self.frames.last().unwrap().base;
-                let val = self.stack.last().unwrap().clone();
-                self.stack[base + slot as usize] = val;
-            }
-            Op::GetUpvalue(slot) => {
-                let uv = self.frames.last().unwrap().closure.upvalues[slot as usize].clone();
-                let val = match &*uv.borrow() {
-                    UpvalueState::Open(idx) => self.stack[*idx].clone(),
-                    UpvalueState::Closed(v) => v.clone(),
-                };
-                self.stack.push(val);
-            }
-            Op::SetUpvalue(slot) => {
-                let uv = self.frames.last().unwrap().closure.upvalues[slot as usize].clone();
-                let val = self.stack.last().unwrap().clone();
-                let mut state = uv.borrow_mut();
-                match &mut *state {
-                    UpvalueState::Open(idx) => self.stack[*idx] = val,
-                    UpvalueState::Closed(v) => *v = val,
+    fn execute_fast(&mut self, target_depth: usize) -> Result<Value, String> {
+        let mut cur_closure;
+        let mut cur_base;
+        let mut ip;
+        let mut proto_ptr;
+        {
+            let f = self.frames.last().unwrap();
+            cur_closure = f.closure.clone();
+            cur_base = f.base;
+            ip = f.ip;
+            proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
+        }
+
+        loop {
+            self.check_budget_step()?;
+            let chunk = &cur_closure.proto.chunk;
+            let op_ip = ip;
+            let op = chunk.code[op_ip];
+            ip += 1;
+
+            match op {
+                Op::Constant(idx) => {
+                    let val = match &chunk.constants[idx as usize] {
+                        Constant::Int(v) => Value::Int(*v),
+                        Constant::Float(v) => Value::Float(*v),
+                        Constant::Str(s) => Value::Str(s.clone()),
+                        Constant::Bytes(b) => Value::Bytes(Rc::new(b.clone())),
+                        Constant::Function(_) | Constant::Struct(_) => {
+                            unreachable!(
+                                "Function/struct constant cannot be loaded via Op::Constant"
+                            )
+                        }
+                    };
+                    self.stack.push(val);
                 }
-            }
-            Op::CloseUpvalue => {
-                let slot = self.stack.len() - 1;
-                self.close_upvalues_from(slot);
-                self.stack.pop();
-            }
-            Op::GetGlobal(idx) => {
-                let ic_idx = (proto_ptr.wrapping_mul(31) ^ op_ip) & 1023;
-                let cached = self.global_ic[ic_idx];
-                if cached.0 == self.ic_epoch
-                    && cached.1 == proto_ptr
-                    && cached.2 == op_ip
-                    && cached.3 < self.global_values.len()
-                {
-                    self.stack.push(self.global_values[cached.3].clone());
-                } else {
-                    let frame = self.frames.last().unwrap();
-                    let name = match &frame.closure.proto.chunk.constants[idx as usize] {
+                Op::ConstInt(imm) => self.stack.push(Value::Int(imm as i64)),
+                Op::Unit => self.stack.push(Value::Unit),
+                Op::True => self.stack.push(Value::Bool(true)),
+                Op::False => self.stack.push(Value::Bool(false)),
+                Op::Pop => {
+                    self.stack.pop();
+                }
+                Op::Dup => {
+                    let v = self.stack.last().unwrap().clone();
+                    self.stack.push(v);
+                }
+                Op::Dup2 => {
+                    let len = self.stack.len();
+                    let a = self.stack[len - 2].clone();
+                    let b = self.stack[len - 1].clone();
+                    self.stack.push(a);
+                    self.stack.push(b);
+                }
+                Op::GetLocal(slot) => {
+                    let val = self.stack[cur_base + slot as usize].clone();
+                    self.stack.push(val);
+                }
+                Op::SetLocal(slot) => {
+                    let val = self.stack.last().unwrap().clone();
+                    self.stack[cur_base + slot as usize] = val;
+                }
+                Op::AddLocalInt(slot, imm) => {
+                    let imm64 = imm as i64;
+                    if let Value::Int(x) = &self.stack[cur_base + slot as usize] {
+                        self.stack.push(Value::Int(x.wrapping_add(imm64)));
+                    } else {
+                        let a = self.stack[cur_base + slot as usize].clone();
+                        let line = chunk.lines[op_ip];
+                        match a {
+                            Value::Float(x) => self.stack.push(Value::Float(x + (imm64 as f64))),
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Cannot add '{}' and 'int'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Op::SubLocalInt(slot, imm) => {
+                    let imm64 = imm as i64;
+                    if let Value::Int(x) = &self.stack[cur_base + slot as usize] {
+                        self.stack.push(Value::Int(x.wrapping_sub(imm64)));
+                    } else {
+                        let a = self.stack[cur_base + slot as usize].clone();
+                        let line = chunk.lines[op_ip];
+                        match a {
+                            Value::Float(x) => self.stack.push(Value::Float(x - (imm64 as f64))),
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Cannot subtract '{}' and 'int'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Op::LtLocalInt(slot, imm) => {
+                    let imm64 = imm as i64;
+                    if let Value::Int(x) = &self.stack[cur_base + slot as usize] {
+                        self.stack.push(Value::Bool(*x < imm64));
+                    } else {
+                        let a = &self.stack[cur_base + slot as usize];
+                        let line = chunk.lines[op_ip];
+                        match a {
+                            Value::Float(x) => self.stack.push(Value::Bool(*x < (imm64 as f64))),
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Cannot compare '{}' and 'int'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Op::LeLocalInt(slot, imm) => {
+                    let imm64 = imm as i64;
+                    if let Value::Int(x) = &self.stack[cur_base + slot as usize] {
+                        self.stack.push(Value::Bool(*x <= imm64));
+                    } else {
+                        let a = &self.stack[cur_base + slot as usize];
+                        let line = chunk.lines[op_ip];
+                        match a {
+                            Value::Float(x) => self.stack.push(Value::Bool(*x <= (imm64 as f64))),
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Cannot compare '{}' and 'int'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Op::AddLocals(a, b) => {
+                    let va = &self.stack[cur_base + a as usize];
+                    let vb = &self.stack[cur_base + b as usize];
+                    if let (Value::Int(x), Value::Int(y)) = (va, vb) {
+                        self.stack.push(Value::Int(x.wrapping_add(*y)));
+                    } else {
+                        let lhs = va.clone();
+                        let rhs = vb.clone();
+                        self.stack.push(lhs);
+                        self.stack.push(rhs);
+                        self.execute_add(chunk.lines[op_ip])?;
+                    }
+                }
+                Op::SubLocals(a, b) => {
+                    let va = &self.stack[cur_base + a as usize];
+                    let vb = &self.stack[cur_base + b as usize];
+                    if let (Value::Int(x), Value::Int(y)) = (va, vb) {
+                        self.stack.push(Value::Int(x.wrapping_sub(*y)));
+                    } else {
+                        let lhs = va.clone();
+                        let rhs = vb.clone();
+                        self.stack.push(lhs);
+                        self.stack.push(rhs);
+                        let line = chunk.lines[op_ip];
+                        self.numeric_op(line, i64::wrapping_sub, |x, y| x - y, "subtract")?;
+                    }
+                }
+                Op::LtLocals(a, b) => {
+                    let va = &self.stack[cur_base + a as usize];
+                    let vb = &self.stack[cur_base + b as usize];
+                    if let (Value::Int(x), Value::Int(y)) = (va, vb) {
+                        self.stack.push(Value::Bool(*x < *y));
+                    } else {
+                        let lhs = va.clone();
+                        let rhs = vb.clone();
+                        self.stack.push(lhs);
+                        self.stack.push(rhs);
+                        let line = chunk.lines[op_ip];
+                        self.cmp_op(line, |x, y| x < y, |x, y| x < y, |x, y| x < y)?;
+                    }
+                }
+                Op::IncLocalPop(slot, delta) => {
+                    let pos = cur_base + slot as usize;
+                    let delta64 = delta as i64;
+                    match &mut self.stack[pos] {
+                        Value::Int(x) => *x = x.wrapping_add(delta64),
+                        Value::Float(x) => *x += delta64 as f64,
+                        other => {
+                            let line = chunk.lines[op_ip];
+                            return Err(format!(
+                                "[line {}] Cannot add '{}' and 'int'",
+                                line,
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+                Op::GetUpvalue(slot) => {
+                    let uv = &cur_closure.upvalues[slot as usize];
+                    let val = match &*uv.borrow() {
+                        UpvalueState::Open(idx) => self.stack[*idx].clone(),
+                        UpvalueState::Closed(v) => v.clone(),
+                    };
+                    self.stack.push(val);
+                }
+                Op::SetUpvalue(slot) => {
+                    let uv = &cur_closure.upvalues[slot as usize];
+                    let val = self.stack.last().unwrap().clone();
+                    let mut state = uv.borrow_mut();
+                    match &mut *state {
+                        UpvalueState::Open(idx) => self.stack[*idx] = val,
+                        UpvalueState::Closed(v) => *v = val,
+                    }
+                }
+                Op::CloseUpvalue => {
+                    let slot = self.stack.len() - 1;
+                    if !self.open_upvalues.is_empty() {
+                        self.close_upvalues_from(slot);
+                    }
+                    self.stack.pop();
+                }
+                Op::GetGlobal(idx) => {
+                    let ic_idx = (proto_ptr.wrapping_mul(31) ^ op_ip) & 1023;
+                    let cached = self.global_ic[ic_idx];
+                    if cached.0 == self.ic_epoch
+                        && cached.1 == proto_ptr
+                        && cached.2 == op_ip
+                        && cached.3 < self.global_values.len()
+                    {
+                        self.stack.push(self.global_values[cached.3].clone());
+                    } else {
+                        let name = match &chunk.constants[idx as usize] {
+                            Constant::Str(s) => s.as_str(),
+                            _ => unreachable!(),
+                        };
+                        let line = chunk.lines[op_ip];
+                        let slot = *self.global_slots.get(name).ok_or_else(|| {
+                            format!("[line {}] Undefined variable '{}'", line, name)
+                        })?;
+                        self.global_ic[ic_idx] = (self.ic_epoch, proto_ptr, op_ip, slot);
+                        self.stack.push(self.global_values[slot].clone());
+                    }
+                }
+                Op::DefineGlobal(idx) => {
+                    let val = self.stack.pop().unwrap();
+                    let name = match &chunk.constants[idx as usize] {
                         Constant::Str(s) => s.as_str(),
                         _ => unreachable!(),
                     };
-                    let slot = *self
-                        .global_slots
-                        .get(name)
-                        .ok_or_else(|| format!("[line {}] Undefined variable '{}'", line, name))?;
-                    self.global_ic[ic_idx] = (self.ic_epoch, proto_ptr, op_ip, slot);
-                    self.stack.push(self.global_values[slot].clone());
+                    if let Some(&slot) = self.global_slots.get(name) {
+                        self.global_values[slot] = val;
+                    } else {
+                        let slot = self.global_values.len();
+                        let name_owned = name.to_string();
+                        self.global_values.push(val);
+                        self.global_slots.insert(name_owned, slot);
+                    }
                 }
-            }
-            Op::DefineGlobal(idx) => {
-                let val = self.stack.pop().unwrap();
-                let frame = self.frames.last().unwrap();
-                let name = match &frame.closure.proto.chunk.constants[idx as usize] {
-                    Constant::Str(s) => s.as_str(),
-                    _ => unreachable!(),
-                };
-                if let Some(&slot) = self.global_slots.get(name) {
+                Op::SetGlobal(idx) => {
+                    let name = match &chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.as_str(),
+                        _ => unreachable!(),
+                    };
+                    let val = self.stack.last().unwrap().clone();
+                    let Some(&slot) = self.global_slots.get(name) else {
+                        let line = chunk.lines[op_ip];
+                        return Err(format!("[line {}] Undefined variable '{}'", line, name));
+                    };
                     self.global_values[slot] = val;
-                } else {
-                    let slot = self.global_values.len();
-                    let name_owned = name.to_string();
-                    self.global_values.push(val);
-                    self.global_slots.insert(name_owned, slot);
                 }
-            }
-            Op::SetGlobal(idx) => {
-                let frame = self.frames.last().unwrap();
-                let name = match &frame.closure.proto.chunk.constants[idx as usize] {
-                    Constant::Str(s) => s.as_str(),
-                    _ => unreachable!(),
-                };
-                let val = self.stack.last().unwrap().clone();
-                let Some(&slot) = self.global_slots.get(name) else {
-                    return Err(format!("[line {}] Undefined variable '{}'", line, name));
-                };
-                self.global_values[slot] = val;
-            }
-            Op::Add => {
-                let len = self.stack.len();
-                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
-                {
-                    let res = x.wrapping_add(*y);
-                    self.stack[len - 2] = Value::Int(res);
-                    self.stack.pop();
-                } else {
+                Op::Add => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        let res = x.wrapping_add(*y);
+                        self.stack[len - 2] = Value::Int(res);
+                        self.stack.pop();
+                    } else {
+                        self.execute_add(chunk.lines[op_ip])?;
+                    }
+                }
+                Op::Sub => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        let res = x.wrapping_sub(*y);
+                        self.stack[len - 2] = Value::Int(res);
+                        self.stack.pop();
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        self.numeric_op(line, i64::wrapping_sub, |a, b| a - b, "subtract")?;
+                    }
+                }
+                Op::Mul => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        let res = x.wrapping_mul(*y);
+                        self.stack[len - 2] = Value::Int(res);
+                        self.stack.pop();
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        self.numeric_op(line, i64::wrapping_mul, |a, b| a * b, "multiply")?;
+                    }
+                }
+                Op::Div => {
+                    let line = chunk.lines[op_ip];
                     let b = self.stack.pop().unwrap();
                     let a = self.stack.pop().unwrap();
                     let res = match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => Value::Int(x.wrapping_add(y)),
-                        (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
-                        (Value::Int(x), Value::Float(y)) => Value::Float((x as f64) + y),
-                        (Value::Float(x), Value::Int(y)) => Value::Float(x + (y as f64)),
-                        (Value::Str(x), Value::Str(y)) => {
-                            let new_len = x.len().saturating_add(y.len());
-                            if new_len > 64 * 1024 * 1024 {
-                                return Err(format!(
-                                    "[line {}] String size limit (64 MiB) exceeded",
-                                    line
-                                ));
-                            }
-                            self.charge_alloc(new_len)?;
-                            Value::Str(format!("{}{}", x, y))
+                        (Value::Int(_), Value::Int(0)) => {
+                            return Err(format!("[line {}] Division by zero", line));
                         }
-                        (Value::Bytes(x), Value::Bytes(y)) => {
-                            let new_len = x.len().saturating_add(y.len());
-                            if new_len > 64 * 1024 * 1024 {
-                                return Err(format!(
-                                    "[line {}] Bytes size limit (64 MiB) exceeded",
-                                    line
-                                ));
-                            }
-                            self.charge_alloc(new_len)?;
-                            let mut out = Vec::with_capacity(new_len);
-                            out.extend_from_slice(x.as_slice());
-                            out.extend_from_slice(y.as_slice());
-                            Value::Bytes(Rc::new(out))
+                        (Value::Int(x), Value::Int(y)) => {
+                            Value::Int(x.checked_div(y).unwrap_or(i64::MIN))
                         }
-                        (Value::List(x), Value::List(y)) => {
-                            let (x_ref, y_ref) = (x.borrow(), y.borrow());
-                            let new_len = x_ref.len().saturating_add(y_ref.len());
-                            if new_len > 10_000_000 {
-                                return Err(format!(
-                                    "[line {}] List size limit (10,000,000) exceeded",
-                                    line
-                                ));
+                        (Value::Float(x), Value::Float(y)) => {
+                            if y == 0.0 {
+                                return Err(format!("[line {}] Division by zero", line));
                             }
-                            let mut combined = Vec::new();
-                            combined.extend(x_ref.iter().cloned());
-                            combined.extend(y_ref.iter().cloned());
-                            drop((x_ref, y_ref));
-                            self.charge_alloc(
-                                new_len.saturating_mul(std::mem::size_of::<Value>()),
-                            )?;
-                            Value::List(Rc::new(RefCell::new(combined)))
+                            Value::Float(x / y)
+                        }
+                        (Value::Int(x), Value::Float(y)) => {
+                            if y == 0.0 {
+                                return Err(format!("[line {}] Division by zero", line));
+                            }
+                            Value::Float((x as f64) / y)
+                        }
+                        (Value::Float(x), Value::Int(y)) => {
+                            if y == 0 {
+                                return Err(format!("[line {}] Division by zero", line));
+                            }
+                            Value::Float(x / (y as f64))
                         }
                         (l, r) => {
                             return Err(format!(
-                                "[line {}] Cannot add '{}' and '{}'",
+                                "[line {}] Cannot divide '{}' and '{}'",
                                 line,
                                 l.type_name(),
                                 r.type_name()
@@ -1427,266 +1703,251 @@ impl VM {
                     };
                     self.stack.push(res);
                 }
-            }
-            Op::Sub => {
-                let len = self.stack.len();
-                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
-                {
-                    let res = x.wrapping_sub(*y);
-                    self.stack[len - 2] = Value::Int(res);
-                    self.stack.pop();
-                } else {
-                    self.numeric_op(line, i64::wrapping_sub, |a, b| a - b, "subtract")?;
-                }
-            }
-            Op::Mul => self.numeric_op(line, i64::wrapping_mul, |a, b| a * b, "multiply")?,
-            Op::Div => {
-                let b = self.stack.pop().unwrap();
-                let a = self.stack.pop().unwrap();
-                let res = match (a, b) {
-                    (Value::Int(_), Value::Int(0)) => {
-                        return Err(format!("[line {}] Division by zero", line));
-                    }
-                    (Value::Int(x), Value::Int(y)) => {
-                        Value::Int(x.checked_div(y).unwrap_or(i64::MIN))
-                    }
-                    (Value::Float(x), Value::Float(y)) => {
-                        if y == 0.0 {
-                            return Err(format!("[line {}] Division by zero", line));
+                Op::Mod => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        if *y == 0 {
+                            let line = chunk.lines[op_ip];
+                            return Err(format!("[line {}] Modulo by zero", line));
                         }
-                        Value::Float(x / y)
-                    }
-                    (Value::Int(x), Value::Float(y)) => {
-                        if y == 0.0 {
-                            return Err(format!("[line {}] Division by zero", line));
+                        let res = x.checked_rem(*y).unwrap_or(0);
+                        self.stack[len - 2] = Value::Int(res);
+                        self.stack.pop();
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        let b = self.stack.pop().unwrap();
+                        let a = self.stack.pop().unwrap();
+                        match (a, b) {
+                            (Value::Float(x), Value::Float(y)) => {
+                                self.stack.push(Value::Float(x % y))
+                            }
+                            (l, r) => {
+                                return Err(format!(
+                                    "[line {}] Cannot modulo '{}' and '{}'",
+                                    line,
+                                    l.type_name(),
+                                    r.type_name()
+                                ));
+                            }
                         }
-                        Value::Float((x as f64) / y)
                     }
-                    (Value::Float(x), Value::Int(y)) => {
-                        if y == 0 {
-                            return Err(format!("[line {}] Division by zero", line));
+                }
+                Op::Neg => {
+                    let len = self.stack.len();
+                    match &mut self.stack[len - 1] {
+                        Value::Int(x) => *x = x.wrapping_neg(),
+                        Value::Float(x) => *x = -*x,
+                        other => {
+                            let line = chunk.lines[op_ip];
+                            return Err(format!(
+                                "[line {}] Cannot negate '{}'",
+                                line,
+                                other.type_name()
+                            ));
                         }
-                        Value::Float(x / (y as f64))
-                    }
-                    (l, r) => {
-                        return Err(format!(
-                            "[line {}] Cannot divide '{}' and '{}'",
-                            line,
-                            l.type_name(),
-                            r.type_name()
-                        ));
-                    }
-                };
-                self.stack.push(res);
-            }
-            Op::Mod => {
-                let b = self.stack.pop().unwrap();
-                let a = self.stack.pop().unwrap();
-                match (a, b) {
-                    (Value::Int(_), Value::Int(0)) => {
-                        return Err(format!("[line {}] Modulo by zero", line));
-                    }
-                    (Value::Int(x), Value::Int(y)) => {
-                        self.stack.push(Value::Int(x.checked_rem(y).unwrap_or(0)))
-                    }
-                    (Value::Float(x), Value::Float(y)) => self.stack.push(Value::Float(x % y)),
-                    (l, r) => {
-                        return Err(format!(
-                            "[line {}] Cannot modulo '{}' and '{}'",
-                            line,
-                            l.type_name(),
-                            r.type_name()
-                        ));
                     }
                 }
-            }
-            Op::Neg => {
-                let v = self.stack.pop().unwrap();
-                match v {
-                    Value::Int(x) => self.stack.push(Value::Int(x.wrapping_neg())),
-                    Value::Float(x) => self.stack.push(Value::Float(-x)),
-                    other => {
-                        return Err(format!(
-                            "[line {}] Cannot negate '{}'",
-                            line,
-                            other.type_name()
-                        ));
-                    }
+                Op::Not => {
+                    let len = self.stack.len();
+                    let b = !self.stack[len - 1].is_truthy();
+                    self.stack[len - 1] = Value::Bool(b);
                 }
-            }
-            Op::Not => {
-                let v = self.stack.pop().unwrap();
-                self.stack.push(Value::Bool(!v.is_truthy()));
-            }
-            Op::Eq => {
-                let b = self.stack.pop().unwrap();
-                let a = self.stack.pop().unwrap();
-                self.stack.push(Value::Bool(a.equals(&b)));
-            }
-            Op::Ne => {
-                let b = self.stack.pop().unwrap();
-                let a = self.stack.pop().unwrap();
-                self.stack.push(Value::Bool(!a.equals(&b)));
-            }
-            Op::Lt => {
-                let len = self.stack.len();
-                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
-                {
-                    let res = *x < *y;
-                    self.stack[len - 2] = Value::Bool(res);
+                Op::Eq => {
+                    let len = self.stack.len();
+                    let eq = match (&self.stack[len - 2], &self.stack[len - 1]) {
+                        (Value::Int(a), Value::Int(b)) => a == b,
+                        (Value::Bool(a), Value::Bool(b)) => a == b,
+                        (Value::Str(a), Value::Str(b)) => a == b,
+                        (Value::Unit, Value::Unit) => true,
+                        (a, b) => a.equals(b),
+                    };
+                    self.stack[len - 2] = Value::Bool(eq);
                     self.stack.pop();
-                } else {
-                    self.cmp_op(line, |a, b| a < b, |a, b| a < b, |a, b| a < b)?;
                 }
-            }
-            Op::Le => {
-                let len = self.stack.len();
-                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
-                {
-                    let res = *x <= *y;
-                    self.stack[len - 2] = Value::Bool(res);
+                Op::Ne => {
+                    let len = self.stack.len();
+                    let ne = match (&self.stack[len - 2], &self.stack[len - 1]) {
+                        (Value::Int(a), Value::Int(b)) => a != b,
+                        (Value::Bool(a), Value::Bool(b)) => a != b,
+                        (Value::Str(a), Value::Str(b)) => a != b,
+                        (Value::Unit, Value::Unit) => false,
+                        (a, b) => !a.equals(b),
+                    };
+                    self.stack[len - 2] = Value::Bool(ne);
                     self.stack.pop();
-                } else {
-                    self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?;
                 }
-            }
-            Op::Gt => {
-                let len = self.stack.len();
-                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
-                {
-                    let res = *x > *y;
-                    self.stack[len - 2] = Value::Bool(res);
-                    self.stack.pop();
-                } else {
-                    self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?;
-                }
-            }
-            Op::Ge => {
-                let len = self.stack.len();
-                if let (Value::Int(x), Value::Int(y)) = (&self.stack[len - 2], &self.stack[len - 1])
-                {
-                    let res = *x >= *y;
-                    self.stack[len - 2] = Value::Bool(res);
-                    self.stack.pop();
-                } else {
-                    self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?;
-                }
-            }
-            Op::In => {
-                let container = self.stack.pop().unwrap();
-                let needle = self.stack.pop().unwrap();
-                let found = match (needle, container) {
-                    (Value::Str(sub), Value::Str(s)) => s.contains(&sub),
-                    (Value::Int(byte), Value::Bytes(b)) => {
-                        (0..=255).contains(&byte) && b.contains(&(byte as u8))
+                Op::Lt => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        let res = *x < *y;
+                        self.stack[len - 2] = Value::Bool(res);
+                        self.stack.pop();
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        self.cmp_op(line, |a, b| a < b, |a, b| a < b, |a, b| a < b)?;
                     }
-                    (Value::Bytes(sub), Value::Bytes(b)) => {
-                        sub.is_empty() || b.windows(sub.len()).any(|w| w == sub.as_slice())
+                }
+                Op::Le => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        let res = *x <= *y;
+                        self.stack[len - 2] = Value::Bool(res);
+                        self.stack.pop();
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?;
                     }
-                    (val, Value::List(l)) => l.borrow().iter().any(|item| item.equals(&val)),
-                    (val, Value::Set(s)) => s.borrow().contains(&val),
-                    (Value::Str(k), Value::Dict(d)) => d.borrow().contains_key(&k),
-                    (Value::Int(n), Value::Range { start, end }) => n >= start && n < end,
-                    (val, Value::StructInstance(inst)) => {
-                        let Some(method) = inst.def.methods.get("contains").cloned() else {
+                }
+                Op::Gt => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        let res = *x > *y;
+                        self.stack[len - 2] = Value::Bool(res);
+                        self.stack.pop();
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?;
+                    }
+                }
+                Op::Ge => {
+                    let len = self.stack.len();
+                    if let (Value::Int(x), Value::Int(y)) =
+                        (&self.stack[len - 2], &self.stack[len - 1])
+                    {
+                        let res = *x >= *y;
+                        self.stack[len - 2] = Value::Bool(res);
+                        self.stack.pop();
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?;
+                    }
+                }
+                Op::In => {
+                    let line = chunk.lines[op_ip];
+                    let container = self.stack.pop().unwrap();
+                    let needle = self.stack.pop().unwrap();
+                    let found = match (needle, container) {
+                        (Value::Str(sub), Value::Str(s)) => s.contains(&sub),
+                        (Value::Int(byte), Value::Bytes(b)) => {
+                            (0..=255).contains(&byte) && b.contains(&(byte as u8))
+                        }
+                        (Value::Bytes(sub), Value::Bytes(b)) => {
+                            sub.is_empty() || b.windows(sub.len()).any(|w| w == sub.as_slice())
+                        }
+                        (val, Value::List(l)) => l.borrow().iter().any(|item| item.equals(&val)),
+                        (val, Value::Set(s)) => s.borrow().contains(&val),
+                        (Value::Str(k), Value::Dict(d)) => d.borrow().contains_key(&k),
+                        (Value::Int(n), Value::Range { start, end }) => n >= start && n < end,
+                        (val, Value::StructInstance(inst)) => {
+                            let Some(method) = inst.def.methods.get("contains").cloned() else {
+                                return Err(format!(
+                                    "[line {}] Cannot check '{}' in '{}'",
+                                    line,
+                                    val.type_name(),
+                                    inst.def.name
+                                ));
+                            };
+                            self.frames.last_mut().unwrap().ip = ip;
+                            let res = self
+                                .call_value(method, &[Value::StructInstance(inst), val])
+                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                            res.is_truthy()
+                        }
+                        (n, c) => {
                             return Err(format!(
                                 "[line {}] Cannot check '{}' in '{}'",
                                 line,
-                                val.type_name(),
-                                inst.def.name
-                            ));
-                        };
-                        let res = self
-                            .call_value(method, &[Value::StructInstance(inst), val])
-                            .map_err(|e| format!("[line {}] {}", line, e))?;
-                        res.is_truthy()
-                    }
-                    (n, c) => {
-                        return Err(format!(
-                            "[line {}] Cannot check '{}' in '{}'",
-                            line,
-                            n.type_name(),
-                            c.type_name()
-                        ));
-                    }
-                };
-                self.stack.push(Value::Bool(found));
-            }
-            Op::IsNumeric => {
-                let val = self.stack.pop().unwrap();
-                self.stack
-                    .push(Value::Bool(matches!(val, Value::Int(_) | Value::Float(_))));
-            }
-            Op::Jump(target) => {
-                self.frames.last_mut().unwrap().ip = target;
-            }
-            Op::JumpIfFalsePop(target) => {
-                let cond = self.stack.pop().unwrap();
-                if !cond.is_truthy() {
-                    self.frames.last_mut().unwrap().ip = target;
-                }
-            }
-            Op::JumpIfFalsePeek(target) => {
-                if !self.stack.last().unwrap().is_truthy() {
-                    self.frames.last_mut().unwrap().ip = target;
-                }
-            }
-            Op::JumpIfTruePeek(target) => {
-                if self.stack.last().unwrap().is_truthy() {
-                    self.frames.last_mut().unwrap().ip = target;
-                }
-            }
-            Op::JumpIfNotUnitPeek(target) => {
-                if !matches!(self.stack.last().unwrap(), Value::Unit) {
-                    self.frames.last_mut().unwrap().ip = target;
-                }
-            }
-            Op::JumpIfArgPresent(arg_idx, target) => {
-                let frame = self.frames.last_mut().unwrap();
-                if arg_is_present(&frame.arg_bits, arg_idx as usize) {
-                    frame.ip = target;
-                }
-            }
-            Op::Call(argc) => {
-                let argc = argc as usize;
-                let callee_idx = self.stack.len() - 1 - argc;
-                let callee = self.stack[callee_idx].clone();
-                match callee {
-                    Value::Closure(closure) => {
-                        if self.frames.len() >= MAX_CALL_DEPTH {
-                            return Err(format!(
-                                "[line {}] Stack overflow (maximum call depth {} exceeded)",
-                                line, MAX_CALL_DEPTH
+                                n.type_name(),
+                                c.type_name()
                             ));
                         }
-                        if closure.proto.arity as usize == argc && !closure.proto.is_variadic {
+                    };
+                    self.stack.push(Value::Bool(found));
+                }
+                Op::IsNumeric => {
+                    let len = self.stack.len();
+                    let b = matches!(self.stack[len - 1], Value::Int(_) | Value::Float(_));
+                    self.stack[len - 1] = Value::Bool(b);
+                }
+                Op::Jump(target) => {
+                    ip = target;
+                }
+                Op::JumpIfFalsePop(target) => {
+                    let cond = self.stack.pop().unwrap();
+                    if !cond.is_truthy() {
+                        ip = target;
+                    }
+                }
+                Op::JumpIfFalsePeek(target) => {
+                    if !self.stack.last().unwrap().is_truthy() {
+                        ip = target;
+                    }
+                }
+                Op::JumpIfTruePeek(target) => {
+                    if self.stack.last().unwrap().is_truthy() {
+                        ip = target;
+                    }
+                }
+                Op::JumpIfNotUnitPeek(target) => {
+                    if !matches!(self.stack.last().unwrap(), Value::Unit) {
+                        ip = target;
+                    }
+                }
+                Op::JumpIfArgPresent(arg_idx, target) => {
+                    if arg_is_present(&self.frames.last().unwrap().arg_bits, arg_idx as usize) {
+                        ip = target;
+                    }
+                }
+                Op::Call(argc) => {
+                    let argc_usize = argc as usize;
+                    let callee_idx = self.stack.len() - 1 - argc_usize;
+                    match &self.stack[callee_idx] {
+                        Value::Closure(closure_ref) => {
+                            if self.frames.len() >= MAX_CALL_DEPTH {
+                                let line = chunk.lines[op_ip];
+                                return Err(format!(
+                                    "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                    line, MAX_CALL_DEPTH
+                                ));
+                            }
+                            let fixed_fast = closure_ref.proto.arity as usize == argc_usize
+                                && !closure_ref.proto.is_variadic;
+                            let Value::Closure(closure) =
+                                std::mem::replace(&mut self.stack[callee_idx], Value::Unit)
+                            else {
+                                unreachable!()
+                            };
+                            let bits = if fixed_fast {
+                                make_positional_arg_bits(argc_usize)
+                            } else {
+                                let line = chunk.lines[op_ip];
+                                let pos_args = self.stack[callee_idx + 1..].to_vec();
+                                let (slots, bits) = self
+                                    .build_closure_slots(&closure, &pos_args, None)
+                                    .map_err(|e| format!("[line {}] {}", line, e))?;
+                                self.stack.truncate(callee_idx + 1);
+                                self.stack.extend(slots);
+                                bits
+                            };
                             let enter_step = self.step_counter;
                             let enter_time = if self.profile_enabled {
                                 Some(Instant::now())
                             } else {
                                 None
                             };
-                            self.frames.push(CallFrame {
-                                closure,
-                                ip: 0,
-                                base: callee_idx,
-                                arg_bits: make_positional_arg_bits(argc),
-                                enter_step,
-                                enter_time,
-                            });
-                        } else {
-                            let pos_args = self.stack[callee_idx + 1..].to_vec();
-                            let (slots, bits) = self
-                                .build_closure_slots(&closure, &pos_args, None)
-                                .map_err(|e| format!("[line {}] {}", line, e))?;
-                            self.stack.truncate(callee_idx + 1);
-                            self.stack.extend(slots);
-                            let enter_step = self.step_counter;
-                            let enter_time = if self.profile_enabled {
-                                Some(Instant::now())
-                            } else {
-                                None
-                            };
+                            self.frames.last_mut().unwrap().ip = ip;
+                            cur_closure = closure.clone();
+                            cur_base = callee_idx;
+                            ip = 0;
+                            proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
                             self.frames.push(CallFrame {
                                 closure,
                                 ip: 0,
@@ -1696,176 +1957,1024 @@ impl VM {
                                 enter_time,
                             });
                         }
+                        Value::NativeFn(native) => {
+                            let native = *native;
+                            self.frames.last_mut().unwrap().ip = ip;
+                            let line = chunk.lines[op_ip];
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            let res = if argc_usize <= 8 {
+                                let mut small_args: [Value; 8] = [const { Value::Unit }; 8];
+                                for i in 0..argc_usize {
+                                    small_args[i] = std::mem::replace(
+                                        &mut self.stack[callee_idx + 1 + i],
+                                        Value::Unit,
+                                    );
+                                }
+                                self.stack.truncate(callee_idx);
+                                (native.func)(self, &small_args[..argc_usize])
+                            } else {
+                                let args = self.stack[callee_idx + 1..].to_vec();
+                                self.stack.truncate(callee_idx);
+                                (native.func)(self, &args)
+                            }
+                            .map_err(|e| format!("[line {}] {}", line, e));
+                            if self.profile_enabled {
+                                self.record_profile(native.name, enter_step, enter_time);
+                            }
+                            self.stack.push(res?);
+                        }
+                        Value::BoundMethod(_) | Value::StructDef(_) => {
+                            let callee =
+                                std::mem::replace(&mut self.stack[callee_idx], Value::Unit);
+                            let line = chunk.lines[op_ip];
+                            match callee {
+                                Value::BoundMethod(m) => {
+                                    let mut combined = Vec::with_capacity(1 + argc_usize);
+                                    combined.push(m.receiver.clone());
+                                    combined.extend_from_slice(&self.stack[callee_idx + 1..]);
+                                    self.stack.truncate(callee_idx);
+                                    let func = m.func.clone();
+                                    match func {
+                                        Value::Closure(closure) => {
+                                            if self.frames.len() >= MAX_CALL_DEPTH {
+                                                return Err(format!(
+                                                    "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                                    line, MAX_CALL_DEPTH
+                                                ));
+                                            }
+                                            let (slots, bits) = self
+                                                .build_closure_slots(&closure, &combined, None)
+                                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                                            self.stack.push(Value::Unit);
+                                            self.stack.extend(slots);
+                                            let enter_step = self.step_counter;
+                                            let enter_time = if self.profile_enabled {
+                                                Some(Instant::now())
+                                            } else {
+                                                None
+                                            };
+                                            self.frames.last_mut().unwrap().ip = ip;
+                                            cur_closure = closure.clone();
+                                            cur_base = callee_idx;
+                                            ip = 0;
+                                            proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
+                                            self.frames.push(CallFrame {
+                                                closure,
+                                                ip: 0,
+                                                base: callee_idx,
+                                                arg_bits: bits,
+                                                enter_step,
+                                                enter_time,
+                                            });
+                                        }
+                                        other => {
+                                            self.frames.last_mut().unwrap().ip = ip;
+                                            let res = self
+                                                .call_value(other, &combined)
+                                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                                            self.stack.push(res);
+                                        }
+                                    }
+                                }
+                                Value::StructDef(def) => {
+                                    let args = self.stack[callee_idx + 1..].to_vec();
+                                    self.stack.truncate(callee_idx);
+                                    if args.len() > def.field_names.len() {
+                                        return Err(format!(
+                                            "[line {}] Struct '{}' takes at most {} positional arguments, got {}",
+                                            line,
+                                            def.name,
+                                            def.field_names.len(),
+                                            args.len()
+                                        ));
+                                    }
+                                    let names = def.field_names[..args.len()].to_vec();
+                                    let res = self
+                                        .instantiate_struct(&def, None, &names, &args)
+                                        .map_err(|e| format!("[line {}] {}", line, e))?;
+                                    self.stack.push(res);
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        other => {
+                            let line = chunk.lines[op_ip];
+                            return Err(format!(
+                                "[line {}] Cannot call value of type '{}'",
+                                line,
+                                other.type_name()
+                            ));
+                        }
                     }
-                    Value::NativeFn(native) => {
+                }
+                Op::TailCall(argc) => {
+                    let argc_usize = argc as usize;
+                    let callee_idx = self.stack.len() - 1 - argc_usize;
+                    if let Value::Closure(closure_ref) = &self.stack[callee_idx] {
+                        let fixed_fast = closure_ref.proto.arity as usize == argc_usize
+                            && !closure_ref.proto.is_variadic;
+                        let Value::Closure(closure) =
+                            std::mem::replace(&mut self.stack[callee_idx], Value::Unit)
+                        else {
+                            unreachable!()
+                        };
+                        if self.frames.len() < 16 {
+                            let bits = if fixed_fast {
+                                make_positional_arg_bits(argc_usize)
+                            } else {
+                                let line = chunk.lines[op_ip];
+                                let pos_args = self.stack[callee_idx + 1..].to_vec();
+                                let (slots, bits) = self
+                                    .build_closure_slots(&closure, &pos_args, None)
+                                    .map_err(|e| format!("[line {}] {}", line, e))?;
+                                self.stack.truncate(callee_idx + 1);
+                                self.stack.extend(slots);
+                                bits
+                            };
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            self.frames.last_mut().unwrap().ip = ip;
+                            cur_closure = closure.clone();
+                            cur_base = callee_idx;
+                            ip = 0;
+                            proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
+                            self.frames.push(CallFrame {
+                                closure,
+                                ip: 0,
+                                base: callee_idx,
+                                arg_bits: bits,
+                                enter_step,
+                                enter_time,
+                            });
+                        } else {
+                            let line = chunk.lines[op_ip];
+                            if self.profile_enabled {
+                                let cur_frame = self.frames.last().unwrap();
+                                let prev_name = cur_frame.closure.proto.name.clone();
+                                let prev_step = cur_frame.enter_step;
+                                let prev_time = cur_frame.enter_time;
+                                self.record_profile(&prev_name, prev_step, prev_time);
+                            }
+                            let (slots, bits) = if fixed_fast {
+                                (
+                                    self.stack[callee_idx + 1..].to_vec(),
+                                    make_positional_arg_bits(argc_usize),
+                                )
+                            } else {
+                                let pos_args = self.stack[callee_idx + 1..].to_vec();
+                                self.build_closure_slots(&closure, &pos_args, None)
+                                    .map_err(|e| format!("[line {}] {}", line, e))?
+                            };
+                            if !self.open_upvalues.is_empty() {
+                                self.close_upvalues_from(cur_base);
+                            }
+                            self.stack.truncate(cur_base);
+                            self.stack.push(Value::Unit);
+                            self.stack.extend(slots);
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            cur_closure = closure.clone();
+                            ip = 0;
+                            proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
+                            let frame = self.frames.last_mut().unwrap();
+                            frame.closure = closure;
+                            frame.ip = 0;
+                            frame.arg_bits = bits;
+                            frame.enter_step = enter_step;
+                            frame.enter_time = enter_time;
+                        }
+                    } else {
+                        let line = chunk.lines[op_ip];
+                        let callee = std::mem::replace(&mut self.stack[callee_idx], Value::Unit);
                         let args = self.stack[callee_idx + 1..].to_vec();
                         self.stack.truncate(callee_idx);
-                        let enter_step = self.step_counter;
-                        let enter_time = if self.profile_enabled {
-                            Some(Instant::now())
-                        } else {
-                            None
-                        };
-                        let res = (native.func)(self, &args)
-                            .map_err(|e| format!("[line {}] {}", line, e));
-                        self.record_profile(native.name, enter_step, enter_time);
-                        self.stack.push(res?);
+                        self.frames.last_mut().unwrap().ip = ip;
+                        let res = self
+                            .call_value(callee, &args)
+                            .map_err(|e| format!("[line {}] {}", line, e))?;
+                        let frame = self.frames.pop().unwrap();
+                        if self.profile_enabled {
+                            self.record_profile(
+                                &frame.closure.proto.name,
+                                frame.enter_step,
+                                frame.enter_time,
+                            );
+                        }
+                        if !self.try_handlers.is_empty() {
+                            while self
+                                .try_handlers
+                                .last()
+                                .is_some_and(|h| h.frame_depth > self.frames.len())
+                            {
+                                self.try_handlers.pop();
+                            }
+                        }
+                        if !self.open_upvalues.is_empty() {
+                            self.close_upvalues_from(frame.base);
+                        }
+                        self.stack.truncate(frame.base);
+                        if self.frames.len() == target_depth {
+                            return Ok(res);
+                        }
+                        self.stack.push(res);
+                        let caller = self.frames.last().unwrap();
+                        cur_closure = caller.closure.clone();
+                        cur_base = caller.base;
+                        ip = caller.ip;
+                        proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
                     }
-                    Value::BoundMethod(m) => {
-                        let mut combined = Vec::with_capacity(1 + argc);
-                        combined.push(m.receiver.clone());
-                        combined.extend_from_slice(&self.stack[callee_idx + 1..]);
-                        self.stack.truncate(callee_idx);
-                        let func = m.func.clone();
-                        match func {
-                            Value::Closure(closure) => {
-                                if self.frames.len() >= MAX_CALL_DEPTH {
+                }
+                Op::CallNamed(pos_argc, kw_idx) => {
+                    let line = chunk.lines[op_ip];
+                    let pos_argc = pos_argc as usize;
+                    let kw_names = chunk.kw_lists[kw_idx as usize].clone();
+                    let kw_len = kw_names.len();
+                    let total_argc = pos_argc + kw_len;
+                    let callee_idx = self.stack.len() - 1 - total_argc;
+                    let callee = std::mem::replace(&mut self.stack[callee_idx], Value::Unit);
+                    let pos_args = self.stack[callee_idx + 1..callee_idx + 1 + pos_argc].to_vec();
+                    let kw_vals = self.stack[callee_idx + 1 + pos_argc..].to_vec();
+                    self.stack.truncate(callee_idx);
+                    match callee {
+                        Value::Closure(closure) => {
+                            if self.frames.len() >= MAX_CALL_DEPTH {
+                                return Err(format!(
+                                    "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                    line, MAX_CALL_DEPTH
+                                ));
+                            }
+                            let (slots, bits) = self
+                                .build_closure_slots(
+                                    &closure,
+                                    &pos_args,
+                                    Some((&kw_names, &kw_vals)),
+                                )
+                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                            self.stack.push(Value::Unit);
+                            self.stack.extend(slots);
+                            let enter_step = self.step_counter;
+                            let enter_time = if self.profile_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
+                            self.frames.last_mut().unwrap().ip = ip;
+                            cur_closure = closure.clone();
+                            cur_base = callee_idx;
+                            ip = 0;
+                            proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
+                            self.frames.push(CallFrame {
+                                closure,
+                                ip: 0,
+                                base: callee_idx,
+                                arg_bits: bits,
+                                enter_step,
+                                enter_time,
+                            });
+                        }
+                        Value::BoundMethod(m) => {
+                            let mut combined = Vec::with_capacity(1 + pos_args.len());
+                            combined.push(m.receiver.clone());
+                            combined.extend(pos_args);
+                            match m.func.clone() {
+                                Value::Closure(closure) => {
+                                    if self.frames.len() >= MAX_CALL_DEPTH {
+                                        return Err(format!(
+                                            "[line {}] Stack overflow (maximum call depth {} exceeded)",
+                                            line, MAX_CALL_DEPTH
+                                        ));
+                                    }
+                                    let (slots, bits) = self
+                                        .build_closure_slots(
+                                            &closure,
+                                            &combined,
+                                            Some((&kw_names, &kw_vals)),
+                                        )
+                                        .map_err(|e| format!("[line {}] {}", line, e))?;
+                                    self.stack.push(Value::Unit);
+                                    self.stack.extend(slots);
+                                    let enter_step = self.step_counter;
+                                    let enter_time = if self.profile_enabled {
+                                        Some(Instant::now())
+                                    } else {
+                                        None
+                                    };
+                                    self.frames.last_mut().unwrap().ip = ip;
+                                    cur_closure = closure.clone();
+                                    cur_base = callee_idx;
+                                    ip = 0;
+                                    proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
+                                    self.frames.push(CallFrame {
+                                        closure,
+                                        ip: 0,
+                                        base: callee_idx,
+                                        arg_bits: bits,
+                                        enter_step,
+                                        enter_time,
+                                    });
+                                }
+                                other => {
                                     return Err(format!(
-                                        "[line {}] Stack overflow (maximum call depth {} exceeded)",
-                                        line, MAX_CALL_DEPTH
+                                        "[line {}] Named arguments are not supported for '{}'",
+                                        line,
+                                        other.type_name()
                                     ));
                                 }
-                                let (slots, bits) = self
-                                    .build_closure_slots(&closure, &combined, None)
-                                    .map_err(|e| format!("[line {}] {}", line, e))?;
-                                self.stack.push(Value::Closure(closure.clone()));
-                                self.stack.extend(slots);
-                                let enter_step = self.step_counter;
-                                let enter_time = if self.profile_enabled {
-                                    Some(Instant::now())
-                                } else {
-                                    None
-                                };
-                                self.frames.push(CallFrame {
-                                    closure,
-                                    ip: 0,
-                                    base: callee_idx,
-                                    arg_bits: bits,
-                                    enter_step,
-                                    enter_time,
-                                });
-                            }
-                            other => {
-                                let res = self
-                                    .call_value(other, &combined)
-                                    .map_err(|e| format!("[line {}] {}", line, e))?;
-                                self.stack.push(res);
                             }
                         }
-                    }
-                    Value::StructDef(def) => {
-                        let args = self.stack[callee_idx + 1..].to_vec();
-                        self.stack.truncate(callee_idx);
-                        if args.len() > def.field_names.len() {
+                        Value::StructDef(def) => {
+                            if pos_args.len() > def.field_names.len() {
+                                return Err(format!(
+                                    "[line {}] Struct '{}' takes at most {} positional arguments",
+                                    line,
+                                    def.name,
+                                    def.field_names.len()
+                                ));
+                            }
+                            let mut names = def.field_names[..pos_args.len()].to_vec();
+                            let mut vals = pos_args;
+                            names.extend(kw_names);
+                            vals.extend(kw_vals);
+                            let res = self
+                                .instantiate_struct(&def, None, &names, &vals)
+                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                            self.stack.push(res);
+                        }
+                        other => {
                             return Err(format!(
-                                "[line {}] Struct '{}' takes at most {} positional arguments, got {}",
+                                "[line {}] Named arguments are not supported for '{}'",
                                 line,
-                                def.name,
-                                def.field_names.len(),
-                                args.len()
+                                other.type_name()
                             ));
                         }
-                        let names = def.field_names[..args.len()].to_vec();
-                        let res = self
-                            .instantiate_struct(&def, None, &names, &args)
-                            .map_err(|e| format!("[line {}] {}", line, e))?;
-                        self.stack.push(res);
-                    }
-                    other => {
-                        return Err(format!(
-                            "[line {}] Cannot call value of type '{}'",
-                            line,
-                            other.type_name()
-                        ));
                     }
                 }
-            }
-            Op::TailCall(argc) => {
-                let argc = argc as usize;
-                let callee_idx = self.stack.len() - 1 - argc;
-                let callee = self.stack[callee_idx].clone();
-                if let Value::Closure(closure) = callee {
-                    if self.frames.len() < 16 {
-                        if closure.proto.arity as usize == argc && !closure.proto.is_variadic {
-                            let enter_step = self.step_counter;
-                            let enter_time = if self.profile_enabled {
-                                Some(Instant::now())
-                            } else {
-                                None
-                            };
-                            self.frames.push(CallFrame {
-                                closure,
-                                ip: 0,
-                                base: callee_idx,
-                                arg_bits: make_positional_arg_bits(argc),
-                                enter_step,
-                                enter_time,
-                            });
+                Op::Closure(idx, uv_idx) => {
+                    let proto = match &chunk.constants[idx as usize] {
+                        Constant::Function(p) => p.clone(),
+                        _ => unreachable!(),
+                    };
+                    let descs = &chunk.upvalue_lists[uv_idx as usize];
+                    let mut upvalues = Vec::with_capacity(descs.len());
+                    for desc in descs {
+                        if desc.is_local {
+                            let slot = cur_base + desc.index as usize;
+                            upvalues.push(self.capture_upvalue(slot));
                         } else {
-                            let pos_args = self.stack[callee_idx + 1..].to_vec();
-                            let (slots, bits) = self
-                                .build_closure_slots(&closure, &pos_args, None)
-                                .map_err(|e| format!("[line {}] {}", line, e))?;
-                            self.stack.truncate(callee_idx + 1);
-                            self.stack.extend(slots);
-                            let enter_step = self.step_counter;
-                            let enter_time = if self.profile_enabled {
-                                Some(Instant::now())
-                            } else {
-                                None
-                            };
-                            self.frames.push(CallFrame {
-                                closure,
-                                ip: 0,
-                                base: callee_idx,
-                                arg_bits: bits,
-                                enter_step,
-                                enter_time,
-                            });
+                            upvalues.push(cur_closure.upvalues[desc.index as usize].clone());
                         }
-                        return Ok(None);
                     }
-                    let cur_frame = self.frames.last().unwrap();
-                    let cur_base = cur_frame.base;
-                    if self.profile_enabled {
-                        let prev_name = cur_frame.closure.proto.name.clone();
-                        let prev_step = cur_frame.enter_step;
-                        let prev_time = cur_frame.enter_time;
-                        self.record_profile(&prev_name, prev_step, prev_time);
-                    }
-                    let (slots, bits) =
-                        if closure.proto.arity as usize == argc && !closure.proto.is_variadic {
-                            (
-                                self.stack[callee_idx + 1..].to_vec(),
-                                make_positional_arg_bits(argc),
-                            )
-                        } else {
-                            let pos_args = self.stack[callee_idx + 1..].to_vec();
-                            self.build_closure_slots(&closure, &pos_args, None)
-                                .map_err(|e| format!("[line {}] {}", line, e))?
+                    let base_dir = cur_closure.base_dir.clone();
+                    self.stack.push(Value::Closure(Rc::new(Closure {
+                        proto,
+                        upvalues,
+                        base_dir,
+                    })));
+                }
+                Op::MakeList(count) => {
+                    let count = count as usize;
+                    self.charge_alloc(count.saturating_mul(std::mem::size_of::<Value>()))?;
+                    let start = self.stack.len() - count;
+                    let items = self.stack.drain(start..).collect::<Vec<_>>();
+                    self.stack.push(Value::List(Rc::new(RefCell::new(items))));
+                }
+                Op::MakeDict(count) => {
+                    let line = chunk.lines[op_ip];
+                    let count = count as usize;
+                    self.charge_alloc(count.saturating_mul(64))?;
+                    let start = self.stack.len() - count * 2;
+                    let drained: Vec<Value> = self.stack.drain(start..).collect();
+                    let mut map = HashMap::with_capacity(count);
+                    for pair in drained.chunks_exact(2) {
+                        let key = match &pair[0] {
+                            Value::Str(s) => s.clone(),
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Dictionary keys must be strings, got '{}'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
                         };
-                    self.close_upvalues_from(cur_base);
-                    self.stack.truncate(cur_base);
-                    self.stack.push(Value::Closure(closure.clone()));
-                    self.stack.extend(slots);
-                    let enter_step = self.step_counter;
-                    let enter_time = if self.profile_enabled {
-                        Some(Instant::now())
+                        map.insert(key, pair[1].clone());
+                    }
+                    self.stack.push(Value::Dict(Rc::new(RefCell::new(map))));
+                }
+                Op::MakeStructDef(idx) => {
+                    let st_proto = match &chunk.constants[idx as usize] {
+                        Constant::Struct(s) => s.clone(),
+                        _ => unreachable!(),
+                    };
+                    let default_count = st_proto
+                        .fields
+                        .iter()
+                        .filter(|(_, has_def)| *has_def)
+                        .count();
+                    let method_count = st_proto.methods.len();
+                    let total = default_count + method_count;
+                    let start = self.stack.len() - total;
+                    let popped: Vec<Value> = self.stack.drain(start..).collect();
+                    let mut field_names = Vec::with_capacity(st_proto.fields.len());
+                    let mut field_index = HashMap::with_capacity(st_proto.fields.len());
+                    let mut field_defaults = Vec::with_capacity(st_proto.fields.len());
+                    let mut p_idx = 0usize;
+                    for (i, (fname, has_def)) in st_proto.fields.iter().enumerate() {
+                        field_names.push(fname.clone());
+                        field_index.insert(fname.clone(), i);
+                        if *has_def {
+                            field_defaults.push(Some(popped[p_idx].clone()));
+                            p_idx += 1;
+                        } else {
+                            field_defaults.push(None);
+                        }
+                    }
+                    let mut methods = HashMap::with_capacity(method_count);
+                    for mname in &st_proto.methods {
+                        methods.insert(mname.clone(), popped[p_idx].clone());
+                        p_idx += 1;
+                    }
+                    self.stack.push(Value::StructDef(Rc::new(StructDef {
+                        name: st_proto.name.clone(),
+                        field_names,
+                        field_index,
+                        field_defaults,
+                        methods,
+                    })));
+                }
+                Op::InitStruct(has_spread, kw_idx) => {
+                    let line = chunk.lines[op_ip];
+                    let field_names = chunk.kw_lists[kw_idx as usize].clone();
+                    let field_count = field_names.len();
+                    let fstart = self.stack.len() - field_count;
+                    let field_vals: Vec<Value> = self.stack.drain(fstart..).collect();
+                    let spread = if has_spread != 0 {
+                        Some(self.stack.pop().unwrap())
                     } else {
                         None
                     };
-                    let frame = self.frames.last_mut().unwrap();
-                    frame.closure = closure;
-                    frame.ip = 0;
-                    frame.arg_bits = bits;
-                    frame.enter_step = enter_step;
-                    frame.enter_time = enter_time;
-                } else {
-                    let args = self.stack[callee_idx + 1..].to_vec();
-                    self.stack.truncate(callee_idx);
-                    let res = self
-                        .call_value(callee, &args)
+                    let target = self.stack.pop().unwrap();
+                    let Value::StructDef(def) = target else {
+                        return Err(format!(
+                            "[line {}] Expected struct type before '{{ ... }}', got '{}'",
+                            line,
+                            target.type_name()
+                        ));
+                    };
+                    let inst = self
+                        .instantiate_struct(&def, spread, &field_names, &field_vals)
                         .map_err(|e| format!("[line {}] {}", line, e))?;
+                    self.stack.push(inst);
+                }
+                Op::GetIndex => {
+                    let len = self.stack.len();
+                    match (&self.stack[len - 2], &self.stack[len - 1]) {
+                        (Value::List(list), Value::Int(i)) => {
+                            let borrowed = list.borrow();
+                            let llen = borrowed.len() as i64;
+                            let actual = if *i < 0 { llen + *i } else { *i };
+                            if actual < 0 || actual >= llen {
+                                let line = chunk.lines[op_ip];
+                                return Err(format!(
+                                    "[line {}] Index {} out of bounds for list of length {}",
+                                    line, *i, llen
+                                ));
+                            }
+                            let val = borrowed[actual as usize].clone();
+                            drop(borrowed);
+                            self.stack[len - 2] = val;
+                            self.stack.pop();
+                        }
+                        (Value::Dict(dict), Value::Str(key)) => {
+                            let val = dict.borrow().get(key).cloned().unwrap_or(Value::Unit);
+                            self.stack[len - 2] = val;
+                            self.stack.pop();
+                        }
+                        (Value::Bytes(b), Value::Int(i)) => {
+                            let blen = b.len() as i64;
+                            let actual = if *i < 0 { blen + *i } else { *i };
+                            if actual < 0 || actual >= blen {
+                                let line = chunk.lines[op_ip];
+                                return Err(format!(
+                                    "[line {}] Index {} out of bounds for bytes of length {}",
+                                    line, *i, blen
+                                ));
+                            }
+                            let val = Value::Int(b[actual as usize] as i64);
+                            self.stack[len - 2] = val;
+                            self.stack.pop();
+                        }
+                        _ => {
+                            let line = chunk.lines[op_ip];
+                            let idx_val = self.stack.pop().unwrap();
+                            let obj_val = self.stack.pop().unwrap();
+                            let res = match (obj_val, idx_val) {
+                                (Value::Str(s), Value::Int(i)) => {
+                                    let chars: Vec<char> = s.chars().collect();
+                                    let slen = chars.len() as i64;
+                                    let actual = if i < 0 { slen + i } else { i };
+                                    if actual < 0 || actual >= slen {
+                                        return Err(format!(
+                                            "[line {}] Index {} out of bounds for string of length {}",
+                                            line, i, slen
+                                        ));
+                                    }
+                                    Value::Str(chars[actual as usize].to_string())
+                                }
+                                (Value::Range { start, end }, Value::Int(i)) => {
+                                    let rlen = if end > start {
+                                        (end as i128) - (start as i128)
+                                    } else {
+                                        0
+                                    };
+                                    let actual = if i < 0 { rlen + i as i128 } else { i as i128 };
+                                    if actual < 0 || actual >= rlen {
+                                        return Err(format!(
+                                            "[line {}] Index {} out of bounds for range of length {}",
+                                            line, i, rlen
+                                        ));
+                                    }
+                                    Value::Int((start as i128 + actual) as i64)
+                                }
+                                (o, i) => {
+                                    return Err(format!(
+                                        "[line {}] Cannot index '{}' with '{}'",
+                                        line,
+                                        o.type_name(),
+                                        i.type_name()
+                                    ));
+                                }
+                            };
+                            self.stack.push(res);
+                        }
+                    }
+                }
+                Op::Slice(inclusive) => {
+                    let line = chunk.lines[op_ip];
+                    let end_val = self.stack.pop().unwrap();
+                    let start_val = self.stack.pop().unwrap();
+                    let obj_val = self.stack.pop().unwrap();
+                    let resolve_bounds = |len: i64| -> Result<(usize, usize), String> {
+                        let s = match &start_val {
+                            Value::Unit => 0,
+                            Value::Int(v) => {
+                                let r = if *v < 0 { len + *v } else { *v };
+                                r.clamp(0, len) as usize
+                            }
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Slice start must be int, got '{}'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        };
+                        let e = match &end_val {
+                            Value::Unit => len as usize,
+                            Value::Int(v) => {
+                                let r = if *v < 0 { len + *v } else { *v };
+                                let r = if inclusive { r.saturating_add(1) } else { r };
+                                r.clamp(0, len) as usize
+                            }
+                            other => {
+                                return Err(format!(
+                                    "[line {}] Slice end must be int, got '{}'",
+                                    line,
+                                    other.type_name()
+                                ));
+                            }
+                        };
+                        Ok((s, e))
+                    };
+                    let res = match obj_val {
+                        Value::List(list) => {
+                            let (s, e) = {
+                                let borrowed = list.borrow();
+                                resolve_bounds(borrowed.len() as i64)?
+                            };
+                            let slice_len = e.saturating_sub(s);
+                            self.charge_alloc(
+                                slice_len.saturating_mul(std::mem::size_of::<Value>()),
+                            )?;
+                            let sliced = if slice_len > 0 {
+                                list.borrow()[s..e].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            Value::List(Rc::new(RefCell::new(sliced)))
+                        }
+                        Value::Str(text) => {
+                            let chars: Vec<char> = text.chars().collect();
+                            let (s, e) = resolve_bounds(chars.len() as i64)?;
+                            let sliced: String = if s < e {
+                                chars[s..e].iter().collect()
+                            } else {
+                                String::new()
+                            };
+                            self.charge_alloc(sliced.len())?;
+                            Value::Str(sliced)
+                        }
+                        Value::Bytes(bytes) => {
+                            let (s, e) = resolve_bounds(bytes.len() as i64)?;
+                            let slice_len = e.saturating_sub(s);
+                            self.charge_alloc(slice_len)?;
+                            let sliced = if slice_len > 0 {
+                                bytes[s..e].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            Value::Bytes(Rc::new(sliced))
+                        }
+                        Value::Range { start, end } => {
+                            let len = if end > start {
+                                ((end as i128) - (start as i128)).min(i64::MAX as i128) as i64
+                            } else {
+                                0
+                            };
+                            let (s, e) = resolve_bounds(len)?;
+                            let ns = (start as i128 + s as i128).min(end as i128) as i64;
+                            let ne = (start as i128 + e as i128).min(end as i128) as i64;
+                            Value::Range {
+                                start: ns,
+                                end: ne.max(ns),
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "[line {}] Cannot slice '{}'",
+                                line,
+                                other.type_name()
+                            ));
+                        }
+                    };
+                    self.stack.push(res);
+                }
+                Op::SetIndex => {
+                    let val = self.stack.pop().unwrap();
+                    let idx_val = self.stack.pop().unwrap();
+                    let obj_val = self.stack.pop().unwrap();
+                    match (obj_val, idx_val) {
+                        (Value::List(list), Value::Int(i)) => {
+                            let mut borrowed = list.borrow_mut();
+                            let len = borrowed.len() as i64;
+                            let actual = if i < 0 { len + i } else { i };
+                            if actual < 0 || actual >= len {
+                                let line = chunk.lines[op_ip];
+                                return Err(format!(
+                                    "[line {}] Index {} out of bounds for list of length {}",
+                                    line, i, len
+                                ));
+                            }
+                            borrowed[actual as usize] = val.clone();
+                        }
+                        (Value::Dict(dict), Value::Str(key)) => {
+                            dict.borrow_mut().insert(key, val.clone());
+                        }
+                        (o, i) => {
+                            let line = chunk.lines[op_ip];
+                            return Err(format!(
+                                "[line {}] Cannot index-assign '{}' with '{}'",
+                                line,
+                                o.type_name(),
+                                i.type_name()
+                            ));
+                        }
+                    }
+                    self.stack.push(val);
+                }
+                Op::GetAttr(idx) => {
+                    let len = self.stack.len();
+                    match &self.stack[len - 1] {
+                        Value::Module(m) => {
+                            let mic_idx = (proto_ptr.wrapping_mul(31) ^ op_ip) & 511;
+                            let m_ptr = Rc::as_ptr(m) as usize;
+                            let cached = &self.module_ic[mic_idx];
+                            if cached.0 == self.ic_epoch
+                                && cached.1 == proto_ptr
+                                && cached.2 == op_ip
+                                && cached.3 == m_ptr
+                            {
+                                let val = cached.4.clone();
+                                self.stack[len - 1] = val;
+                                continue;
+                            }
+                            let attr_name = match &chunk.constants[idx as usize] {
+                                Constant::Str(s) => s.as_str(),
+                                _ => unreachable!(),
+                            };
+                            let val =
+                                m.exports.borrow().get(attr_name).cloned().ok_or_else(|| {
+                                    let line = chunk.lines[op_ip];
+                                    format!(
+                                        "[line {}] Module '{}' has no export '{}'",
+                                        line, m.name, attr_name
+                                    )
+                                })?;
+                            self.module_ic[mic_idx] =
+                                (self.ic_epoch, proto_ptr, op_ip, m_ptr, val.clone());
+                            self.stack[len - 1] = val;
+                            continue;
+                        }
+                        Value::StructInstance(inst) => {
+                            let ic_idx = (proto_ptr.wrapping_mul(31) ^ op_ip) & 1023;
+                            let cached = self.attr_ic[ic_idx];
+                            let def_ptr = Rc::as_ptr(&inst.def) as usize;
+                            if cached.0 == self.ic_epoch
+                                && cached.1 == proto_ptr
+                                && cached.2 == op_ip
+                                && cached.3 == def_ptr
+                            {
+                                let val = inst.fields.borrow()[cached.4].clone();
+                                self.stack[len - 1] = val;
+                                continue;
+                            }
+                            let attr_name = match &chunk.constants[idx as usize] {
+                                Constant::Str(s) => s.as_str(),
+                                _ => unreachable!(),
+                            };
+                            if let Some(&field_idx) = inst.def.field_index.get(attr_name) {
+                                self.attr_ic[ic_idx] =
+                                    (self.ic_epoch, proto_ptr, op_ip, def_ptr, field_idx);
+                                let val = inst.fields.borrow()[field_idx].clone();
+                                self.stack[len - 1] = val;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                    let attr = match &chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.as_str(),
+                        _ => unreachable!(),
+                    };
+                    let line = chunk.lines[op_ip];
+                    let obj = self.stack.pop().unwrap();
+                    let val = self.get_attr_value(obj, attr, line, ".")?;
+                    self.stack.push(val);
+                }
+                Op::OptGetAttr(idx) => {
+                    let obj = self.stack.pop().unwrap();
+                    if matches!(obj, Value::Unit) {
+                        self.stack.push(Value::Unit);
+                    } else {
+                        let attr = match &chunk.constants[idx as usize] {
+                            Constant::Str(s) => s.as_str(),
+                            _ => unreachable!(),
+                        };
+                        let line = chunk.lines[op_ip];
+                        let val = self.get_attr_value(obj, attr, line, "?.")?;
+                        self.stack.push(val);
+                    }
+                }
+                Op::ForPrep(slot, exit_ip) => {
+                    let line = chunk.lines[op_ip];
+                    let iter_pos = cur_base + slot as usize;
+                    let iter_val = self.stack[iter_pos].clone();
+                    let (normalized, start_i, end_i) = match iter_val {
+                        Value::Range { start, end } => (None, start, end),
+                        Value::List(ref l) => (None, 0, l.borrow().len() as i64),
+                        Value::Bytes(ref b) => (None, 0, b.len() as i64),
+                        Value::Str(ref s) => {
+                            let chars: Vec<Value> =
+                                s.chars().map(|c| Value::Str(c.to_string())).collect();
+                            let len = chars.len() as i64;
+                            self.charge_alloc(
+                                chars.len().saturating_mul(std::mem::size_of::<Value>()),
+                            )?;
+                            (Some(Value::List(Rc::new(RefCell::new(chars)))), 0, len)
+                        }
+                        Value::Set(ref s) => {
+                            let items = s.borrow().items.clone();
+                            let len = items.len() as i64;
+                            self.charge_alloc(
+                                items.len().saturating_mul(std::mem::size_of::<Value>()),
+                            )?;
+                            (Some(Value::List(Rc::new(RefCell::new(items)))), 0, len)
+                        }
+                        Value::StructInstance(inst) => {
+                            let Some(iter_fn) = inst.def.methods.get("iter").cloned() else {
+                                return Err(format!(
+                                    "[line {}] Struct '{}' does not implement iter()",
+                                    line, inst.def.name
+                                ));
+                            };
+                            self.frames.last_mut().unwrap().ip = ip;
+                            let ret = self
+                                .call_value(iter_fn, &[Value::StructInstance(inst)])
+                                .map_err(|e| format!("[line {}] {}", line, e))?;
+                            let (norm_val, s, e) = match &ret {
+                                Value::Range { start, end } => (ret.clone(), *start, *end),
+                                Value::List(l) => (ret.clone(), 0, l.borrow().len() as i64),
+                                Value::Bytes(b) => (ret.clone(), 0, b.len() as i64),
+                                Value::Str(st) => {
+                                    let chars: Vec<Value> =
+                                        st.chars().map(|c| Value::Str(c.to_string())).collect();
+                                    let len = chars.len() as i64;
+                                    self.charge_alloc(
+                                        chars.len().saturating_mul(std::mem::size_of::<Value>()),
+                                    )?;
+                                    (Value::List(Rc::new(RefCell::new(chars))), 0, len)
+                                }
+                                Value::Set(st) => {
+                                    let items = st.borrow().items.clone();
+                                    let len = items.len() as i64;
+                                    self.charge_alloc(
+                                        items.len().saturating_mul(std::mem::size_of::<Value>()),
+                                    )?;
+                                    (Value::List(Rc::new(RefCell::new(items))), 0, len)
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "[line {}] iter() returned non-iterable '{}'",
+                                        line,
+                                        other.type_name()
+                                    ));
+                                }
+                            };
+                            (Some(norm_val), s, e)
+                        }
+                        other => {
+                            return Err(format!(
+                                "[line {}] Cannot iterate over '{}'",
+                                line,
+                                other.type_name()
+                            ));
+                        }
+                    };
+                    if let Some(norm) = normalized {
+                        self.stack[iter_pos] = norm;
+                    }
+                    if start_i >= end_i {
+                        ip = exit_ip;
+                    } else {
+                        self.stack[iter_pos + 1] = Value::Int(start_i);
+                        self.stack[iter_pos + 2] = Value::Int(end_i);
+                    }
+                }
+                Op::ForIter(slot, exit_ip) => {
+                    let iter_pos = cur_base + slot as usize;
+                    let (Value::Int(idx), Value::Int(end)) =
+                        (&self.stack[iter_pos + 1], &self.stack[iter_pos + 2])
+                    else {
+                        unreachable!();
+                    };
+                    let idx = *idx;
+                    let end = *end;
+                    if idx >= end {
+                        ip = exit_ip;
+                    } else {
+                        let next_idx = idx.wrapping_add(1);
+                        let item = match &self.stack[iter_pos] {
+                            Value::Range { .. } => Value::Int(idx),
+                            Value::List(l) => {
+                                let b = l.borrow();
+                                if (idx as usize) >= b.len() {
+                                    ip = exit_ip;
+                                    continue;
+                                }
+                                b[idx as usize].clone()
+                            }
+                            Value::Bytes(b) => Value::Int(b[idx as usize] as i64),
+                            _ => unreachable!(),
+                        };
+                        self.stack[iter_pos + 1] = Value::Int(next_idx);
+                        self.stack.push(item);
+                    }
+                }
+                Op::SetAttr(idx) => {
+                    let attr = match &chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.as_str(),
+                        _ => unreachable!(),
+                    };
+                    let val = self.stack.pop().unwrap();
+                    let obj = self.stack.pop().unwrap();
+                    match obj {
+                        Value::Dict(dict) => {
+                            dict.borrow_mut().insert(attr.to_string(), val.clone());
+                            self.stack.push(val);
+                        }
+                        Value::StructInstance(inst) => {
+                            let Some(&field_idx) = inst.def.field_index.get(attr) else {
+                                let line = chunk.lines[op_ip];
+                                return Err(format!(
+                                    "[line {}] Struct '{}' has no field '{}'",
+                                    line, inst.def.name, attr
+                                ));
+                            };
+                            inst.fields.borrow_mut()[field_idx] = val.clone();
+                            self.stack.push(val);
+                        }
+                        other => {
+                            let line = chunk.lines[op_ip];
+                            return Err(format!(
+                                "[line {}] Cannot assign '.{}' on '{}'",
+                                line,
+                                attr,
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+                Op::Import(idx, is_path) => {
+                    let source = match &chunk.constants[idx as usize] {
+                        Constant::Str(s) => s.clone(),
+                        _ => unreachable!(),
+                    };
+                    let line = chunk.lines[op_ip];
+                    self.frames.last_mut().unwrap().ip = ip;
+                    let module = self
+                        .load_module(&source, is_path)
+                        .map_err(|e| format!("[line {}] {}", line, e))?;
+                    self.stack.push(module);
+                }
+                Op::MakeModule(name_idx, count) => {
+                    let mod_name = match &chunk.constants[name_idx as usize] {
+                        Constant::Str(s) => s.clone(),
+                        _ => unreachable!(),
+                    };
+                    let count = count as usize;
+                    let start = self.stack.len() - count * 2;
+                    let mut exports = HashMap::with_capacity(count);
+                    let drained: Vec<Value> = self.stack.drain(start..).collect();
+                    for pair in drained.chunks_exact(2) {
+                        if let Value::Str(k) = &pair[0] {
+                            exports.insert(k.clone(), pair[1].clone());
+                        }
+                    }
+                    self.stack.push(Value::Module(Rc::new(ModuleData {
+                        name: mod_name,
+                        exports: Rc::new(RefCell::new(exports)),
+                    })));
+                }
+                Op::SetupTry(catch_ip) => {
+                    self.try_handlers.push(TryHandler {
+                        frame_depth: self.frames.len(),
+                        stack_len: self.stack.len(),
+                        cleanup_len: self.cleanup_stack.len(),
+                        catch_ip,
+                    });
+                }
+                Op::PopTry => {
+                    self.try_handlers.pop();
+                }
+                Op::Throw => {
+                    let val = self.stack.pop().unwrap();
+                    return Err(val.to_string());
+                }
+                Op::PushDefer(scope_depth) => {
+                    let val = self.stack.pop().unwrap();
+                    let Value::Closure(closure) = val else {
+                        unreachable!("PushDefer expects closure");
+                    };
+                    self.cleanup_stack.push(CleanupEntry {
+                        frame_depth: self.frames.len(),
+                        scope_depth,
+                        kind: CleanupKind::Defer(closure),
+                    });
+                }
+                Op::EnterSandbox(scope_depth) => {
+                    let line = chunk.lines[op_ip];
+                    let policy = self.stack.pop().unwrap();
+                    let snapshot = self
+                        .attenuate_permissions(&policy)
+                        .map_err(|e| format!("[line {}] {}", line, e))?;
+                    self.cleanup_stack.push(CleanupEntry {
+                        frame_depth: self.frames.len(),
+                        scope_depth,
+                        kind: CleanupKind::Sandbox(snapshot),
+                    });
+                }
+                Op::RunCleanups(min_scope) => {
+                    if !self.cleanup_stack.is_empty() {
+                        self.frames.last_mut().unwrap().ip = ip;
+                        let target_frame_depth = self.frames.len();
+                        self.unwind_cleanups_scope(target_frame_depth, min_scope, true)?;
+                    }
+                }
+                Op::Return => {
+                    if !self.cleanup_stack.is_empty() {
+                        let fdepth = self.frames.len();
+                        if self
+                            .cleanup_stack
+                            .last()
+                            .is_some_and(|e| e.frame_depth >= fdepth)
+                        {
+                            self.frames.last_mut().unwrap().ip = ip;
+                            self.unwind_cleanups_scope(fdepth, 0, true)?;
+                        }
+                    }
+                    let result = self.stack.pop().unwrap();
                     let frame = self.frames.pop().unwrap();
                     if self.profile_enabled {
                         self.record_profile(
@@ -1874,725 +2983,418 @@ impl VM {
                             frame.enter_time,
                         );
                     }
-                    while self
-                        .try_handlers
-                        .last()
-                        .is_some_and(|h| h.frame_depth > self.frames.len())
-                    {
-                        self.try_handlers.pop();
+                    if !self.try_handlers.is_empty() {
+                        while self
+                            .try_handlers
+                            .last()
+                            .is_some_and(|h| h.frame_depth > self.frames.len())
+                        {
+                            self.try_handlers.pop();
+                        }
                     }
-                    self.close_upvalues_from(frame.base);
+                    if !self.open_upvalues.is_empty() {
+                        self.close_upvalues_from(frame.base);
+                    }
                     self.stack.truncate(frame.base);
                     if self.frames.len() == target_depth {
-                        return Ok(Some(res));
+                        return Ok(result);
                     }
-                    self.stack.push(res);
+                    self.stack.push(result);
+                    let caller = self.frames.last().unwrap();
+                    cur_closure = caller.closure.clone();
+                    cur_base = caller.base;
+                    ip = caller.ip;
+                    proto_ptr = Rc::as_ptr(&cur_closure.proto) as usize;
                 }
             }
-            Op::CallNamed(pos_argc, kw_idx) => {
-                let pos_argc = pos_argc as usize;
-                let kw_names = self.frames.last().unwrap().closure.proto.chunk.kw_lists
-                    [kw_idx as usize]
-                    .clone();
-                let kw_len = kw_names.len();
-                let total_argc = pos_argc + kw_len;
-                let callee_idx = self.stack.len() - 1 - total_argc;
-                let callee = self.stack[callee_idx].clone();
-                let pos_args = self.stack[callee_idx + 1..callee_idx + 1 + pos_argc].to_vec();
-                let kw_vals = self.stack[callee_idx + 1 + pos_argc..].to_vec();
-                self.stack.truncate(callee_idx);
-                match callee {
-                    Value::Closure(closure) => {
-                        if self.frames.len() >= MAX_CALL_DEPTH {
-                            return Err(format!(
-                                "[line {}] Stack overflow (maximum call depth {} exceeded)",
-                                line, MAX_CALL_DEPTH
-                            ));
-                        }
-                        let (slots, bits) = self
-                            .build_closure_slots(&closure, &pos_args, Some((&kw_names, &kw_vals)))
-                            .map_err(|e| format!("[line {}] {}", line, e))?;
-                        self.stack.push(Value::Closure(closure.clone()));
-                        self.stack.extend(slots);
-                        let enter_step = self.step_counter;
-                        let enter_time = if self.profile_enabled {
-                            Some(Instant::now())
-                        } else {
-                            None
-                        };
-                        self.frames.push(CallFrame {
-                            closure,
-                            ip: 0,
-                            base: callee_idx,
-                            arg_bits: bits,
-                            enter_step,
-                            enter_time,
-                        });
-                    }
-                    Value::BoundMethod(m) => {
-                        let mut combined = Vec::with_capacity(1 + pos_args.len());
-                        combined.push(m.receiver.clone());
-                        combined.extend(pos_args);
-                        match m.func.clone() {
-                            Value::Closure(closure) => {
-                                if self.frames.len() >= MAX_CALL_DEPTH {
-                                    return Err(format!(
-                                        "[line {}] Stack overflow (maximum call depth {} exceeded)",
-                                        line, MAX_CALL_DEPTH
-                                    ));
-                                }
-                                let (slots, bits) = self
-                                    .build_closure_slots(
-                                        &closure,
-                                        &combined,
-                                        Some((&kw_names, &kw_vals)),
-                                    )
-                                    .map_err(|e| format!("[line {}] {}", line, e))?;
-                                self.stack.push(Value::Closure(closure.clone()));
-                                self.stack.extend(slots);
-                                let enter_step = self.step_counter;
-                                let enter_time = if self.profile_enabled {
-                                    Some(Instant::now())
-                                } else {
-                                    None
-                                };
-                                self.frames.push(CallFrame {
-                                    closure,
-                                    ip: 0,
-                                    base: callee_idx,
-                                    arg_bits: bits,
-                                    enter_step,
-                                    enter_time,
-                                });
-                            }
-                            other => {
-                                return Err(format!(
-                                    "[line {}] Named arguments are not supported for '{}'",
-                                    line,
-                                    other.type_name()
-                                ));
-                            }
-                        }
-                    }
-                    Value::StructDef(def) => {
-                        if pos_args.len() > def.field_names.len() {
-                            return Err(format!(
-                                "[line {}] Struct '{}' takes at most {} positional arguments",
-                                line,
-                                def.name,
-                                def.field_names.len()
-                            ));
-                        }
-                        let mut names = def.field_names[..pos_args.len()].to_vec();
-                        let mut vals = pos_args;
-                        names.extend(kw_names);
-                        vals.extend(kw_vals);
-                        let res = self
-                            .instantiate_struct(&def, None, &names, &vals)
-                            .map_err(|e| format!("[line {}] {}", line, e))?;
-                        self.stack.push(res);
-                    }
-                    other => {
-                        return Err(format!(
-                            "[line {}] Named arguments are not supported for '{}'",
-                            line,
-                            other.type_name()
-                        ));
-                    }
-                }
-            }
-            Op::Closure(idx, uv_idx) => {
-                let (proto, upvalue_descs) = {
-                    let frame = self.frames.last().unwrap();
-                    let proto = match &frame.closure.proto.chunk.constants[idx as usize] {
-                        Constant::Function(p) => p.clone(),
-                        _ => unreachable!(),
-                    };
-                    let descs = frame.closure.proto.chunk.upvalue_lists[uv_idx as usize].clone();
-                    (proto, descs)
-                };
-                let mut upvalues = Vec::with_capacity(upvalue_descs.len());
-                for desc in upvalue_descs {
-                    if desc.is_local {
-                        let base = self.frames.last().unwrap().base;
-                        let slot = base + desc.index as usize;
-                        upvalues.push(self.capture_upvalue(slot));
-                    } else {
-                        let uv = self.frames.last().unwrap().closure.upvalues[desc.index as usize]
-                            .clone();
-                        upvalues.push(uv);
-                    }
-                }
-                let base_dir = self.frames.last().unwrap().closure.base_dir.clone();
-                self.stack.push(Value::Closure(Rc::new(Closure {
-                    proto,
-                    upvalues,
-                    base_dir,
-                })));
-            }
-            Op::MakeList(count) => {
-                let count = count as usize;
-                self.charge_alloc(count.saturating_mul(std::mem::size_of::<Value>()))?;
-                let start = self.stack.len() - count;
-                let items = self.stack.drain(start..).collect::<Vec<_>>();
-                self.stack.push(Value::List(Rc::new(RefCell::new(items))));
-            }
-            Op::MakeDict(count) => {
-                let count = count as usize;
-                self.charge_alloc(count.saturating_mul(64))?;
-                let start = self.stack.len() - count * 2;
-                let drained: Vec<Value> = self.stack.drain(start..).collect();
-                let mut map = HashMap::with_capacity(count);
-                for pair in drained.chunks_exact(2) {
-                    let key = match &pair[0] {
-                        Value::Str(s) => s.clone(),
-                        other => {
-                            return Err(format!(
-                                "[line {}] Dictionary keys must be strings, got '{}'",
-                                line,
-                                other.type_name()
-                            ));
-                        }
-                    };
-                    map.insert(key, pair[1].clone());
-                }
-                self.stack.push(Value::Dict(Rc::new(RefCell::new(map))));
-            }
-            Op::MakeStructDef(idx) => {
-                let st_proto = match &self.frames.last().unwrap().closure.proto.chunk.constants
-                    [idx as usize]
-                {
-                    Constant::Struct(s) => s.clone(),
-                    _ => unreachable!(),
-                };
-                let default_count = st_proto
-                    .fields
-                    .iter()
-                    .filter(|(_, has_def)| *has_def)
-                    .count();
-                let method_count = st_proto.methods.len();
-                let total = default_count + method_count;
-                let start = self.stack.len() - total;
-                let popped: Vec<Value> = self.stack.drain(start..).collect();
-                let mut field_names = Vec::with_capacity(st_proto.fields.len());
-                let mut field_index = HashMap::with_capacity(st_proto.fields.len());
-                let mut field_defaults = Vec::with_capacity(st_proto.fields.len());
-                let mut p_idx = 0usize;
-                for (i, (fname, has_def)) in st_proto.fields.iter().enumerate() {
-                    field_names.push(fname.clone());
-                    field_index.insert(fname.clone(), i);
-                    if *has_def {
-                        field_defaults.push(Some(popped[p_idx].clone()));
-                        p_idx += 1;
-                    } else {
-                        field_defaults.push(None);
-                    }
-                }
-                let mut methods = HashMap::with_capacity(method_count);
-                for mname in &st_proto.methods {
-                    methods.insert(mname.clone(), popped[p_idx].clone());
-                    p_idx += 1;
-                }
-                self.stack.push(Value::StructDef(Rc::new(StructDef {
-                    name: st_proto.name.clone(),
-                    field_names,
-                    field_index,
-                    field_defaults,
-                    methods,
-                })));
-            }
-            Op::InitStruct(has_spread, kw_idx) => {
-                let field_names = self.frames.last().unwrap().closure.proto.chunk.kw_lists
-                    [kw_idx as usize]
-                    .clone();
-                let field_count = field_names.len();
-                let fstart = self.stack.len() - field_count;
-                let field_vals: Vec<Value> = self.stack.drain(fstart..).collect();
-                let spread = if has_spread != 0 {
-                    Some(self.stack.pop().unwrap())
-                } else {
-                    None
-                };
-                let target = self.stack.pop().unwrap();
-                let Value::StructDef(def) = target else {
+        }
+    }
+
+    fn execute_add(&mut self, line: usize) -> Result<(), String> {
+        let b = self.stack.pop().unwrap();
+        let a = self.stack.pop().unwrap();
+        let res = match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Value::Int(x.wrapping_add(y)),
+            (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
+            (Value::Int(x), Value::Float(y)) => Value::Float((x as f64) + y),
+            (Value::Float(x), Value::Int(y)) => Value::Float(x + (y as f64)),
+            (Value::Str(mut x), Value::Str(y)) => {
+                let new_len = x.len().saturating_add(y.len());
+                if new_len > 64 * 1024 * 1024 {
                     return Err(format!(
-                        "[line {}] Expected struct type before '{{ ... }}', got '{}'",
-                        line,
-                        target.type_name()
+                        "[line {}] String size limit (64 MiB) exceeded",
+                        line
                     ));
-                };
-                let inst = self
-                    .instantiate_struct(&def, spread, &field_names, &field_vals)
-                    .map_err(|e| format!("[line {}] {}", line, e))?;
-                self.stack.push(inst);
-            }
-            Op::GetIndex => {
-                let idx_val = self.stack.pop().unwrap();
-                let obj_val = self.stack.pop().unwrap();
-                let res = match (obj_val, idx_val) {
-                    (Value::List(list), Value::Int(i)) => {
-                        let borrowed = list.borrow();
-                        let len = borrowed.len() as i64;
-                        let actual = if i < 0 { len + i } else { i };
-                        if actual < 0 || actual >= len {
-                            return Err(format!(
-                                "[line {}] Index {} out of bounds for list of length {}",
-                                line, i, len
-                            ));
-                        }
-                        borrowed[actual as usize].clone()
-                    }
-                    (Value::Str(s), Value::Int(i)) => {
-                        let chars: Vec<char> = s.chars().collect();
-                        let len = chars.len() as i64;
-                        let actual = if i < 0 { len + i } else { i };
-                        if actual < 0 || actual >= len {
-                            return Err(format!(
-                                "[line {}] Index {} out of bounds for string of length {}",
-                                line, i, len
-                            ));
-                        }
-                        Value::Str(chars[actual as usize].to_string())
-                    }
-                    (Value::Bytes(b), Value::Int(i)) => {
-                        let len = b.len() as i64;
-                        let actual = if i < 0 { len + i } else { i };
-                        if actual < 0 || actual >= len {
-                            return Err(format!(
-                                "[line {}] Index {} out of bounds for bytes of length {}",
-                                line, i, len
-                            ));
-                        }
-                        Value::Int(b[actual as usize] as i64)
-                    }
-                    (Value::Dict(dict), Value::Str(key)) => {
-                        dict.borrow().get(&key).cloned().unwrap_or(Value::Unit)
-                    }
-                    (Value::Range { start, end }, Value::Int(i)) => {
-                        let len = if end > start {
-                            (end as i128) - (start as i128)
-                        } else {
-                            0
-                        };
-                        let actual = if i < 0 { len + i as i128 } else { i as i128 };
-                        if actual < 0 || actual >= len {
-                            return Err(format!(
-                                "[line {}] Index {} out of bounds for range of length {}",
-                                line, i, len
-                            ));
-                        }
-                        Value::Int((start as i128 + actual) as i64)
-                    }
-                    (o, i) => {
-                        return Err(format!(
-                            "[line {}] Cannot index '{}' with '{}'",
-                            line,
-                            o.type_name(),
-                            i.type_name()
-                        ));
-                    }
-                };
-                self.stack.push(res);
-            }
-            Op::Slice(inclusive) => {
-                let end_val = self.stack.pop().unwrap();
-                let start_val = self.stack.pop().unwrap();
-                let obj_val = self.stack.pop().unwrap();
-                let resolve_bounds = |len: i64| -> Result<(usize, usize), String> {
-                    let s = match &start_val {
-                        Value::Unit => 0,
-                        Value::Int(v) => {
-                            let r = if *v < 0 { len + *v } else { *v };
-                            r.clamp(0, len) as usize
-                        }
-                        other => {
-                            return Err(format!(
-                                "[line {}] Slice start must be int, got '{}'",
-                                line,
-                                other.type_name()
-                            ));
-                        }
-                    };
-                    let e = match &end_val {
-                        Value::Unit => len as usize,
-                        Value::Int(v) => {
-                            let r = if *v < 0 { len + *v } else { *v };
-                            let r = if inclusive { r.saturating_add(1) } else { r };
-                            r.clamp(0, len) as usize
-                        }
-                        other => {
-                            return Err(format!(
-                                "[line {}] Slice end must be int, got '{}'",
-                                line,
-                                other.type_name()
-                            ));
-                        }
-                    };
-                    Ok((s, e))
-                };
-                let res = match obj_val {
-                    Value::List(list) => {
-                        let (s, e) = {
-                            let borrowed = list.borrow();
-                            resolve_bounds(borrowed.len() as i64)?
-                        };
-                        let slice_len = e.saturating_sub(s);
-                        self.charge_alloc(slice_len.saturating_mul(std::mem::size_of::<Value>()))?;
-                        let sliced = if slice_len > 0 {
-                            list.borrow()[s..e].to_vec()
-                        } else {
-                            Vec::new()
-                        };
-                        Value::List(Rc::new(RefCell::new(sliced)))
-                    }
-                    Value::Str(text) => {
-                        let chars: Vec<char> = text.chars().collect();
-                        let (s, e) = resolve_bounds(chars.len() as i64)?;
-                        let sliced: String = if s < e {
-                            chars[s..e].iter().collect()
-                        } else {
-                            String::new()
-                        };
-                        self.charge_alloc(sliced.len())?;
-                        Value::Str(sliced)
-                    }
-                    Value::Bytes(bytes) => {
-                        let (s, e) = resolve_bounds(bytes.len() as i64)?;
-                        let slice_len = e.saturating_sub(s);
-                        self.charge_alloc(slice_len)?;
-                        let sliced = if slice_len > 0 {
-                            bytes[s..e].to_vec()
-                        } else {
-                            Vec::new()
-                        };
-                        Value::Bytes(Rc::new(sliced))
-                    }
-                    Value::Range { start, end } => {
-                        let len = if end > start {
-                            ((end as i128) - (start as i128)).min(i64::MAX as i128) as i64
-                        } else {
-                            0
-                        };
-                        let (s, e) = resolve_bounds(len)?;
-                        let ns = (start as i128 + s as i128).min(end as i128) as i64;
-                        let ne = (start as i128 + e as i128).min(end as i128) as i64;
-                        Value::Range {
-                            start: ns,
-                            end: ne.max(ns),
-                        }
-                    }
-                    other => {
-                        return Err(format!(
-                            "[line {}] Cannot slice '{}'",
-                            line,
-                            other.type_name()
-                        ));
-                    }
-                };
-                self.stack.push(res);
-            }
-            Op::SetIndex => {
-                let val = self.stack.pop().unwrap();
-                let idx_val = self.stack.pop().unwrap();
-                let obj_val = self.stack.pop().unwrap();
-                match (obj_val, idx_val) {
-                    (Value::List(list), Value::Int(i)) => {
-                        let mut borrowed = list.borrow_mut();
-                        let len = borrowed.len() as i64;
-                        let actual = if i < 0 { len + i } else { i };
-                        if actual < 0 || actual >= len {
-                            return Err(format!(
-                                "[line {}] Index {} out of bounds for list of length {}",
-                                line, i, len
-                            ));
-                        }
-                        borrowed[actual as usize] = val.clone();
-                    }
-                    (Value::Dict(dict), Value::Str(key)) => {
-                        dict.borrow_mut().insert(key, val.clone());
-                    }
-                    (o, i) => {
-                        return Err(format!(
-                            "[line {}] Cannot index-assign '{}' with '{}'",
-                            line,
-                            o.type_name(),
-                            i.type_name()
-                        ));
-                    }
                 }
-                self.stack.push(val);
+                self.charge_alloc(new_len)?;
+                x.push_str(&y);
+                Value::Str(x)
             }
-            Op::GetAttr(idx) => {
-                let len = self.stack.len();
-                let ic_idx = (proto_ptr.wrapping_mul(31) ^ op_ip) & 1023;
-                if let Value::StructInstance(inst) = &self.stack[len - 1] {
-                    let cached = self.attr_ic[ic_idx];
-                    let def_ptr = Rc::as_ptr(&inst.def) as usize;
-                    if cached.0 == self.ic_epoch
-                        && cached.1 == proto_ptr
-                        && cached.2 == op_ip
-                        && cached.3 == def_ptr
-                    {
-                        let val = inst.fields.borrow()[cached.4].clone();
-                        self.stack[len - 1] = val;
-                        return Ok(None);
-                    }
-                    let frame = self.frames.last().unwrap();
-                    let attr_name = match &frame.closure.proto.chunk.constants[idx as usize] {
-                        Constant::Str(s) => s.as_str(),
-                        _ => unreachable!(),
-                    };
-                    if let Some(&field_idx) = inst.def.field_index.get(attr_name) {
-                        self.attr_ic[ic_idx] =
-                            (self.ic_epoch, proto_ptr, op_ip, def_ptr, field_idx);
-                        let val = inst.fields.borrow()[field_idx].clone();
-                        self.stack[len - 1] = val;
-                        return Ok(None);
-                    }
+            (Value::Bytes(x), Value::Bytes(y)) => {
+                let new_len = x.len().saturating_add(y.len());
+                if new_len > 64 * 1024 * 1024 {
+                    return Err(format!(
+                        "[line {}] Bytes size limit (64 MiB) exceeded",
+                        line
+                    ));
                 }
-                let attr = self.read_string(idx);
-                let obj = self.stack.pop().unwrap();
-                let val = self.get_attr_value(obj, &attr, line, ".")?;
-                self.stack.push(val);
+                self.charge_alloc(new_len)?;
+                let mut out = Vec::with_capacity(new_len);
+                out.extend_from_slice(x.as_slice());
+                out.extend_from_slice(y.as_slice());
+                Value::Bytes(Rc::new(out))
             }
-            Op::OptGetAttr(idx) => {
-                let obj = self.stack.pop().unwrap();
-                if matches!(obj, Value::Unit) {
-                    self.stack.push(Value::Unit);
-                } else {
-                    let attr = self.read_string(idx);
-                    let val = self.get_attr_value(obj, &attr, line, "?.")?;
-                    self.stack.push(val);
+            (Value::List(x), Value::List(y)) => {
+                let (x_ref, y_ref) = (x.borrow(), y.borrow());
+                let new_len = x_ref.len().saturating_add(y_ref.len());
+                if new_len > 10_000_000 {
+                    return Err(format!(
+                        "[line {}] List size limit (10,000,000) exceeded",
+                        line
+                    ));
                 }
+                let mut combined = Vec::with_capacity(new_len);
+                combined.extend(x_ref.iter().cloned());
+                combined.extend(y_ref.iter().cloned());
+                drop((x_ref, y_ref));
+                self.charge_alloc(new_len.saturating_mul(std::mem::size_of::<Value>()))?;
+                Value::List(Rc::new(RefCell::new(combined)))
             }
-            Op::ForPrep(slot, exit_ip) => {
-                let base = self.frames.last().unwrap().base;
-                let iter_pos = base + slot as usize;
-                let iter_val = self.stack[iter_pos].clone();
-                let (normalized, start_i, end_i) = match iter_val {
-                    Value::Range { start, end } => (None, start, end),
-                    Value::List(ref l) => (None, 0, l.borrow().len() as i64),
-                    Value::Bytes(ref b) => (None, 0, b.len() as i64),
-                    Value::Str(ref s) => {
-                        let chars: Vec<Value> =
-                            s.chars().map(|c| Value::Str(c.to_string())).collect();
-                        let len = chars.len() as i64;
-                        self.charge_alloc(
-                            chars.len().saturating_mul(std::mem::size_of::<Value>()),
-                        )?;
-                        (Some(Value::List(Rc::new(RefCell::new(chars)))), 0, len)
-                    }
-                    Value::Set(ref s) => {
-                        let items = s.borrow().items.clone();
-                        let len = items.len() as i64;
-                        self.charge_alloc(
-                            items.len().saturating_mul(std::mem::size_of::<Value>()),
-                        )?;
-                        (Some(Value::List(Rc::new(RefCell::new(items)))), 0, len)
-                    }
-                    Value::StructInstance(inst) => {
-                        let Some(iter_fn) = inst.def.methods.get("iter").cloned() else {
-                            return Err(format!(
-                                "[line {}] Struct '{}' does not implement iter()",
-                                line, inst.def.name
-                            ));
-                        };
-                        let ret = self
-                            .call_value(iter_fn, &[Value::StructInstance(inst)])
-                            .map_err(|e| format!("[line {}] {}", line, e))?;
-                        let (norm_val, s, e) = match &ret {
-                            Value::Range { start, end } => (ret.clone(), *start, *end),
-                            Value::List(l) => (ret.clone(), 0, l.borrow().len() as i64),
-                            Value::Bytes(b) => (ret.clone(), 0, b.len() as i64),
-                            Value::Str(st) => {
-                                let chars: Vec<Value> =
-                                    st.chars().map(|c| Value::Str(c.to_string())).collect();
-                                let len = chars.len() as i64;
-                                self.charge_alloc(
-                                    chars.len().saturating_mul(std::mem::size_of::<Value>()),
-                                )?;
-                                (Value::List(Rc::new(RefCell::new(chars))), 0, len)
-                            }
-                            Value::Set(st) => {
-                                let items = st.borrow().items.clone();
-                                let len = items.len() as i64;
-                                self.charge_alloc(
-                                    items.len().saturating_mul(std::mem::size_of::<Value>()),
-                                )?;
-                                (Value::List(Rc::new(RefCell::new(items))), 0, len)
-                            }
-                            other => {
-                                return Err(format!(
-                                    "[line {}] iter() returned non-iterable '{}'",
-                                    line,
-                                    other.type_name()
-                                ));
-                            }
-                        };
-                        (Some(norm_val), s, e)
-                    }
-                    other => {
-                        return Err(format!(
-                            "[line {}] Cannot iterate over '{}'",
-                            line,
-                            other.type_name()
-                        ));
-                    }
-                };
-                if let Some(norm) = normalized {
-                    self.stack[iter_pos] = norm;
-                }
-                if start_i >= end_i {
-                    self.frames.last_mut().unwrap().ip = exit_ip;
-                } else {
-                    self.stack[iter_pos + 1] = Value::Int(start_i);
-                    self.stack[iter_pos + 2] = Value::Int(end_i);
-                }
+            (l, r) => {
+                return Err(format!(
+                    "[line {}] Cannot add '{}' and '{}'",
+                    line,
+                    l.type_name(),
+                    r.type_name()
+                ));
             }
-            Op::ForIter(slot, exit_ip) => {
-                let base = self.frames.last().unwrap().base;
-                let iter_pos = base + slot as usize;
-                let (Value::Int(idx), Value::Int(end)) =
-                    (&self.stack[iter_pos + 1], &self.stack[iter_pos + 2])
-                else {
-                    unreachable!();
-                };
-                let idx = *idx;
-                let end = *end;
-                if idx >= end {
-                    self.frames.last_mut().unwrap().ip = exit_ip;
-                } else {
-                    let next_idx = idx.saturating_add(1);
-                    let item = match &self.stack[iter_pos] {
-                        Value::Range { .. } => Value::Int(idx),
-                        Value::List(l) => {
-                            let b = l.borrow();
-                            if (idx as usize) >= b.len() {
-                                self.frames.last_mut().unwrap().ip = exit_ip;
-                                return Ok(None);
-                            }
-                            b[idx as usize].clone()
-                        }
-                        Value::Bytes(b) => Value::Int(b[idx as usize] as i64),
-                        _ => unreachable!(),
-                    };
-                    self.stack[iter_pos + 1] = Value::Int(next_idx);
-                    self.stack.push(item);
-                }
-            }
-            Op::SetAttr(idx) => {
-                let attr = self.read_string(idx);
-                let val = self.stack.pop().unwrap();
-                let obj = self.stack.pop().unwrap();
-                match obj {
-                    Value::Dict(dict) => {
-                        dict.borrow_mut().insert(attr, val.clone());
-                        self.stack.push(val);
-                    }
-                    Value::StructInstance(inst) => {
-                        let Some(&field_idx) = inst.def.field_index.get(&attr) else {
-                            return Err(format!(
-                                "[line {}] Struct '{}' has no field '{}'",
-                                line, inst.def.name, attr
-                            ));
-                        };
-                        inst.fields.borrow_mut()[field_idx] = val.clone();
-                        self.stack.push(val);
-                    }
-                    other => {
-                        return Err(format!(
-                            "[line {}] Cannot assign '.{}' on '{}'",
-                            line,
-                            attr,
-                            other.type_name()
-                        ));
-                    }
-                }
-            }
-            Op::Import(idx, is_path) => {
-                let source = self.read_string(idx);
-                let module = self
-                    .load_module(&source, is_path)
-                    .map_err(|e| format!("[line {}] {}", line, e))?;
-                self.stack.push(module);
-            }
-            Op::MakeModule(name_idx, count) => {
-                let mod_name = self.read_string(name_idx);
-                let count = count as usize;
-                let start = self.stack.len() - count * 2;
-                let mut exports = HashMap::with_capacity(count);
-                let drained: Vec<Value> = self.stack.drain(start..).collect();
-                for pair in drained.chunks_exact(2) {
-                    if let Value::Str(k) = &pair[0] {
-                        exports.insert(k.clone(), pair[1].clone());
-                    }
-                }
-                self.stack.push(Value::Module {
-                    name: mod_name,
-                    exports: Rc::new(RefCell::new(exports)),
-                });
-            }
-            Op::SetupTry(catch_ip) => {
-                self.try_handlers.push(TryHandler {
-                    frame_depth: self.frames.len(),
-                    stack_len: self.stack.len(),
-                    catch_ip,
-                });
-            }
-            Op::PopTry => {
-                self.try_handlers.pop();
-            }
-            Op::Throw => {
-                let val = self.stack.pop().unwrap();
-                return Err(val.to_string());
-            }
-            Op::Return => {
-                let result = self.stack.pop().unwrap();
-                let frame = self.frames.pop().unwrap();
-                if self.profile_enabled {
-                    self.record_profile(
-                        &frame.closure.proto.name,
-                        frame.enter_step,
-                        frame.enter_time,
-                    );
-                }
-                while self
-                    .try_handlers
-                    .last()
-                    .is_some_and(|h| h.frame_depth > self.frames.len())
-                {
-                    self.try_handlers.pop();
-                }
-                self.close_upvalues_from(frame.base);
-                self.stack.truncate(frame.base);
-                if self.frames.len() == target_depth {
-                    return Ok(Some(result));
-                }
-                self.stack.push(result);
-            }
-        }
-        Ok(None)
+        };
+        self.stack.push(res);
+        Ok(())
     }
 
-    fn read_constant(&self, idx: u16) -> Value {
-        let frame = self.frames.last().unwrap();
-        match &frame.closure.proto.chunk.constants[idx as usize] {
-            Constant::Int(v) => Value::Int(*v),
-            Constant::Float(v) => Value::Float(*v),
-            Constant::Str(s) => Value::Str(s.clone()),
-            Constant::Bytes(b) => Value::Bytes(Rc::new(b.clone())),
-            Constant::Function(_) | Constant::Struct(_) => {
-                unreachable!("Function/struct constant cannot be loaded via Op::Constant")
-            }
+    fn restore_sandbox_snapshot(&mut self, snap: SandboxSnapshot) {
+        self.permissions = snap.perms;
+        self.sandboxed = snap.sandboxed;
+        if let Some(extra) = snap.saved_instr_extra {
+            self.instructions_left = self.instructions_left.saturating_add(extra);
         }
     }
 
-    fn read_string(&self, idx: u16) -> String {
-        let frame = self.frames.last().unwrap();
-        match &frame.closure.proto.chunk.constants[idx as usize] {
-            Constant::Str(s) => s.clone(),
-            _ => unreachable!(),
+    fn unwind_cleanups_scope(
+        &mut self,
+        target_frame_depth: usize,
+        min_scope: u16,
+        run_defers: bool,
+    ) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        while let Some(top) = self.cleanup_stack.last() {
+            if top.frame_depth < target_frame_depth
+                || (top.frame_depth == target_frame_depth && top.scope_depth < min_scope)
+            {
+                break;
+            }
+            let entry = self.cleanup_stack.pop().unwrap();
+            match entry.kind {
+                CleanupKind::Sandbox(snap) => self.restore_sandbox_snapshot(snap),
+                CleanupKind::Defer(closure) => {
+                    if run_defers && first_err.is_none() {
+                        if let Err(e) = self.call_value(Value::Closure(closure), &[]) {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
         }
+        if let Some(err) = first_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn unwind_cleanups_to_len(
+        &mut self,
+        target_len: usize,
+        run_defers: bool,
+    ) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        while self.cleanup_stack.len() > target_len {
+            let entry = self.cleanup_stack.pop().unwrap();
+            match entry.kind {
+                CleanupKind::Sandbox(snap) => self.restore_sandbox_snapshot(snap),
+                CleanupKind::Defer(closure) => {
+                    if run_defers && first_err.is_none() {
+                        if let Err(e) = self.call_value(Value::Closure(closure), &[]) {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn attenuate_permissions(&mut self, policy: &Value) -> Result<SandboxSnapshot, String> {
+        let prev_perms = self.permissions.clone();
+        let prev_sandboxed = self.sandboxed;
+        let mut next = Permissions::sandboxed();
+        next.restrict_to_explicit_roots = true;
+        next.max_instructions = prev_perms.max_instructions;
+        next.max_duration_ms = prev_perms.max_duration_ms;
+        next.max_memory_bytes = prev_perms.max_memory_bytes;
+        next.max_io_bytes = prev_perms.max_io_bytes;
+
+        let mut saved_instr_extra: Option<u64> = None;
+
+        if let Value::Dict(dict_rc) = policy {
+            let dict = dict_rc.borrow();
+            for (k, v) in dict.iter() {
+                match k.as_str() {
+                    "read" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_read = None,
+                        Value::Bool(true) => {
+                            if !prev_perms.allow_all && prev_perms.restrict_to_explicit_roots {
+                                next.allow_read = prev_perms.allow_read.clone();
+                            } else {
+                                next.allow_read = prev_perms.allow_read.clone();
+                                if next.allow_read.is_none()
+                                    && !prev_perms.restrict_to_explicit_roots
+                                {
+                                    next.restrict_to_explicit_roots = false;
+                                }
+                            }
+                        }
+                        Value::List(list_rc) => {
+                            let mut roots = Vec::new();
+                            for item in list_rc.borrow().iter() {
+                                let Value::Str(p) = item else {
+                                    return Err(
+                                        "sandbox read policy paths must be strings".to_string()
+                                    );
+                                };
+                                self.resolve_read_path(p).map_err(|_| {
+                                    format!("sandbox cannot escalate read access to '{}'", p)
+                                })?;
+                                roots.push(PathBuf::from(p));
+                            }
+                            next.allow_read = Some(roots);
+                        }
+                        Value::Str(p) => {
+                            self.resolve_read_path(p).map_err(|_| {
+                                format!("sandbox cannot escalate read access to '{}'", p)
+                            })?;
+                            next.allow_read = Some(vec![PathBuf::from(p)]);
+                        }
+                        _ => {
+                            return Err(
+                                "sandbox 'read' policy must be list, string, or bool".to_string()
+                            );
+                        }
+                    },
+                    "write" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_write = None,
+                        Value::Bool(true) => {
+                            next.allow_write = prev_perms.allow_write.clone();
+                            if next.allow_write.is_none() && !prev_perms.restrict_to_explicit_roots
+                            {
+                                next.restrict_to_explicit_roots = false;
+                            }
+                        }
+                        Value::List(list_rc) => {
+                            let mut roots = Vec::new();
+                            for item in list_rc.borrow().iter() {
+                                let Value::Str(p) = item else {
+                                    return Err(
+                                        "sandbox write policy paths must be strings".to_string()
+                                    );
+                                };
+                                self.resolve_write_path(p).map_err(|_| {
+                                    format!("sandbox cannot escalate write access to '{}'", p)
+                                })?;
+                                roots.push(PathBuf::from(p));
+                            }
+                            next.allow_write = Some(roots);
+                        }
+                        Value::Str(p) => {
+                            self.resolve_write_path(p).map_err(|_| {
+                                format!("sandbox cannot escalate write access to '{}'", p)
+                            })?;
+                            next.allow_write = Some(vec![PathBuf::from(p)]);
+                        }
+                        _ => {
+                            return Err(
+                                "sandbox 'write' policy must be list, string, or bool".to_string()
+                            );
+                        }
+                    },
+                    "net" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_net = None,
+                        Value::Bool(true) => {
+                            if !prev_perms.allow_all && prev_perms.allow_net.is_none() {
+                                return Err("sandbox cannot escalate network access".to_string());
+                            }
+                            next.allow_net = prev_perms.allow_net.clone();
+                        }
+                        Value::List(list_rc) => {
+                            let mut hosts = Vec::new();
+                            for item in list_rc.borrow().iter() {
+                                let Value::Str(h) = item else {
+                                    return Err(
+                                        "sandbox net policy hosts must be strings".to_string()
+                                    );
+                                };
+                                let url = if h.starts_with("https://") {
+                                    h.clone()
+                                } else {
+                                    format!("https://{}", h)
+                                };
+                                self.check_net(&url).map_err(|_| {
+                                    format!("sandbox cannot escalate net access to '{}'", h)
+                                })?;
+                                hosts.push(h.clone());
+                            }
+                            next.allow_net = Some(hosts);
+                        }
+                        _ => return Err("sandbox 'net' policy must be bool or list".to_string()),
+                    },
+                    "env" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_env = None,
+                        Value::Bool(true) => {
+                            if !prev_perms.allow_all && prev_perms.allow_env.is_none() {
+                                return Err("sandbox cannot escalate env access".to_string());
+                            }
+                            next.allow_env = prev_perms.allow_env.clone();
+                        }
+                        Value::List(list_rc) => {
+                            let mut keys = Vec::new();
+                            for item in list_rc.borrow().iter() {
+                                let Value::Str(key) = item else {
+                                    return Err(
+                                        "sandbox env policy keys must be strings".to_string()
+                                    );
+                                };
+                                self.check_env(key).map_err(|_| {
+                                    format!("sandbox cannot escalate env access to '{}'", key)
+                                })?;
+                                keys.push(key.clone());
+                            }
+                            next.allow_env = Some(keys);
+                        }
+                        _ => return Err("sandbox 'env' policy must be bool or list".to_string()),
+                    },
+                    "exec" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_exec = None,
+                        Value::Bool(true) => {
+                            if !prev_perms.allow_all && prev_perms.allow_exec.is_none() {
+                                return Err("sandbox cannot escalate process exec".to_string());
+                            }
+                            next.allow_exec = prev_perms.allow_exec.clone();
+                        }
+                        Value::List(list_rc) => {
+                            let mut cmds = Vec::new();
+                            for item in list_rc.borrow().iter() {
+                                let Value::Str(c) = item else {
+                                    return Err(
+                                        "sandbox exec policy commands must be strings".to_string()
+                                    );
+                                };
+                                self.check_exec(c).map_err(|_| {
+                                    format!("sandbox cannot escalate exec access to '{}'", c)
+                                })?;
+                                cmds.push(c.clone());
+                            }
+                            next.allow_exec = Some(cmds);
+                        }
+                        _ => return Err("sandbox 'exec' policy must be bool or list".to_string()),
+                    },
+                    "clipboard" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_clipboard = false,
+                        Value::Bool(true) => {
+                            self.check_clipboard().map_err(|_| {
+                                "sandbox cannot escalate clipboard access".to_string()
+                            })?;
+                            next.allow_clipboard = true;
+                        }
+                        _ => return Err("sandbox 'clipboard' policy must be bool".to_string()),
+                    },
+                    "input" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_input = false,
+                        Value::Bool(true) => {
+                            self.check_input()
+                                .map_err(|_| "sandbox cannot escalate input access".to_string())?;
+                            next.allow_input = true;
+                        }
+                        _ => return Err("sandbox 'input' policy must be bool".to_string()),
+                    },
+                    "args" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_sys_args = false,
+                        Value::Bool(true) => {
+                            self.check_sys_args().map_err(|_| {
+                                "sandbox cannot escalate sys.args access".to_string()
+                            })?;
+                            next.allow_sys_args = true;
+                        }
+                        _ => return Err("sandbox 'args' policy must be bool".to_string()),
+                    },
+                    "timeout" => match v {
+                        Value::Int(ms) if *ms > 0 => {
+                            let elapsed = self.run_start.elapsed().as_millis() as u64;
+                            let desired = elapsed.saturating_add(*ms as u64);
+                            next.max_duration_ms = Some(match prev_perms.max_duration_ms {
+                                Some(prev) => prev.min(desired),
+                                None => desired,
+                            });
+                        }
+                        _ => return Err("sandbox 'timeout' must be positive int (ms)".to_string()),
+                    },
+                    "max_mem" => match v {
+                        Value::Int(mb) if *mb > 0 => {
+                            let cap = self
+                                .budget
+                                .bytes_allocated
+                                .saturating_add((*mb as u64).saturating_mul(1024 * 1024));
+                            next.max_memory_bytes = Some(match prev_perms.max_memory_bytes {
+                                Some(prev) => prev.min(cap),
+                                None => cap,
+                            });
+                        }
+                        _ => return Err("sandbox 'max_mem' must be positive int (MiB)".to_string()),
+                    },
+                    "max_steps" => match v {
+                        Value::Int(steps) if *steps > 0 => {
+                            let req = *steps as u64;
+                            next.max_instructions = Some(match prev_perms.max_instructions {
+                                Some(prev) => prev.min(req),
+                                None => req,
+                            });
+                            if self.instructions_left > req {
+                                saved_instr_extra = Some(self.instructions_left - req);
+                                self.instructions_left = req;
+                            }
+                        }
+                        _ => return Err("sandbox 'max_steps' must be positive int".to_string()),
+                    },
+                    other => {
+                        return Err(format!("Unknown sandbox policy option '{}'", other));
+                    }
+                }
+            }
+        } else if !matches!(policy, Value::Unit) {
+            return Err("sandbox policy must be a dictionary".to_string());
+        }
+
+        self.permissions = next;
+        self.sandboxed = true;
+        Ok(SandboxSnapshot {
+            perms: prev_perms,
+            sandboxed: prev_sandboxed,
+            saved_instr_extra,
+        })
     }
 
     fn capture_upvalue(&mut self, slot: usize) -> Rc<RefCell<UpvalueState>> {
@@ -3436,6 +4238,292 @@ fn native_pairs(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             "for a, b requires a list of pairs or dict, got '{}'",
             other.type_name()
         )),
+    }
+}
+
+fn is_sensitive_template_label(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("private_key")
+        || lower.contains("auth")
+}
+
+fn native_tag_eval(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err("__tag_eval expects 4 arguments".to_string());
+    }
+    let Value::Str(tag) = &args[0] else {
+        return Err("__tag_eval tag must be string".to_string());
+    };
+    let Value::List(parts_rc) = &args[1] else {
+        return Err("__tag_eval parts must be list".to_string());
+    };
+    let Value::List(values_rc) = &args[2] else {
+        return Err("__tag_eval values must be list".to_string());
+    };
+    let Value::List(labels_rc) = &args[3] else {
+        return Err("__tag_eval labels must be list".to_string());
+    };
+
+    if let Some(&slot) = vm.global_slots.get(tag) {
+        let maybe_fn = vm.global_values[slot].clone();
+        if matches!(
+            maybe_fn,
+            Value::Closure(_) | Value::NativeFn(_) | Value::BoundMethod(_)
+        ) {
+            return vm.call_value(maybe_fn, &[args[1].clone(), args[2].clone()]);
+        }
+    }
+
+    let parts = parts_rc.borrow();
+    let values = values_rc.borrow();
+    let labels = labels_rc.borrow();
+
+    match tag.as_str() {
+        "log" => {
+            let mut out = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                if let Value::Str(s) = part {
+                    out.push_str(s);
+                }
+                if i < values.len() {
+                    let lbl = match labels.get(i) {
+                        Some(Value::Str(s)) => s.as_str(),
+                        _ => "",
+                    };
+                    if is_sensitive_template_label(lbl) {
+                        out.push_str("[REDACTED]");
+                    } else {
+                        out.push_str(&values[i].to_string());
+                    }
+                }
+            }
+            let safe = crate::modules::log::redact_secrets(&out);
+            vm.charge_alloc(safe.len())?;
+            Ok(Value::Str(safe))
+        }
+        "sql" => {
+            let mut query = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                if let Value::Str(s) = part {
+                    query.push_str(s);
+                }
+                if i < values.len() {
+                    query.push('?');
+                }
+            }
+            let params_vec = values.clone();
+            drop((parts, values, labels));
+            vm.charge_alloc(query.len() + params_vec.len() * std::mem::size_of::<Value>() + 64)?;
+            let mut map = HashMap::with_capacity(2);
+            map.insert("query".to_string(), Value::Str(query));
+            map.insert(
+                "params".to_string(),
+                Value::List(Rc::new(RefCell::new(params_vec))),
+            );
+            Ok(Value::Dict(Rc::new(RefCell::new(map))))
+        }
+        other => Err(format!("Unknown template tag '{}'", other)),
+    }
+}
+
+fn native_check_needs(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("__check_needs expects 1 list argument".to_string());
+    }
+    let Value::List(caps_rc) = &args[0] else {
+        return Err("__check_needs expects a list".to_string());
+    };
+    let caps = caps_rc.borrow().clone();
+    for entry in caps {
+        let Value::List(pair_rc) = entry else {
+            continue;
+        };
+        let pair = pair_rc.borrow();
+        let Some(Value::Str(cap_name)) = pair.first() else {
+            continue;
+        };
+        let cap_args: Vec<String> = match pair.get(1) {
+            Some(Value::List(l)) => l
+                .borrow()
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        match cap_name.as_str() {
+            "read" => {
+                if cap_args.is_empty() {
+                    if !vm.permissions.allow_all
+                        && vm.permissions.restrict_to_explicit_roots
+                        && vm.permissions.allow_read.is_none()
+                    {
+                        return Err(
+                            "Contract failed ('needs read'): read access is disabled".to_string()
+                        );
+                    }
+                } else {
+                    for p in &cap_args {
+                        vm.resolve_read_path(p).map_err(|e| {
+                            format!("Contract failed ('needs read(\"{}\")'): {}", p, e)
+                        })?;
+                    }
+                }
+            }
+            "write" => {
+                if cap_args.is_empty() {
+                    if !vm.permissions.allow_all
+                        && vm.permissions.allow_write.is_none()
+                        && vm.permissions.restrict_to_explicit_roots
+                    {
+                        return Err(
+                            "Contract failed ('needs write'): write access is disabled".to_string()
+                        );
+                    }
+                } else {
+                    for p in &cap_args {
+                        vm.resolve_write_path(p).map_err(|e| {
+                            format!("Contract failed ('needs write(\"{}\")'): {}", p, e)
+                        })?;
+                    }
+                }
+            }
+            "net" => {
+                if !vm.permissions.allow_all {
+                    if vm.permissions.allow_net.is_none() {
+                        return Err("Contract failed ('needs net'): network access is disabled (pass --allow-net or --unsafe)".to_string());
+                    }
+                    for h in &cap_args {
+                        let url = if h.starts_with("https://") {
+                            h.clone()
+                        } else {
+                            format!("https://{}", h)
+                        };
+                        vm.check_net(&url).map_err(|e| {
+                            format!("Contract failed ('needs net(\"{}\")'): {}", h, e)
+                        })?;
+                    }
+                }
+            }
+            "env" => {
+                if !vm.permissions.allow_all {
+                    if cap_args.is_empty() && vm.permissions.allow_env.is_none() {
+                        return Err("Contract failed ('needs env'): env access is disabled (pass --allow-env or --unsafe)".to_string());
+                    }
+                    for k in &cap_args {
+                        vm.check_env(k).map_err(|e| {
+                            format!("Contract failed ('needs env(\"{}\")'): {}", k, e)
+                        })?;
+                    }
+                }
+            }
+            "exec" => {
+                if !vm.permissions.allow_all {
+                    if vm.permissions.allow_exec.is_none() {
+                        return Err("Contract failed ('needs exec'): process execution is disabled (pass --allow-exec or --unsafe)".to_string());
+                    }
+                    for c in &cap_args {
+                        vm.check_exec(c).map_err(|e| {
+                            format!("Contract failed ('needs exec(\"{}\")'): {}", c, e)
+                        })?;
+                    }
+                }
+            }
+            "clipboard" => {
+                vm.check_clipboard()
+                    .map_err(|e| format!("Contract failed ('needs clipboard'): {}", e))?;
+            }
+            "input" => {
+                vm.check_input()
+                    .map_err(|e| format!("Contract failed ('needs input'): {}", e))?;
+            }
+            "args" | "sys_args" => {
+                vm.check_sys_args()
+                    .map_err(|e| format!("Contract failed ('needs args'): {}", e))?;
+            }
+            other => {
+                return Err(format!(
+                    "Unknown capability '{}' in 'needs' contract",
+                    other
+                ));
+            }
+        }
+    }
+    Ok(Value::Unit)
+}
+
+fn native_close_resource(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Ok(Value::Unit);
+    }
+    match &args[0] {
+        Value::Unit => Ok(Value::Unit),
+        Value::StructInstance(inst) => {
+            if let Some(close_fn) = inst.def.methods.get("close").cloned() {
+                vm.call_value(close_fn, &[Value::StructInstance(inst.clone())])?;
+            }
+            Ok(Value::Unit)
+        }
+        Value::Dict(d) => {
+            let close_val = d.borrow().get("close").cloned();
+            if let Some(c @ (Value::Closure(_) | Value::NativeFn(_) | Value::BoundMethod(_))) =
+                close_val
+            {
+                vm.call_value(c, &[])?;
+            }
+            Ok(Value::Unit)
+        }
+        _ => Ok(Value::Unit),
+    }
+}
+
+fn native_sleep_checked(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("sleep/after/every expects duration in milliseconds".to_string());
+    }
+    let ms = match &args[0] {
+        Value::Int(v) if *v >= 0 => *v as u64,
+        Value::Float(v) if v.is_finite() && *v >= 0.0 => v.round() as u64,
+        other => {
+            return Err(format!(
+                "Expected non-negative duration (ms), got '{}'",
+                other.type_name()
+            ));
+        }
+    };
+    vm.sleep_checked(ms)?;
+    Ok(Value::Unit)
+}
+
+fn native_run_spec(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("__run_spec expects 2 arguments (name, fn)".to_string());
+    }
+    let Value::Str(name) = &args[0] else {
+        return Err("__run_spec name must be string".to_string());
+    };
+    let name = name.clone();
+    let closure = args[1].clone();
+    match vm.call_value(closure, &[]) {
+        Ok(_) => {
+            vm.spec_results.push((name, Ok(())));
+            Ok(Value::Bool(true))
+        }
+        Err(e) => {
+            if VM::is_unrecoverable_error(&e) {
+                return Err(e);
+            }
+            vm.spec_results.push((name, Err(e)));
+            Ok(Value::Bool(false))
+        }
     }
 }
 

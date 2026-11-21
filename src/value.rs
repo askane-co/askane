@@ -127,6 +127,11 @@ pub struct BoundMethod {
     pub func: Value,
 }
 
+pub struct ModuleData {
+    pub name: String,
+    pub exports: Rc<RefCell<HashMap<String, Value>>>,
+}
+
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
@@ -137,20 +142,14 @@ pub enum Value {
     List(Rc<RefCell<Vec<Value>>>),
     Dict(Rc<RefCell<HashMap<String, Value>>>),
     Set(Rc<RefCell<AskaneSet>>),
-    Range {
-        start: i64,
-        end: i64,
-    },
+    Range { start: i64, end: i64 },
     Unit,
     Closure(Rc<Closure>),
     NativeFn(NativeFunction),
     BoundMethod(Rc<BoundMethod>),
     StructDef(Rc<StructDef>),
     StructInstance(Rc<StructInstance>),
-    Module {
-        name: String,
-        exports: Rc<RefCell<HashMap<String, Value>>>,
-    },
+    Module(Rc<ModuleData>),
 }
 
 impl Value {
@@ -185,7 +184,7 @@ impl Value {
             Value::Closure(_) | Value::NativeFn(_) | Value::BoundMethod(_) => "fn",
             Value::StructDef(_) => "struct",
             Value::StructInstance(inst) => &inst.def.name,
-            Value::Module { .. } => "module",
+            Value::Module(_) => "module",
         }
     }
 
@@ -332,9 +331,7 @@ impl Value {
             (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
                 s1 == s2 && e1 == e2
             }
-            (Value::Module { exports: a, .. }, Value::Module { exports: b, .. }) => {
-                Rc::ptr_eq(a, b)
-            }
+            (Value::Module(a), Value::Module(b)) => Rc::ptr_eq(&a.exports, &b.exports),
             _ => false,
         }
     }
@@ -584,9 +581,9 @@ impl Value {
                 seen.remove(&ptr);
                 write!(f, "}}")
             }
-            Value::Module { name, .. } => {
-                budget.consume(name.len() + 10);
-                write!(f, "<module {}>", name)
+            Value::Module(m) => {
+                budget.consume(m.name.len() + 10);
+                write!(f, "<module {}>", m.name)
             }
             Value::Range { start, end } => {
                 budget.consume(20);

@@ -1,6 +1,7 @@
 use crate::ast::{
     AssignTarget, BinaryOp, CallNamedExpr, ChainedCmpExpr, Expr, FnParam, ImportItem, ImportSource,
-    MatchArm, Pattern, Program, Stmt, StructField, StructInitExpr, StructMethod, UnaryOp,
+    MatchArm, Pattern, PipeAssignExpr, Program, SafePipeExpr, SandboxExpr, Stmt, StructField,
+    StructInitExpr, StructMethod, TaggedTemplateExpr, UnaryOp, WithExpr,
 };
 use crate::lexer::{Span, Token, TokenKind};
 
@@ -72,6 +73,151 @@ impl Parser {
         Ok((stmts, tail))
     }
 
+    fn is_needs_stmt(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Ident(s) if s == "needs")
+            && matches!(self.peek_next_kind(), Some(TokenKind::Ident(_)))
+    }
+
+    fn is_defer_stmt(&self) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::Ident(s) if s == "defer") {
+            return false;
+        }
+        matches!(
+            self.peek_next_kind(),
+            Some(
+                TokenKind::LBrace
+                    | TokenKind::Ident(_)
+                    | TokenKind::If
+                    | TokenKind::Try
+                    | TokenKind::Match
+            )
+        )
+    }
+
+    fn looks_like_sandbox(&self) -> bool {
+        if matches!(self.peek_next_kind(), Some(TokenKind::LBrace)) {
+            return true;
+        }
+        if !matches!(self.peek_next_kind(), Some(TokenKind::LParen)) {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut i = self.pos + 1;
+        while let Some(t) = self.tokens.get(i) {
+            match t.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1).map(|n| &n.kind),
+                            Some(TokenKind::LBrace)
+                        );
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn looks_like_control_block(&self, allow_as: bool) -> bool {
+        let Some(first) = self.tokens.get(self.pos + 1).map(|t| &t.kind) else {
+            return false;
+        };
+        match first {
+            TokenKind::Int(_)
+            | TokenKind::Float(_)
+            | TokenKind::Str(_)
+            | TokenKind::Bytes(_)
+            | TokenKind::Bool(_)
+            | TokenKind::Unit
+            | TokenKind::Ident(_)
+            | TokenKind::LParen
+            | TokenKind::LBracket
+            | TokenKind::Hash
+            | TokenKind::If
+            | TokenKind::Try
+            | TokenKind::Match => {}
+            _ => return false,
+        }
+        let starts_with_lparen = matches!(first, TokenKind::LParen);
+        let mut pdepth = 0usize;
+        let mut bdepth = 0usize;
+        let limit = (self.pos + 64).min(self.tokens.len());
+        let mut i = self.pos + 1;
+        while i < limit {
+            match &self.tokens[i].kind {
+                TokenKind::LParen => pdepth += 1,
+                TokenKind::RParen => {
+                    if pdepth == 0 {
+                        return false;
+                    }
+                    pdepth -= 1;
+                    if starts_with_lparen && pdepth == 0 && bdepth == 0 {
+                        let next_ok = match self.tokens.get(i + 1).map(|t| &t.kind) {
+                            Some(TokenKind::LBrace) => true,
+                            Some(TokenKind::As) if allow_as => true,
+                            _ => false,
+                        };
+                        if next_ok {
+                            return true;
+                        }
+                        if matches!(
+                            self.tokens.get(i + 1).map(|t| &t.kind),
+                            Some(
+                                TokenKind::Semicolon
+                                    | TokenKind::RBrace
+                                    | TokenKind::Comma
+                                    | TokenKind::Eof
+                            )
+                        ) {
+                            return false;
+                        }
+                    }
+                }
+                TokenKind::LBracket => bdepth += 1,
+                TokenKind::RBracket => {
+                    if bdepth == 0 {
+                        return false;
+                    }
+                    bdepth -= 1;
+                }
+                TokenKind::LBrace if pdepth == 0 && bdepth == 0 => return true,
+                TokenKind::As if allow_as && pdepth == 0 && bdepth == 0 => {
+                    return matches!(
+                        self.tokens.get(i + 1).map(|t| &t.kind),
+                        Some(TokenKind::Ident(_))
+                    ) && matches!(
+                        self.tokens.get(i + 2).map(|t| &t.kind),
+                        Some(TokenKind::LBrace)
+                    );
+                }
+                TokenKind::Semicolon
+                | TokenKind::Assign
+                | TokenKind::PlusAssign
+                | TokenKind::MinusAssign
+                | TokenKind::StarAssign
+                | TokenKind::SlashAssign
+                | TokenKind::PipeAssign
+                | TokenKind::RBrace
+                | TokenKind::Eof
+                    if pdepth == 0 && bdepth == 0 =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn is_stmt_start(&self) -> bool {
         match self.peek_kind() {
             TokenKind::Let
@@ -86,6 +232,16 @@ impl Parser {
             | TokenKind::Break
             | TokenKind::Continue => true,
             TokenKind::Fn => matches!(self.peek_next_kind(), Some(TokenKind::Ident(_))),
+            TokenKind::Ident(s) if s == "needs" => self.is_needs_stmt(),
+            TokenKind::Ident(s) if s == "defer" => self.is_defer_stmt(),
+            TokenKind::Ident(s) if s == "every" => self.looks_like_control_block(false),
+            TokenKind::Ident(s) if s == "spec" => {
+                matches!(self.peek_next_kind(), Some(TokenKind::Str(_)))
+                    && matches!(
+                        self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                        Some(TokenKind::LBrace)
+                    )
+            }
             _ => false,
         }
     }
@@ -239,6 +395,95 @@ impl Parser {
                 self.expect(&TokenKind::Semicolon, "Expected ';' after 'continue'")?;
                 Ok(Stmt::Continue(span))
             }
+            TokenKind::Ident(s) if s == "needs" => {
+                self.advance();
+                let mut caps = Vec::new();
+                loop {
+                    let cap_name = self.expect_ident("Expected capability name after 'needs'")?;
+                    let mut args = Vec::new();
+                    if self.match_kind(&TokenKind::LParen) {
+                        if !self.check(&TokenKind::RParen) {
+                            loop {
+                                match self.peek_kind().clone() {
+                                    TokenKind::Str(v) => {
+                                        self.advance();
+                                        args.push(v);
+                                    }
+                                    _ => {
+                                        let sp = self.current_span();
+                                        return Err(format!(
+                                            "[{}:{}] Capability argument in 'needs' must be a string literal",
+                                            sp.line, sp.col
+                                        ));
+                                    }
+                                }
+                                if !self.match_kind(&TokenKind::Comma) {
+                                    break;
+                                }
+                                if self.check(&TokenKind::RParen) {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(
+                            &TokenKind::RParen,
+                            "Expected ')' after capability arguments in 'needs'",
+                        )?;
+                    }
+                    caps.push((cap_name, args));
+                    if !self.match_kind(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.check(&TokenKind::Semicolon) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::Semicolon, "Expected ';' after 'needs' contract")?;
+                Ok(Stmt::Needs { caps, span })
+            }
+            TokenKind::Ident(s) if s == "defer" => {
+                self.advance();
+                let body = if self.check(&TokenKind::LBrace) {
+                    let b = self.parse_block()?;
+                    let _ = self.match_kind(&TokenKind::Semicolon);
+                    b
+                } else {
+                    let e = self.parse_expr()?;
+                    self.expect(
+                        &TokenKind::Semicolon,
+                        "Expected ';' after 'defer' expression",
+                    )?;
+                    e
+                };
+                Ok(Stmt::Defer { body, span })
+            }
+            TokenKind::Ident(s) if s == "every" => {
+                self.advance();
+                let interval = self.parse_expr_no_struct()?;
+                let body = self.parse_block()?;
+                Ok(Stmt::Every {
+                    interval,
+                    body,
+                    span,
+                })
+            }
+            TokenKind::Ident(s) if s == "spec" => {
+                self.advance();
+                let name = match self.peek_kind().clone() {
+                    TokenKind::Str(v) => {
+                        self.advance();
+                        v
+                    }
+                    other => {
+                        return Err(format!(
+                            "[{}:{}] Expected string name after 'spec', got {:?}",
+                            span.line, span.col, other
+                        ));
+                    }
+                };
+                let body = self.parse_block()?;
+                Ok(Stmt::Spec { name, body, span })
+            }
             _ => unreachable!(),
         }
     }
@@ -265,8 +510,78 @@ impl Parser {
         res
     }
 
+    fn expr_to_assign_target(expr: &Expr, span: Span) -> Result<AssignTarget, String> {
+        match expr {
+            Expr::Ident(name, _) => Ok(AssignTarget::Var(name.clone())),
+            Expr::Index { object, index, .. } => Ok(AssignTarget::Index {
+                object: object.clone(),
+                index: index.clone(),
+            }),
+            Expr::GetAttr { object, name, .. } => Ok(AssignTarget::Attr {
+                object: object.clone(),
+                name: name.clone(),
+            }),
+            _ => Err(format!(
+                "[{}:{}] Invalid assignment target",
+                span.line, span.col
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn parse_pipe_assign_suffix(&mut self, expr: Expr) -> Result<Expr, String> {
+        let span = expr.span();
+        let target = Self::expr_to_assign_target(&expr, span)?;
+        let param = "$pa".to_string();
+        let mut stages = Vec::new();
+        let start = self.pos;
+        while self.match_kind(&TokenKind::PipeAssign) {
+            self.check_chain(start)?;
+            let rhs = self.parse_term()?;
+            stages.push(Self::apply_pipeline_rhs(
+                Expr::Ident(param.clone(), rhs.span()),
+                rhs,
+            ));
+        }
+        Ok(Expr::PipeAssign(Box::new(PipeAssignExpr {
+            target: Box::new(target),
+            param,
+            stages,
+            span,
+        })))
+    }
+
+    #[inline(never)]
+    fn parse_recover_suffix(&mut self, mut expr: Expr) -> Result<Expr, String> {
+        let start = self.pos;
+        while self.match_kind(&TokenKind::Recover) {
+            self.check_chain(start)?;
+            let span = expr.span();
+            let catch_var = if matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                Some(self.expect_ident("Expected error variable after 'recover'")?)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::FatArrow, "Expected '=>' after 'recover'")?;
+            let fallback = self.parse_coalesce()?;
+            expr = Expr::TryCatch {
+                try_body: Box::new(expr),
+                catch_var,
+                catch_body: Box::new(fallback),
+                span,
+            };
+        }
+        Ok(expr)
+    }
+
     fn parse_assign(&mut self) -> Result<Expr, String> {
-        let expr = self.parse_coalesce()?;
+        let mut expr = self.parse_coalesce()?;
+        if self.check(&TokenKind::Recover) {
+            expr = self.parse_recover_suffix(expr)?;
+        }
+        if self.check(&TokenKind::PipeAssign) {
+            return self.parse_pipe_assign_suffix(expr);
+        }
         let compound_op = if self.match_kind(&TokenKind::PlusAssign) {
             Some(BinaryOp::Add)
         } else if self.match_kind(&TokenKind::MinusAssign) {
@@ -281,23 +596,7 @@ impl Parser {
         if compound_op.is_some() || self.match_kind(&TokenKind::Assign) {
             let span = expr.span();
             let rhs = self.parse_expr()?;
-            let target = match &expr {
-                Expr::Ident(name, _) => AssignTarget::Var(name.clone()),
-                Expr::Index { object, index, .. } => AssignTarget::Index {
-                    object: object.clone(),
-                    index: index.clone(),
-                },
-                Expr::GetAttr { object, name, .. } => AssignTarget::Attr {
-                    object: object.clone(),
-                    name: name.clone(),
-                },
-                _ => {
-                    return Err(format!(
-                        "[{}:{}] Invalid assignment target",
-                        span.line, span.col
-                    ));
-                }
-            };
+            let target = Self::expr_to_assign_target(&expr, span)?;
             return Ok(Expr::Assign {
                 target: Box::new(target),
                 op: compound_op,
@@ -431,35 +730,237 @@ impl Parser {
         }
     }
 
+    fn count_placeholders(expr: &Expr) -> usize {
+        match expr {
+            Expr::Ident(name, _) if name == "_" => 1,
+            Expr::Unary { expr: inner, .. } | Expr::Throw { value: inner, .. } => {
+                Self::count_placeholders(inner)
+            }
+            Expr::Binary { left, right, .. } | Expr::NullCoalesce { left, right, .. } => {
+                Self::count_placeholders(left) + Self::count_placeholders(right)
+            }
+            Expr::List(items, _) => items.iter().map(Self::count_placeholders).sum(),
+            Expr::Dict(entries, _) => entries
+                .iter()
+                .map(|(k, v)| Self::count_placeholders(k) + Self::count_placeholders(v))
+                .sum(),
+            Expr::Call { callee, args, .. } => {
+                Self::count_placeholders(callee)
+                    + args.iter().map(Self::count_placeholders).sum::<usize>()
+            }
+            Expr::CallNamed(c) => {
+                Self::count_placeholders(&c.callee)
+                    + c.pos_args
+                        .iter()
+                        .map(Self::count_placeholders)
+                        .sum::<usize>()
+                    + c.named_args
+                        .iter()
+                        .map(|(_, v)| Self::count_placeholders(v))
+                        .sum::<usize>()
+            }
+            Expr::Index { object, index, .. } => {
+                Self::count_placeholders(object) + Self::count_placeholders(index)
+            }
+            Expr::GetAttr { object, .. } | Expr::OptGetAttr { object, .. } => {
+                Self::count_placeholders(object)
+            }
+            _ => 0,
+        }
+    }
+
+    fn replace_placeholders(expr: Expr, replacement: &Expr) -> Expr {
+        match expr {
+            Expr::Ident(ref name, _) if name == "_" => replacement.clone(),
+            Expr::Unary {
+                op,
+                expr: inner,
+                span,
+            } => Expr::Unary {
+                op,
+                expr: Box::new(Self::replace_placeholders(*inner, replacement)),
+                span,
+            },
+            Expr::Binary {
+                left,
+                op,
+                right,
+                span,
+            } => Expr::Binary {
+                left: Box::new(Self::replace_placeholders(*left, replacement)),
+                op,
+                right: Box::new(Self::replace_placeholders(*right, replacement)),
+                span,
+            },
+            Expr::NullCoalesce { left, right, span } => Expr::NullCoalesce {
+                left: Box::new(Self::replace_placeholders(*left, replacement)),
+                right: Box::new(Self::replace_placeholders(*right, replacement)),
+                span,
+            },
+            Expr::List(items, span) => Expr::List(
+                items
+                    .into_iter()
+                    .map(|item| Self::replace_placeholders(item, replacement))
+                    .collect(),
+                span,
+            ),
+            Expr::Dict(entries, span) => Expr::Dict(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            Self::replace_placeholders(k, replacement),
+                            Self::replace_placeholders(v, replacement),
+                        )
+                    })
+                    .collect(),
+                span,
+            ),
+            Expr::Call { callee, args, span } => Expr::Call {
+                callee: Box::new(Self::replace_placeholders(*callee, replacement)),
+                args: args
+                    .into_iter()
+                    .map(|a| Self::replace_placeholders(a, replacement))
+                    .collect(),
+                span,
+            },
+            Expr::CallNamed(mut c) => {
+                c.callee = Box::new(Self::replace_placeholders(*c.callee, replacement));
+                c.pos_args = c
+                    .pos_args
+                    .into_iter()
+                    .map(|a| Self::replace_placeholders(a, replacement))
+                    .collect();
+                c.named_args = c
+                    .named_args
+                    .into_iter()
+                    .map(|(k, v)| (k, Self::replace_placeholders(v, replacement)))
+                    .collect();
+                Expr::CallNamed(c)
+            }
+            Expr::Index {
+                object,
+                index,
+                span,
+            } => Expr::Index {
+                object: Box::new(Self::replace_placeholders(*object, replacement)),
+                index: Box::new(Self::replace_placeholders(*index, replacement)),
+                span,
+            },
+            Expr::GetAttr { object, name, span } => Expr::GetAttr {
+                object: Box::new(Self::replace_placeholders(*object, replacement)),
+                name,
+                span,
+            },
+            Expr::OptGetAttr { object, name, span } => Expr::OptGetAttr {
+                object: Box::new(Self::replace_placeholders(*object, replacement)),
+                name,
+                span,
+            },
+            other => other,
+        }
+    }
+
+    fn apply_pipeline_rhs(lhs: Expr, rhs: Expr) -> Expr {
+        let span = rhs.span();
+        let ph_count = Self::count_placeholders(&rhs);
+        if ph_count == 1 {
+            return Self::replace_placeholders(rhs, &lhs);
+        }
+        if ph_count > 1 {
+            let tmp_name = "$pipe_val".to_string();
+            let tmp_ident = Expr::Ident(tmp_name.clone(), span);
+            let replaced = Self::replace_placeholders(rhs, &tmp_ident);
+            return Expr::Block {
+                stmts: vec![Stmt::Let {
+                    name: tmp_name,
+                    value: lhs,
+                    is_pub: false,
+                    span,
+                }],
+                tail: Some(Box::new(replaced)),
+                span,
+            };
+        }
+        match rhs {
+            Expr::Call {
+                callee,
+                mut args,
+                span: call_span,
+            } => {
+                args.insert(0, lhs);
+                Expr::Call {
+                    callee,
+                    args,
+                    span: call_span,
+                }
+            }
+            Expr::CallNamed(mut c) => {
+                c.pos_args.insert(0, lhs);
+                Expr::CallNamed(c)
+            }
+            other => Expr::Call {
+                callee: Box::new(other),
+                args: vec![lhs],
+                span,
+            },
+        }
+    }
+
     fn parse_pipe(&mut self) -> Result<Expr, String> {
         let start = self.pos;
         let mut expr = self.parse_term()?;
-        while self.match_kind(&TokenKind::Pipe) {
+        loop {
+            let kind = if self.match_kind(&TokenKind::Pipe) {
+                0
+            } else if self.match_kind(&TokenKind::PipeSafe) {
+                1
+            } else if self.match_kind(&TokenKind::PipeMap) {
+                2
+            } else {
+                break;
+            };
             self.check_chain(start)?;
             let right = self.parse_term()?;
             let span = right.span();
-            expr = match right {
-                Expr::Call {
-                    callee,
-                    mut args,
-                    span: call_span,
-                } => {
-                    args.insert(0, expr);
-                    Expr::Call {
-                        callee,
-                        args,
-                        span: call_span,
+            expr = match kind {
+                0 => Self::apply_pipeline_rhs(expr, right),
+                1 => {
+                    let param = "$sp".to_string();
+                    let apply = Self::apply_pipeline_rhs(Expr::Ident(param.clone(), span), right);
+                    Expr::SafePipe(Box::new(SafePipeExpr {
+                        left: Box::new(expr),
+                        param,
+                        apply: Box::new(apply),
+                        span,
+                    }))
+                }
+                2 => {
+                    let needs_wrapper = Self::count_placeholders(&right) > 0
+                        || matches!(&right, Expr::Call { .. } | Expr::CallNamed(_));
+                    let mapper = if needs_wrapper {
+                        let param = "$mp".to_string();
+                        let body =
+                            Self::apply_pipeline_rhs(Expr::Ident(param.clone(), span), right);
+                        Expr::Fn {
+                            params: vec![FnParam {
+                                name: param,
+                                default: None,
+                                is_variadic: false,
+                            }],
+                            body: Box::new(body),
+                            span,
+                        }
+                    } else {
+                        right
+                    };
+                    Expr::MapPipe {
+                        left: Box::new(expr),
+                        mapper: Box::new(mapper),
+                        span,
                     }
                 }
-                Expr::CallNamed(mut c) => {
-                    c.pos_args.insert(0, expr);
-                    Expr::CallNamed(c)
-                }
-                other => Expr::Call {
-                    callee: Box::new(other),
-                    args: vec![expr],
-                    span,
-                },
+                _ => unreachable!(),
             };
         }
         Ok(expr)
@@ -558,18 +1059,28 @@ impl Parser {
         result
     }
 
-    fn looks_like_struct_literal(&self) -> bool {
+    fn looks_like_nonempty_struct_literal(&self) -> bool {
         if !matches!(self.peek_kind(), TokenKind::LBrace) {
             return false;
         }
         match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
-            Some(TokenKind::RBrace) | Some(TokenKind::DotDot) => true,
+            Some(TokenKind::DotDot) => true,
             Some(TokenKind::Ident(_)) => matches!(
                 self.tokens.get(self.pos + 2).map(|t| &t.kind),
                 Some(TokenKind::Colon)
             ),
             _ => false,
         }
+    }
+
+    fn looks_like_struct_literal(&self) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::LBrace) {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::RBrace)
+        ) || self.looks_like_nonempty_struct_literal()
     }
 
     #[inline(never)]
@@ -687,9 +1198,9 @@ impl Parser {
             self.check_chain(start)?;
             if self.match_kind(&TokenKind::LParen) {
                 expr = self.parse_call_suffix(expr)?;
-            } else if self.allow_struct_literal
-                && matches!(expr, Expr::Ident(..) | Expr::GetAttr { .. })
-                && self.looks_like_struct_literal()
+            } else if matches!(expr, Expr::Ident(..) | Expr::GetAttr { .. })
+                && ((self.allow_struct_literal && self.looks_like_struct_literal())
+                    || self.looks_like_nonempty_struct_literal())
             {
                 expr = self.parse_struct_init_suffix(expr)?;
             } else if self.match_kind(&TokenKind::LBracket) {
@@ -764,6 +1275,205 @@ impl Parser {
         Ok(expr)
     }
 
+    #[inline(never)]
+    fn parse_tagged_template(&mut self, tag: String, span: Span) -> Result<Expr, String> {
+        match self.peek_kind().clone() {
+            TokenKind::Str(s) => {
+                self.advance();
+                Ok(Expr::TaggedTemplate(Box::new(TaggedTemplateExpr {
+                    tag,
+                    parts: vec![s],
+                    exprs: Vec::new(),
+                    expr_labels: Vec::new(),
+                    span,
+                })))
+            }
+            TokenKind::InterpStart(first) => {
+                self.advance();
+                let start = self.pos;
+                let mut parts = vec![first];
+                let mut exprs = Vec::new();
+                let mut expr_labels = Vec::new();
+                loop {
+                    self.check_chain(start)?;
+                    let expr = self.parse_expr()?;
+                    let mut label = match &expr {
+                        Expr::Ident(name, _) => name.clone(),
+                        Expr::GetAttr { name, .. } => name.clone(),
+                        _ => String::new(),
+                    };
+                    let expr_val = if let TokenKind::DebugEq(eq_label) = self.peek_kind().clone() {
+                        self.advance();
+                        if label.is_empty() {
+                            label = eq_label.clone();
+                        }
+                        let expr_span = expr.span();
+                        let str_call = Expr::Call {
+                            callee: Box::new(Expr::Ident("str".to_string(), expr_span)),
+                            args: vec![expr],
+                            span: expr_span,
+                        };
+                        Expr::Binary {
+                            left: Box::new(Expr::Str(format!("{}=", eq_label), expr_span)),
+                            op: BinaryOp::Add,
+                            right: Box::new(str_call),
+                            span: expr_span,
+                        }
+                    } else {
+                        expr
+                    };
+                    exprs.push(expr_val);
+                    expr_labels.push(label);
+                    match self.peek_kind().clone() {
+                        TokenKind::InterpMid(mid) => {
+                            self.advance();
+                            parts.push(mid);
+                        }
+                        TokenKind::InterpEnd(end) => {
+                            self.advance();
+                            parts.push(end);
+                            break;
+                        }
+                        other => {
+                            return Err(format!(
+                                "[{}:{}] Expected string interpolation continuation, got {:?}",
+                                span.line, span.col, other
+                            ));
+                        }
+                    }
+                }
+                Ok(Expr::TaggedTemplate(Box::new(TaggedTemplateExpr {
+                    tag,
+                    parts,
+                    exprs,
+                    expr_labels,
+                    span,
+                })))
+            }
+            other => Err(format!(
+                "[{}:{}] Expected string literal after template tag '{}', got {:?}",
+                span.line, span.col, tag, other
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn parse_interp(&mut self, first: String, span: Span) -> Result<Expr, String> {
+        let start = self.pos;
+        let mut acc = Expr::Str(first, span);
+        loop {
+            self.check_chain(start)?;
+            let expr = self.parse_expr()?;
+            let expr_span = expr.span();
+            let str_call = Expr::Call {
+                callee: Box::new(Expr::Ident("str".to_string(), expr_span)),
+                args: vec![expr],
+                span: expr_span,
+            };
+            let seg = if let TokenKind::DebugEq(label) = self.peek_kind().clone() {
+                self.advance();
+                Expr::Binary {
+                    left: Box::new(Expr::Str(format!("{}=", label), expr_span)),
+                    op: BinaryOp::Add,
+                    right: Box::new(str_call),
+                    span: expr_span,
+                }
+            } else {
+                str_call
+            };
+            acc = Expr::Binary {
+                left: Box::new(acc),
+                op: BinaryOp::Add,
+                right: Box::new(seg),
+                span,
+            };
+            match self.peek_kind().clone() {
+                TokenKind::InterpMid(mid) => {
+                    self.advance();
+                    if !mid.is_empty() {
+                        acc = Expr::Binary {
+                            left: Box::new(acc),
+                            op: BinaryOp::Add,
+                            right: Box::new(Expr::Str(mid, span)),
+                            span,
+                        };
+                    }
+                }
+                TokenKind::InterpEnd(end) => {
+                    self.advance();
+                    if !end.is_empty() {
+                        acc = Expr::Binary {
+                            left: Box::new(acc),
+                            op: BinaryOp::Add,
+                            right: Box::new(Expr::Str(end, span)),
+                            span,
+                        };
+                    }
+                    break;
+                }
+                other => {
+                    return Err(format!(
+                        "[{}:{}] Expected string interpolation continuation, got {:?}",
+                        span.line, span.col, other
+                    ));
+                }
+            }
+        }
+        Ok(acc)
+    }
+
+    #[inline(never)]
+    fn parse_sandbox_expr(&mut self, span: Span) -> Result<Expr, String> {
+        let mut policy = Vec::new();
+        if self.match_kind(&TokenKind::LParen) {
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    let k = self.expect_ident("Expected policy key inside 'sandbox(...)'")?;
+                    self.expect(&TokenKind::Colon, "Expected ':' after sandbox policy key")?;
+                    let v = self.parse_expr()?;
+                    policy.push((k, v));
+                    if !self.match_kind(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.check(&TokenKind::RParen) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RParen, "Expected ')' after sandbox options")?;
+        }
+        let body = self.parse_block()?;
+        Ok(Expr::Sandbox(Box::new(SandboxExpr { policy, body, span })))
+    }
+
+    #[inline(never)]
+    fn parse_with_expr(&mut self, span: Span) -> Result<Expr, String> {
+        let resource = self.parse_expr_no_struct()?;
+        let alias = if self.match_kind(&TokenKind::As) {
+            Some(self.expect_ident("Expected variable name after 'as' in 'with'")?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        Ok(Expr::With(Box::new(WithExpr {
+            resource,
+            alias,
+            body,
+            span,
+        })))
+    }
+
+    #[inline(never)]
+    fn parse_after_expr(&mut self, span: Span) -> Result<Expr, String> {
+        let delay = self.parse_expr_no_struct()?;
+        let body = self.parse_block()?;
+        Ok(Expr::After {
+            delay: Box::new(delay),
+            body: Box::new(body),
+            span,
+        })
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, String> {
         let span = self.current_span();
         match self.peek_kind().clone() {
@@ -783,58 +1493,13 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Bytes(b, span))
             }
+            TokenKind::TaggedTemplate(tag) => {
+                self.advance();
+                self.parse_tagged_template(tag, span)
+            }
             TokenKind::InterpStart(first) => {
                 self.advance();
-                let start = self.pos;
-                let mut acc = Expr::Str(first, span);
-                loop {
-                    self.check_chain(start)?;
-                    let expr = self.parse_expr()?;
-                    let expr_span = expr.span();
-                    let str_call = Expr::Call {
-                        callee: Box::new(Expr::Ident("str".to_string(), expr_span)),
-                        args: vec![expr],
-                        span: expr_span,
-                    };
-                    acc = Expr::Binary {
-                        left: Box::new(acc),
-                        op: BinaryOp::Add,
-                        right: Box::new(str_call),
-                        span,
-                    };
-                    match self.peek_kind().clone() {
-                        TokenKind::InterpMid(mid) => {
-                            self.advance();
-                            if !mid.is_empty() {
-                                acc = Expr::Binary {
-                                    left: Box::new(acc),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::Str(mid, span)),
-                                    span,
-                                };
-                            }
-                        }
-                        TokenKind::InterpEnd(end) => {
-                            self.advance();
-                            if !end.is_empty() {
-                                acc = Expr::Binary {
-                                    left: Box::new(acc),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::Str(end, span)),
-                                    span,
-                                };
-                            }
-                            break;
-                        }
-                        other => {
-                            return Err(format!(
-                                "[{}:{}] Expected string interpolation continuation, got {:?}",
-                                span.line, span.col, other
-                            ));
-                        }
-                    }
-                }
-                Ok(acc)
+                self.parse_interp(first, span)
             }
             TokenKind::Bool(b) => {
                 self.advance();
@@ -845,6 +1510,18 @@ impl Parser {
                 Ok(Expr::Unit(span))
             }
             TokenKind::Ident(name) => {
+                if name == "sandbox" && self.looks_like_sandbox() {
+                    self.advance();
+                    return self.parse_sandbox_expr(span);
+                }
+                if name == "with" && self.looks_like_control_block(true) {
+                    self.advance();
+                    return self.parse_with_expr(span);
+                }
+                if name == "after" && self.looks_like_control_block(false) {
+                    self.advance();
+                    return self.parse_after_expr(span);
+                }
                 self.advance();
                 Ok(Expr::Ident(name, span))
             }

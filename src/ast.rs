@@ -49,6 +49,46 @@ pub struct ChainedCmpExpr {
 }
 
 #[derive(Debug, Clone)]
+pub struct SafePipeExpr {
+    pub left: Box<Expr>,
+    pub param: String,
+    pub apply: Box<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct PipeAssignExpr {
+    pub target: Box<AssignTarget>,
+    pub param: String,
+    pub stages: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaggedTemplateExpr {
+    pub tag: String,
+    pub parts: Vec<String>,
+    pub exprs: Vec<Expr>,
+    pub expr_labels: Vec<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct WithExpr {
+    pub resource: Expr,
+    pub alias: Option<String>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SandboxExpr {
+    pub policy: Vec<(String, Expr)>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub struct StructMethod {
     pub name: String,
     pub params: Vec<FnParam>,
@@ -130,6 +170,24 @@ pub enum Stmt {
     },
     Break(Span),
     Continue(Span),
+    Needs {
+        caps: Vec<(String, Vec<String>)>,
+        span: Span,
+    },
+    Defer {
+        body: Expr,
+        span: Span,
+    },
+    Every {
+        interval: Expr,
+        body: Expr,
+        span: Span,
+    },
+    Spec {
+        name: String,
+        body: Expr,
+        span: Span,
+    },
     Expr(Expr),
 }
 
@@ -230,6 +288,21 @@ pub enum Expr {
         catch_body: Box<Expr>,
         span: Span,
     },
+    SafePipe(Box<SafePipeExpr>),
+    MapPipe {
+        left: Box<Expr>,
+        mapper: Box<Expr>,
+        span: Span,
+    },
+    PipeAssign(Box<PipeAssignExpr>),
+    TaggedTemplate(Box<TaggedTemplateExpr>),
+    With(Box<WithExpr>),
+    Sandbox(Box<SandboxExpr>),
+    After {
+        delay: Box<Expr>,
+        body: Box<Expr>,
+        span: Span,
+    },
     Throw {
         value: Box<Expr>,
         span: Span,
@@ -263,7 +336,14 @@ impl Expr {
             | Expr::OptGetAttr { span, .. }
             | Expr::NullCoalesce { span, .. }
             | Expr::TryCatch { span, .. }
+            | Expr::MapPipe { span, .. }
+            | Expr::After { span, .. }
             | Expr::Throw { span, .. } => *span,
+            Expr::SafePipe(p) => p.span,
+            Expr::PipeAssign(p) => p.span,
+            Expr::TaggedTemplate(t) => t.span,
+            Expr::With(w) => w.span,
+            Expr::Sandbox(s) => s.span,
             Expr::CallNamed(c) => c.span,
             Expr::StructInit(s) => s.span,
             Expr::ChainedCmp(c) => c.span,

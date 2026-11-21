@@ -1,0 +1,64 @@
+// Benchmark 05: Core Scripting Workload (Weight: 35% - Highest Impact)
+// Tests VM function calls, recursion, closures, match dispatch, list/dict lookups, and loops.
+
+fn fib(n) {
+    if n < 2 {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
+}
+
+fn make_multiplier(factor) {
+    fn(x) { x * factor }
+}
+
+fn eval_op(op, a, b) {
+    match op {
+        0 => a + b,
+        1 => if a >= b { a - b } else { b - a },
+        2 => a * ((b % 13) + 1),
+        3 => if b == 0 { a } else { a / ((b % 7) + 1) },
+        _ => a,
+    }
+}
+
+fn run_scripting_bench() {
+    // 1. Recursive function dispatch
+    let fib_sum = fib(29) + fib(27);
+
+    // 2. Closures + dynamic dispatch loop
+    let mul3 = make_multiplier(3);
+    let mul5 = make_multiplier(5);
+    let dispatch_acc = 0;
+    let i = 0;
+    while i < 120000 {
+        let v = eval_op(i % 4, i, i + 3);
+        if i % 2 == 0 {
+            dispatch_acc = (dispatch_acc + mul3(v % 100)) % 1000000007;
+        } else {
+            dispatch_acc = (dispatch_acc + mul5(v % 100)) % 1000000007;
+        }
+        i = i + 1;
+    }
+
+    // 3. Dictionary lookups, list mutations, and string formatting
+    let env_map = #{ alpha: 11, beta: 22, gamma: 33, delta: 44 };
+    let keys_list = ["alpha", "beta", "gamma", "delta"];
+    let kv_acc = 0;
+    let step = 0;
+    while step < 75000 {
+        let k = keys_list[step % 4];
+        let cur = env_map[k];
+        env_map[k] = (cur + 7) % 10000;
+        kv_acc = (kv_acc + env_map[k]) % 1000000007;
+        step = step + 1;
+    }
+
+    (fib_sum + dispatch_acc + kv_acc) % 1000000007
+}
+
+let t0 = clock();
+let checksum = run_scripting_bench();
+let elapsed = (clock() - t0) * 1000.0;
+println("BENCH_RESULT 05_scripting " + str(elapsed) + " " + str(checksum));
