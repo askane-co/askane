@@ -155,7 +155,9 @@ impl VM {
     }
 
     pub fn new_with_sandbox(sandboxed: bool) -> Self {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let raw_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let current_dir = fs::canonicalize(&raw_dir).unwrap_or(raw_dir);
+        let sandbox_root = current_dir.clone();
         let permissions = if sandboxed {
             Permissions::sandboxed()
         } else {
@@ -173,7 +175,7 @@ impl VM {
             open_upvalues: Vec::new(),
             start_time: Instant::now(),
             current_dir,
-            sandbox_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            sandbox_root,
             sandboxed,
             permissions,
             module_cache: HashMap::new(),
@@ -198,11 +200,11 @@ impl VM {
     }
 
     pub fn set_current_dir(&mut self, dir: PathBuf) {
-        self.current_dir = dir;
+        self.current_dir = fs::canonicalize(&dir).unwrap_or(dir);
     }
 
     pub fn set_sandbox_root(&mut self, dir: PathBuf) {
-        self.sandbox_root = dir;
+        self.sandbox_root = fs::canonicalize(&dir).unwrap_or(dir);
     }
 
     pub fn is_sandboxed(&self) -> bool {
@@ -628,10 +630,25 @@ impl VM {
         if let Some(r) = normalize_lexical(&self.sandbox_root, base_dir) {
             lexical_roots.push(r);
         }
+        if let Ok(canon_root) = fs::canonicalize(&self.sandbox_root) {
+            if let Some(r) = normalize_lexical(&canon_root, &self.current_dir) {
+                lexical_roots.push(r);
+            }
+        }
         if let Some(dirs) = extra_roots {
             for dir in dirs {
                 if let Some(r) = normalize_lexical(dir, base_dir) {
                     lexical_roots.push(r);
+                }
+                let abs = if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    self.current_dir.join(dir)
+                };
+                if let Ok(allowed_root) = Self::canonicalize_existing_prefix(&abs) {
+                    if let Some(r) = normalize_lexical(&allowed_root, &self.current_dir) {
+                        lexical_roots.push(r);
+                    }
                 }
             }
         }
