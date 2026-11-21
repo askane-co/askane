@@ -1,10 +1,33 @@
-# Askane (Open Beta)
+<div align="center">
+  <img src="docs/banner.jpg" alt="Askane - Bytecode Scripting Language in Zero-Crate Rust" width="100%" />
 
-[![CI](https://github.com/askane-co/askane/actions/workflows/ci.yml/badge.svg)](https://github.com/askane-co/askane/actions/workflows/ci.yml)
+  <h1>Askane (v0.16.0 Open Beta)</h1>
 
-Askane is an experimental, bytecode-compiled scripting language written in Rust with zero external crate dependencies. See [docs/SYNTAX.md](docs/SYNTAX.md) for the language specification.
+  <p>
+    An experimental, bytecode-compiled scripting language written in Rust with <strong>zero external crate dependencies</strong>.
+  </p>
 
-> **Transparency note**: This language and its runtime were designed and built in collaboration with **Gemini** (AI-assisted development). I am publishing it as an open beta so anyone can test it, inspect the code, break things, and suggest improvements.
+  <p>
+    <a href="https://github.com/askane-co/askane/actions/workflows/ci.yml">
+      <img src="https://github.com/askane-co/askane/actions/workflows/ci.yml/badge.svg" alt="CI" />
+    </a>
+    &nbsp;&middot;&nbsp;
+    <a href="docs/SYNTAX.md">Language Spec</a>
+    &nbsp;&middot;&nbsp;
+    <a href="SECURITY_AUDIT.md">Security Audit</a>
+    &nbsp;&middot;&nbsp;
+    <a href="ROADMAP.md">Roadmap</a>
+  </p>
+</div>
+
+> **Transparency note**: This language and its runtime were designed and built in collaboration with **Gemini** (AI-assisted development). Published as an open beta so anyone can inspect the VM, run benchmarks, test the sandbox, and suggest improvements.
+
+## Highlights
+
+- **Single standalone binary**: lexer, AST parser, bytecode compiler, register/stack fast VM (`execute_fast`), and a rich standard library in pure Rust with zero Cargo dependencies.
+- **Expression-first syntax**: `{ ... }` blocks, `if`/`else`, `match`, pipelines (`|>`, `|?>`, `|*>`, `|>=`, `_`), inline `recover`, tagged templates (`log"..."`, `sql"..."`), `struct`, `set`, `bytes`, and built-in `spec` tests.
+- **Sandbox & contracts**: default-deny permissions for network, filesystem outside root, env, args, clipboard, global input, and process execution, plus `needs` declarations and `sandbox { ... }` privilege attenuation.
+- **Built-in tooling**: multiline REPL, `askane check`, `askane fmt`, `askane test`, `askane permissions`, `askane init`, benchmark suite (`bench/`), and Windows Askane Studio (`--gui`).
 
 ## How It Works Under the Hood
 
@@ -75,13 +98,21 @@ player.hp = 90;
 let mana = player?.mana ?? 50;
 println("${player.name}: hp=${player.hp}, mana=${mana}", keys(player));
 
-// Error handling with try / catch / throw
+// Error handling with try / catch and inline recover
 let parsed = try {
     if mana < 0 { throw "invalid mana"; }
     mana
 } catch err {
     0
 };
+let safe_double = { int(player?.hp) * 2 } recover => 0;
+
+// Pipelines with placeholder _, elementwise map |*>, and built-in spec tests
+let scaled = [1, 2, 3] |*> (_ * 10) |> (_ + [40]);
+spec "player mana stays non-negative" {
+    import test;
+    test.assert_eq(parsed >= 0, true);
+}
 ```
 
 ## Built-in Functions & Modules
