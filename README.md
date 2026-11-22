@@ -3,7 +3,7 @@
 
   <h1>
     <img src="docs/logo.png" alt="Askane Logo" width="38" height="38" align="absmiddle" />
-    &nbsp;Askane (v0.16.1 Open Beta)
+    &nbsp;Askane (v0.16.2 Open Beta)
   </h1>
 
   <p>
