@@ -216,6 +216,10 @@ for findings and [ROADMAP.md](ROADMAP.md) for proposed next releases.
 
 ![Askane Roadmap](docs/roadmap.jpg)
 
+## Mascot
+
+Askane's official mascot is a **Plecostomus** (**Pleco**), a humble little armored catfish that bravely cleans up messy code and keeps the tank spotless.
+
 ## License
 
 MIT
