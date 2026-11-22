@@ -171,6 +171,7 @@ mod win32_gfx {
         fn GetAsyncKeyState(vKey: i32) -> i16;
         fn GetForegroundWindow() -> Hwnd;
         fn LoadCursorW(hInstance: HInstance, lpCursorName: *const u16) -> *mut c_void;
+        fn LoadIconW(hInstance: HInstance, lpIconName: *const u16) -> *mut c_void;
         fn BeginPaint(hWnd: Hwnd, lpPaint: *mut PaintStruct) -> Hdc;
         fn EndPaint(hWnd: Hwnd, lpPaint: *const PaintStruct) -> i32;
         fn GetCursorPos(lpPoint: *mut Point) -> i32;
@@ -322,6 +323,7 @@ mod win32_gfx {
 
         unsafe {
             let h_instance = GetModuleHandleW(std::ptr::null());
+            let app_icon = LoadIconW(h_instance, 1usize as *const u16);
             let wc = WndClassExW {
                 cb_size: std::mem::size_of::<WndClassExW>() as u32,
                 style: 0,
@@ -329,12 +331,12 @@ mod win32_gfx {
                 cb_cls_extra: 0,
                 cb_wnd_extra: 0,
                 h_instance,
-                h_icon: std::ptr::null_mut(),
+                h_icon: app_icon,
                 h_cursor: LoadCursorW(std::ptr::null_mut(), 32512 as *const u16),
                 hbr_background: std::ptr::null_mut(),
                 lpsz_menu_name: std::ptr::null(),
                 lpsz_class_name: class_name.as_ptr(),
-                h_icon_sm: std::ptr::null_mut(),
+                h_icon_sm: app_icon,
             };
             RegisterClassExW(&wc);
 

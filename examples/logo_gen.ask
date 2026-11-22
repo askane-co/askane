@@ -168,8 +168,30 @@ fn concat_bytes_list(list) {
     acc
 }
 
-fn render_png(size, out_path) {
+fn shade_pixel_ss(cx, cy, scale) {
+    if scale <= 1.1 {
+        return shade_pixel(cx * scale, cy * scale);
+    }
+    let offsets = [-0.25, 0.25];
+    let sr = 0;
+    let sg = 0;
+    let sb = 0;
+    let sa = 0;
+    for oy in offsets {
+        for ox in offsets {
+            let p = shade_pixel((cx + ox) * scale, (cy + oy) * scale);
+            sr += p[0];
+            sg += p[1];
+            sb += p[2];
+            sa += p[3];
+        }
+    }
+    [int(sr / 4), int(sg / 4), int(sb / 4), int(sa / 4)]
+}
+
+fn render_png_bytes(size) {
     let half = float(size) * 0.5;
+    let scale = 512.0 / float(size);
     let chunks = [];
     let row_group = [];
     let y = 0;
@@ -179,7 +201,7 @@ fn render_png(size, out_path) {
         let x = 0;
         while x < size {
             let px = float(x) + 0.5 - half;
-            let rgba = shade_pixel(px, py);
+            let rgba = shade_pixel_ss(px, py, scale);
             push(row, rgba[0]);
             push(row, rgba[1]);
             push(row, rgba[2]);
@@ -199,18 +221,81 @@ fn render_png(size, out_path) {
     }
 
     let raw = concat_bytes_list(chunks);
-
     let sig = b"\x89PNG\r\n\x1a\n";
     let ihdr_body = binary.write_u32_be(size) + binary.write_u32_be(size) + b"\x08\x06\x00\x00\x00";
     let ihdr = png_chunk("IHDR", ihdr_body);
     let idat = png_chunk("IDAT", compress.zlib_compress(raw));
     let iend = png_chunk("IEND", b"");
-    fs.write_bytes(out_path, sig + ihdr + idat + iend);
+    sig + ihdr + idat + iend
+}
+
+fn render_dib_frame(size) {
+    let half = float(size) * 0.5;
+    let scale = 512.0 / float(size);
+    // BITMAPINFOHEADER (40 bytes, biHeight = size * 2 for XOR + AND mask)
+    let hdr = binary.pack("<IIIHHIIIIII", [
+            40,
+            size,
+            size * 2,
+            1,
+            32,
+            0,
+            size * size * 4,
+            0,
+            0,
+            0,
+            0,
+    ]);
+    let rows = [];
+    let y = size - 1;
+    while y >= 0 {
+        let row = [];
+        let py = float(y) + 0.5 - half;
+        let x = 0;
+        while x < size {
+            let px = float(x) + 0.5 - half;
+            let rgba = shade_pixel_ss(px, py, scale);
+            push(row, rgba[2]);
+            push(row, rgba[1]);
+            push(row, rgba[0]);
+            push(row, rgba[3]);
+            x += 1;
+        }
+        push(rows, bytes.from_list(row));
+        y -= 1;
+    }
+    let and_stride = int((size + 31) / 32) * 4;
+    let and_mask = bytes.zeros(and_stride * size);
+    hdr + concat_bytes_list(rows) + and_mask
+}
+
+fn write_ico(out_path) {
+    let frames = [
+        #{ size: 256, data: render_png_bytes(256) },
+        #{ size: 48, data: render_dib_frame(48) },
+        #{ size: 32, data: render_dib_frame(32) },
+        #{ size: 16, data: render_dib_frame(16) },
+    ];
+    let dir_hdr = binary.pack("<HHH", [0, 1, len(frames)]);
+    let offset = 6 + len(frames) * 16;
+    let entries = [];
+    let payloads = [];
+    for f in frames {
+        let sz = f["size"];
+        let dim = if sz >= 256 { 0 } else { sz };
+        let data = f["data"];
+        let entry = binary.pack("<BBBBHHII", [dim, dim, 0, 0, 1, 32, len(data), offset]);
+        push(entries, entry);
+        push(payloads, data);
+        offset += len(data);
+    }
+    fs.write_bytes(out_path, dir_hdr + concat_bytes_list(entries) + concat_bytes_list(payloads));
 }
 
 if is_main() {
     let sz = 512;
     fs.write("../docs/logo.svg", build_svg(sz));
-    render_png(sz, "../docs/logo.png");
-    println("Generated docs/logo.svg and docs/logo.png cleanly using Askane 0.16.1");
+    fs.write_bytes("../docs/logo.png", render_png_bytes(sz));
+    write_ico("../docs/askane.ico");
+    println("Generated docs/logo.svg, docs/logo.png and docs/askane.ico cleanly using Askane 0.16.1");
 }

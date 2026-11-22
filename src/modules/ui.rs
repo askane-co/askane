@@ -2006,6 +2006,7 @@ mod win32_ui {
         fn GetDC(h_wnd: Hwnd) -> Hdc;
         fn ReleaseDC(h_wnd: Hwnd, h_dc: Hdc) -> i32;
         fn LoadCursorW(h_instance: HInstance, lp_cursor_name: *const u16) -> *mut c_void;
+        fn LoadIconW(h_instance: HInstance, lp_icon_name: *const u16) -> *mut c_void;
         fn SetProcessDPIAware() -> i32;
     }
 
@@ -2147,6 +2148,7 @@ mod win32_ui {
             let h_instance = unsafe { GetModuleHandleW(null()) };
             let cname = class_name_wide();
             REGISTER_ONCE.call_once(|| unsafe {
+                let app_icon = LoadIconW(h_instance, 1usize as *const u16);
                 let wc = WndClassExW {
                     cb_size: std::mem::size_of::<WndClassExW>() as u32,
                     style: CS_HREDRAW | CS_VREDRAW,
@@ -2154,12 +2156,12 @@ mod win32_ui {
                     cb_cls_extra: 0,
                     cb_wnd_extra: 0,
                     h_instance,
-                    h_icon: null_mut(),
+                    h_icon: app_icon,
                     h_cursor: LoadCursorW(null_mut(), IDC_ARROW),
                     hbr_background: null_mut(),
                     lpsz_menu_name: null(),
                     lpsz_class_name: cname.as_ptr(),
-                    h_icon_sm: null_mut(),
+                    h_icon_sm: app_icon,
                 };
                 RegisterClassExW(&wc);
             });

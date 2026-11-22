@@ -5,6 +5,7 @@ mod gui;
 mod lexer;
 mod modules;
 mod parser;
+mod setup;
 mod value;
 mod vm;
 
@@ -1359,6 +1360,9 @@ fn print_help() {
     println!("  askane permissions <file>    Inspect capabilities imported by a script");
     println!("  askane fmt [--check] <path>  Format an Askane file or directory");
     println!("  askane init [dir]            Create a starter Askane project");
+    println!(
+        "  askane setup [opts]          Add Askane to User PATH & register .ask files (Windows)"
+    );
     println!("  askane test [file_or_dir]    Run .ask test files or project tests");
     println!("  askane -b <file.ask>         Disassemble compiled bytecode");
     println!("  askane --profile <file.ask>  Print function profiling stats after execution");
@@ -2292,6 +2296,14 @@ fn main() {
         let initial = args.get(2).map(String::as_str);
         if let Err(e) = gui::run(initial) {
             eprintln!("GUI error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
+    if args[1] == "setup" {
+        if let Err(e) = setup::run_setup_cli(&args[2..]) {
+            eprintln!("Setup error: {}", e);
             process::exit(1);
         }
         return;
@@ -6009,5 +6021,24 @@ archive.extract(z, "out")
         assert!(!needs_more_input("let b = b\"foo ${1\";"));
         assert!(needs_more_input("let b = b\"foo\n"));
         assert!(format_askane_source("let s = \"line1\n   line2\";\n").contains("   line2"));
+    }
+
+    #[test]
+    fn test_v0161_setup_path_list_manipulation() {
+        let (p1, added1) = setup::add_dir_to_path_list("C:\\Windows;C:\\Tools", "C:\\Askane\\");
+        assert!(added1);
+        assert!(p1.ends_with("C:\\Askane\\"));
+
+        let (p2, added2) = setup::add_dir_to_path_list(&p1, "C:\\Askane");
+        assert!(!added2);
+        assert_eq!(p2, p1);
+
+        let (p3, removed) = setup::remove_dir_from_path_list(&p1, "C:\\Askane");
+        assert!(removed);
+        assert_eq!(p3, "C:\\Windows;C:\\Tools");
+
+        let (p4, removed2) = setup::remove_dir_from_path_list(&p3, "C:\\Missing");
+        assert!(!removed2);
+        assert_eq!(p4, "C:\\Windows;C:\\Tools");
     }
 }

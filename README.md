@@ -177,8 +177,9 @@ CLI tools:
 - `askane check [--json] <file_or_dir>` — syntax/compile check without execution
 - `askane fmt [--check] <file.ask>` — format Askane source code
 - `askane permissions <file.ask>` — inspect capabilities imported by a script
-- `askane init [dir]` — create a starter Askane project (`askane.toml`, `main.ask`, `tests/basic_test.ask`)
-- `askane test <file_or_dir>` — run `.ask` test files in isolated VMs
+- `askane init [dir]`: create a starter Askane project (`askane.toml`, `main.ask`, `tests/basic_test.ask`)
+- `askane setup [--status|--all|--uninstall]`: add Askane to User PATH and register `.ask` file associations (Windows)
+- `askane test <file_or_dir>`: run `.ask` test files in isolated VMs
 
 ## Security model
 

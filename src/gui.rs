@@ -73,6 +73,10 @@ mod win32_gui {
     const ID_CHK_DARK: usize = 111;
     const ID_EDIT_IN: usize = 112;
     const ID_BTN_SEND: usize = 113;
+    const ID_BTN_SETUP: usize = 114;
+    const MB_YESNO: u32 = 0x0000_0004;
+    const MB_ICONQUESTION: u32 = 0x0000_0020;
+    const IDYES: i32 = 6;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_CTLCOLOREDIT: u32 = 0x0133;
     const WM_CTLCOLORSTATIC: u32 = 0x0138;
@@ -239,6 +243,8 @@ mod win32_gui {
         fn GetWindowTextW(hwnd: Hwnd, lpString: *mut u16, nMaxCount: i32) -> i32;
         fn SetWindowTextW(hwnd: Hwnd, lpString: *const u16) -> i32;
         fn LoadCursorW(hInstance: Hinstance, lpCursorName: *const u16) -> *mut c_void;
+        fn LoadIconW(hInstance: Hinstance, lpIconName: *const u16) -> *mut c_void;
+        fn MessageBoxW(hwnd: Hwnd, lpText: *const u16, lpCaption: *const u16, uType: u32) -> i32;
         fn GetWindowLongPtrW(hwnd: Hwnd, nIndex: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: Hwnd, nIndex: i32, dwNewLong: isize) -> isize;
         fn GetKeyState(nVirtKey: i32) -> i16;
@@ -867,6 +873,56 @@ mod win32_gui {
                             append_out(state.hwnd_out, "\n[Stopped by user]\n");
                         }
                         ID_BTN_CLEAR => set_text(state.hwnd_out, ""),
+                        ID_BTN_SETUP => {
+                            let msg_w = to_wide(
+                                "Add Askane directory to User PATH and register .ask files (double-click Run, Edit in Studio, Open With)?",
+                            );
+                            let cap_w = to_wide("Askane Windows Integration");
+                            let choice = unsafe {
+                                MessageBoxW(
+                                    hwnd,
+                                    msg_w.as_ptr(),
+                                    cap_w.as_ptr(),
+                                    MB_YESNO | MB_ICONQUESTION,
+                                )
+                            };
+                            if choice == IDYES {
+                                match std::env::current_exe().map_err(|e| e.to_string()).and_then(
+                                    |raw| {
+                                        let exe = std::fs::canonicalize(&raw)
+                                            .map(|p| {
+                                                let s = p.to_string_lossy();
+                                                if let Some(st) = s.strip_prefix("\\\\?\\") {
+                                                    PathBuf::from(st)
+                                                } else {
+                                                    p
+                                                }
+                                            })
+                                            .unwrap_or(raw);
+                                        let added = crate::setup::win32_setup::install_path(&exe)?;
+                                        crate::setup::win32_setup::install_assoc(&exe)?;
+                                        Ok((exe, added))
+                                    },
+                                ) {
+                                    Ok((exe, added)) => {
+                                        append_out(
+                                            state.hwnd_out,
+                                            &format!(
+                                                "[Setup OK] Exe: {}\n[Setup OK] User PATH: {}\n[Setup OK] .ask file association registered (Run + Edit in Studio + Open With).\n",
+                                                exe.display(),
+                                                if added { "added" } else { "already present" }
+                                            ),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        append_out(
+                                            state.hwnd_out,
+                                            &format!("[Setup Failed] {}\n", e),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         ID_BTN_SEND => {
                             let line = get_text(state.hwnd_in).replace(['\r', '\n'], "");
                             set_text(state.hwnd_in, "");
@@ -978,6 +1034,7 @@ mod win32_gui {
         let h_inst = unsafe { GetModuleHandleW(null()) };
         let class_name = to_wide("AskaneStudioWindow");
         let title = to_wide(&format!("Askane Studio v{}", crate::VERSION));
+        let app_icon = unsafe { LoadIconW(h_inst, 1usize as *const u16) };
         let wc = WndClassExW {
             cb_size: std::mem::size_of::<WndClassExW>() as u32,
             style: 0,
@@ -985,12 +1042,12 @@ mod win32_gui {
             cb_cls_extra: 0,
             cb_wnd_extra: 0,
             h_instance: h_inst,
-            h_icon: null_mut(),
+            h_icon: app_icon,
             h_cursor: unsafe { LoadCursorW(null_mut(), 32512usize as *const u16) },
             hbr_background: (COLOR_WINDOW + 1) as Hbrush,
             lpsz_menu_name: null(),
             lpsz_class_name: class_name.as_ptr(),
-            h_icon_sm: null_mut(),
+            h_icon_sm: app_icon,
         };
         if unsafe { RegisterClassExW(&wc) } == 0 {
             return Err("Failed to register GUI window class".to_string());
@@ -1088,6 +1145,7 @@ mod win32_gui {
         mk_btn("Clear", 310, 56, ID_BTN_CLEAR, BS_PUSHBUTTON);
         mk_btn("Dark", 370, 56, ID_CHK_DARK, BS_AUTOCHECKBOX);
         let hwnd_chk_unsafe = mk_btn("Unsafe", 430, 68, ID_CHK_UNSAFE, BS_AUTOCHECKBOX);
+        mk_btn("Setup", 502, 58, ID_BTN_SETUP, BS_PUSHBUTTON);
 
         let flags_hint = to_wide("");
         let hwnd_flags = unsafe {
@@ -1096,9 +1154,9 @@ mod win32_gui {
                 edit_cls.as_ptr(),
                 flags_hint.as_ptr(),
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                504,
+                566,
                 10,
-                312,
+                250,
                 24,
                 hwnd,
                 ID_EDIT_FLAGS as Hmenu,
