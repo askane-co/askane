@@ -1,7 +1,10 @@
 <div align="center">
   <img src="docs/banner.jpg" alt="Askane - Bytecode Scripting Language in Zero-Crate Rust" width="100%" />
 
-  <h1>Askane (v0.16.0 Open Beta)</h1>
+  <h1>
+    <img src="docs/logo.png" alt="Askane Logo" width="38" height="38" align="absmiddle" />
+    &nbsp;Askane (v0.16.1 Open Beta)
+  </h1>
 
   <p>
     An experimental, bytecode-compiled scripting language written in Rust with <strong>zero external crate dependencies</strong>.

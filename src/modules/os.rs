@@ -88,7 +88,8 @@ fn os_cwd(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("os.cwd() expects 0 arguments".to_string());
     }
     if vm.is_sandboxed() {
-        return Ok(Value::Str(vm.sandbox_root().display().to_string()));
+        vm.resolve_read_path(".")?;
+        return Ok(Value::Str(".".to_string()));
     }
     let cur = env::current_dir().map_err(|e| format!("os.cwd(): {}", e))?;
     Ok(Value::Str(cur.display().to_string()))

@@ -1,0 +1,216 @@
+// Pure Askane 0.16.1 procedural logo generator (writes PNG + SVG without any external tools)
+import fs;
+import math;
+import bytes;
+import binary;
+import compress;
+
+fn clamp01(x) {
+    if x < 0.0 { return 0.0; }
+    if x > 1.0 { return 1.0; }
+    x
+}
+
+fn smoothstep(edge0, edge1, x) {
+    let t = clamp01((x - edge0) / (edge1 - edge0));
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn sd_round_box(px, py, bx, by, r) {
+    let ax = math.abs(px) - bx + r;
+    let ay = math.abs(py) - by + r;
+    let ox = if ax > 0.0 { ax } else { 0.0 };
+    let oy = if ay > 0.0 { ay } else { 0.0 };
+    let mx = if ax > ay { ax } else { ay };
+    let ins = if mx < 0.0 { mx } else { 0.0 };
+    math.sqrt(ox * ox + oy * oy) + ins - r
+}
+
+// Pointy-top regular hexagon SDF (circumradius r)
+fn sd_hexagon(px, py, r) {
+    let kx = -0.866025404;
+    let ky = 0.5;
+    let kz = 0.577350269;
+    let x = math.abs(px);
+    let y = math.abs(py);
+    let dot = kx * x + ky * y;
+    if dot < 0.0 {
+        x = x - 2.0 * dot * kx;
+        y = y - 2.0 * dot * ky;
+    }
+    let lim = kz * r;
+    let cx = if x < -lim { -lim } else if x > lim { lim } else { x };
+    let dx = x - cx;
+    let dy = y - r * 0.866025404;
+    let dist = math.sqrt(dx * dx + dy * dy);
+    if dy < 0.0 { -dist } else { dist }
+}
+
+fn sd_segment(px, py, ax, ay, bx, by) {
+    let pax = px - ax;
+    let pay = py - ay;
+    let bax = bx - ax;
+    let bay = by - ay;
+    let denom = bax * bax + bay * bay;
+    let h = clamp01((pax * bax + pay * bay) / denom);
+    let dx = pax - bax * h;
+    let dy = pay - bay * h;
+    math.sqrt(dx * dx + dy * dy)
+}
+
+fn mix(a, b, t) {
+    a + (b - a) * t
+}
+
+fn png_chunk(tag, body) {
+    let len_b = binary.write_u32_be(len(body));
+    let crc_input = bytes.from_str(tag) + body;
+    let crc_b = binary.write_u32_be(compress.crc32(crc_input));
+    len_b + crc_input + crc_b
+}
+
+fn build_svg(size) {
+    let c = size / 2;
+    let dx = 82;
+    let dy = 142;
+    "<svg width=\"512\" height=\"512\" viewBox=\"0 0 512 512\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n" +
+    "  <defs>\n" +
+    "    <radialGradient id=\"bg\" cx=\"50%\" cy=\"42%\" r=\"68%\">\n" +
+    "      <stop offset=\"0%\" stop-color=\"#192234\"/>\n" +
+    "      <stop offset=\"100%\" stop-color=\"#0C1018\"/>\n" +
+    "    </radialGradient>\n" +
+    "    <linearGradient id=\"hexGrad\" x1=\"110\" y1=\"110\" x2=\"402\" y2=\"402\" gradientUnits=\"userSpaceOnUse\">\n" +
+    "      <stop offset=\"0%\" stop-color=\"#4F8FF7\"/>\n" +
+    "      <stop offset=\"52%\" stop-color=\"#27C5A8\"/>\n" +
+    "      <stop offset=\"100%\" stop-color=\"#3FB950\"/>\n" +
+    "    </linearGradient>\n" +
+    "  </defs>\n" +
+    "  <rect x=\"16\" y=\"16\" width=\"480\" height=\"480\" rx=\"108\" fill=\"url(#bg)\" stroke=\"#2D3C58\" stroke-width=\"4\"/>\n" +
+    "  <polygon points=\"${c - 164},${c} ${c - dx},${c - dy} ${c + dx},${c - dy} ${c + 164},${c} ${c + dx},${c + dy} ${c - dx},${c + dy}\" stroke=\"url(#hexGrad)\" stroke-width=\"22\" stroke-linejoin=\"round\" fill=\"#111827\" fill-opacity=\"0.55\"/>\n" +
+    "  <line x1=\"198\" y1=\"194\" x2=\"198\" y2=\"318\" stroke=\"#F3F7FC\" stroke-width=\"26\" stroke-linecap=\"round\"/>\n" +
+    "  <polyline points=\"248,198 326,256 248,314\" stroke=\"#F3F7FC\" stroke-width=\"26\" stroke-linecap=\"round\" stroke-linejoin=\"round\" fill=\"none\"/>\n" +
+    "</svg>\n"
+}
+
+fn shade_pixel(px, py) {
+    let d_bg = sd_round_box(px, py, 240.0, 240.0, 108.0);
+    let bg_alpha = 1.0 - smoothstep(-1.2, 1.2, d_bg);
+    if bg_alpha <= 0.001 {
+        return [0, 0, 0, 0];
+    }
+
+    let rad = clamp01(math.sqrt(px * px + (py + 20.0) * (py + 20.0)) / 320.0);
+    let cr = mix(26.0, 11.0, rad);
+    let cg = mix(35.0, 16.0, rad);
+    let cb = mix(54.0, 24.0, rad);
+
+    let d_border = math.abs(d_bg + 2.0) - 2.0;
+    let border_m = 1.0 - smoothstep(-1.0, 1.2, d_border);
+    cr = mix(cr, 56.0, border_m * 0.9);
+    cg = mix(cg, 78.0, border_m * 0.9);
+    cb = mix(cb, 118.0, border_m * 0.9);
+
+    let d_hex = sd_hexagon(px, py, 164.0);
+    let d_ring = math.abs(d_hex) - 11.0;
+    let grad_t = clamp01((px + py + 240.0) / 480.0);
+    let hr = mix(79.0, 63.0, grad_t);
+    let hg = mix(143.0, 185.0, grad_t);
+    let hb = mix(247.0, 80.0, grad_t);
+
+    if d_ring > 0.0 && d_ring < 64.0 {
+        let g_t = 1.0 - d_ring / 64.0;
+        let glow = g_t * g_t * g_t * 0.42;
+        cr = mix(cr, hr, glow);
+        cg = mix(cg, hg, glow);
+        cb = mix(cb, hb, glow);
+    }
+
+    let hex_m = 1.0 - smoothstep(-1.1, 1.1, d_ring);
+    cr = mix(cr, hr, hex_m);
+    cg = mix(cg, hg, hex_m);
+    cb = mix(cb, hb, hex_m);
+
+    let d_bar = sd_segment(px, py, -58.0, -62.0, -58.0, 62.0) - 13.0;
+    let d_top = sd_segment(px, py, -8.0, -58.0, 70.0, 0.0) - 13.0;
+    let d_bot = sd_segment(px, py, 70.0, 0.0, -8.0, 58.0) - 13.0;
+    let d_pipe = d_bar;
+    if d_top < d_pipe { d_pipe = d_top; }
+    if d_bot < d_pipe { d_pipe = d_bot; }
+
+    if d_pipe > 0.0 && d_pipe < 28.0 {
+        let p_t = 1.0 - d_pipe / 28.0;
+        let pglow = p_t * p_t * 0.28;
+        cr = mix(cr, 200.0, pglow);
+        cg = mix(cg, 230.0, pglow);
+        cb = mix(cb, 255.0, pglow);
+    }
+
+    let pipe_m = 1.0 - smoothstep(-1.1, 1.1, d_pipe);
+    cr = mix(cr, 244.0, pipe_m);
+    cg = mix(cg, 248.0, pipe_m);
+    cb = mix(cb, 253.0, pipe_m);
+
+    [
+        int(math.clamp(cr, 0.0, 255.0)),
+        int(math.clamp(cg, 0.0, 255.0)),
+        int(math.clamp(cb, 0.0, 255.0)),
+        int(math.clamp(bg_alpha * 255.0, 0.0, 255.0)),
+    ]
+}
+
+fn concat_bytes_list(list) {
+    let acc = list[0];
+    let k = 1;
+    while k < len(list) {
+        acc = acc + list[k];
+        k += 1;
+    }
+    acc
+}
+
+fn render_png(size, out_path) {
+    let half = float(size) * 0.5;
+    let chunks = [];
+    let row_group = [];
+    let y = 0;
+    while y < size {
+        let row = [0];
+        let py = float(y) + 0.5 - half;
+        let x = 0;
+        while x < size {
+            let px = float(x) + 0.5 - half;
+            let rgba = shade_pixel(px, py);
+            push(row, rgba[0]);
+            push(row, rgba[1]);
+            push(row, rgba[2]);
+            push(row, rgba[3]);
+            x += 1;
+        }
+        push(row_group, bytes.from_list(row));
+        if len(row_group) >= 16 {
+            push(chunks, concat_bytes_list(row_group));
+            row_group = [];
+        }
+        y += 1;
+    }
+
+    if len(row_group) > 0 {
+        push(chunks, concat_bytes_list(row_group));
+    }
+
+    let raw = concat_bytes_list(chunks);
+
+    let sig = b"\x89PNG\r\n\x1a\n";
+    let ihdr_body = binary.write_u32_be(size) + binary.write_u32_be(size) + b"\x08\x06\x00\x00\x00";
+    let ihdr = png_chunk("IHDR", ihdr_body);
+    let idat = png_chunk("IDAT", compress.zlib_compress(raw));
+    let iend = png_chunk("IEND", b"");
+    fs.write_bytes(out_path, sig + ihdr + idat + iend);
+}
+
+if is_main() {
+    let sz = 512;
+    fs.write("../docs/logo.svg", build_svg(sz));
+    render_png(sz, "../docs/logo.png");
+    println("Generated docs/logo.svg and docs/logo.png cleanly using Askane 0.16.1");
+}

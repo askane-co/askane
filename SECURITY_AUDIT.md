@@ -145,3 +145,20 @@ locals после ошибки, instruction budget, блокировки private
    - `Op::ForPrep`/`Op::ForIter` делают снимок при итерации по `set` и проверяют актуальную длину списка на каждой итерации; `verify_proto_depth` валидирует `Constant::Struct`, `kw_lists`, `JumpIfArgPresent`, `ForPrep`/`ForIter`; `askane fmt` проверяет синтаксис через `Lexer` и `Parser` до и после форматирования.
    - `cargo test --locked` после правок 0.15.0: 41/41 passed.
 
+## Исправления безопасности и стабильности (0.16.1)
+
+1. **Песочница, раскрутка стека и лимиты VM (`vm.rs`, `compiler.rs`, `bytecode.rs`, `value.rs`, `lexer.rs`, `parser.rs`):**
+   - `attenuate_permissions`: пустые списки `[]` для `read`, `write`, `net`, `env`, `exec` теперь задают полный запрет (`None` и ограничение корней `restrict_*_to_explicit_roots = true`) вместо wildcard `Some(vec![])`; раздельное отслеживание `restrict_read_to_explicit_roots` и `restrict_write_to_explicit_roots` и запрет эскалации через `read: true` / `write: true` после сужения;
+   - `unwind_cleanups_scope`: при выбросе ошибки из `defer` или `with.close()` раскрутка останавливается на `active_try_cleanup_len` текущего фрейма, поэтому внешние `CleanupKind::Sandbox` и `defer` выше границы `try` не снимаются до перехода на `catch_ip`, а ошибки от `defer` выше `try.cleanup_len` не перехватываются внутренним `catch`;
+   - `Value::equals_depth` / `equals_vm`: коиндуктивный `visiting` + мемоизация без предковой зависимости, общий бюджет работы и периодическая проверка `charge_work` / таймаута защищают от экспоненциального взрыва на DAG;
+   - тегированные шаблоны `log"..."` / `sql"..."` больше не падают при наличии локального `import log` / `import sql`, корректно вызывая встроенный обработчик когда биндинг указывает на `Value::Module`;
+   - учёт аллокаций/работы добавлен в `SetIndex`, `SetAttr`, `ForPrep` (`str`/`set`), `str()`, `keys()`, `values()`, `entries()`, `sort()`, `reverse()`, `set()`, `chars()`, `bytes.to_list()`, `to_utf8()`; синхронизируется `frame.ip` перед вызовами конструкторов/замыканий; в парсере/лексере/верификаторе байткода исправлены проверка `verify_proto` (`depth == 0 && upvalue_count != 0`, `is_variadic && arity == 0`, `param_names`), обход плейсхолдера `_`, `looks_like_control_block`, точный парсинг суффиксов длительности и hex `\xHH` в байтовых строках.
+2. **Стандартная библиотека и модули (`html.rs`, `xml.rs`, `collections.rs`, `binary.rs`, `diff.rs`, `pprint.rs`, `toml.rs`, `ui.rs`, `gfx.rs`, `input.rs`, `archive.rs`, `compress.rs`, `fs.rs`, `os.rs`, `log.rs`, `cli.rs`, `strings.rs`, `regex.rs`, `random.rs`, `hex.rs`):**
+   - устранены бесконечный цикл в `html.parse` / `xml.parse` при незакрытом `<` и циклические/глубокие рекурсии без таймаута и учёта аллокаций;
+   - устранены паники/OOM и целочисленные переполнения в `ui.slider` (`min > max`), `ui.inject_resize` / `WM_SIZE` (ограничение до 4096 + `charge_alloc`), `binary.pack/unpack`, `collections.window` / `PriorityQueue` (`try_borrow` и `checked_add`), `diff`, `pprint`, `toml.parse/stringify`, `compress` (`inflate_zlib`, `inflate_raw`, `gzip_decompress`), `strings.slice`, `regex`, `random.shuffle`, `cli.parse` и `hex.decode`;
+   - усилена проверка архивов в `archive.extract()` / `create()` (запрет `:`, симлинков и исполняемых расширений через `check_safe_write_target`), скрытие реального пути в `os.cwd()` при песочнице и расширенное редактирование секретов в `log`.
+3. **CLI, манифесты и инструменты (`main.rs`):**
+   - при `!perms.allow_all` лимиты из `askane.toml` (`max_steps`, `max_mem_mb`, `timeout_ms`) ограничиваются сверху значениями `Permissions::sandboxed()`; пути манифеста и `askane.toml` проверяются на симлинки и выход за `canon_root`;
+   - `askane check` компилирует блоки `spec`; `askane permissions` рекурсивно учитывает `needs` и приоритет `pkg/mod.ask` перед `pkg.ask`; `askane fmt` и REPL сохраняют `b"..."` и многострочные строковые литералы.
+   - `cargo test --locked`: 52/52 passed.
+

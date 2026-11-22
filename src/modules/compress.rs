@@ -262,10 +262,17 @@ pub(crate) fn inflate_raw(
     mut vm: Option<&mut VM>,
 ) -> Result<Vec<u8>, String> {
     let mut reader = BitReader::new(input);
-    let mut out = Vec::with_capacity(input.len().min(64 * 1024));
+    let mut out = Vec::with_capacity(input.len().min(max_output).min(64 * 1024));
     let mut steps = 0usize;
 
     loop {
+        steps += 1;
+        if (steps & 255) == 0 {
+            if let Some(ref mut v) = vm {
+                v.check_timeout()?;
+                v.charge_work(64)?;
+            }
+        }
         let bfinal = reader.read_bits(1)?;
         let btype = reader.read_bits(2)?;
         match btype {
@@ -297,6 +304,7 @@ pub(crate) fn inflate_raw(
                     steps += 1;
                     if (steps & 4095) == 0 {
                         if let Some(ref mut v) = vm {
+                            v.check_timeout()?;
                             v.charge_work(256)?;
                         }
                     }
@@ -338,12 +346,13 @@ pub(crate) fn inflate_raw(
                                 max_output
                             ));
                         }
+                        if let Some(ref mut v) = vm {
+                            v.charge_alloc(length)?;
+                            v.charge_work((length / 64).max(1) as u64)?;
+                        }
                         for _ in 0..length {
                             let b = out[out.len() - dist];
                             out.push(b);
-                        }
-                        if let Some(ref mut v) = vm {
-                            v.charge_alloc(length)?;
                         }
                     }
                 }
@@ -373,13 +382,12 @@ pub(crate) fn inflate_zlib(
     if (((cmf as u16) << 8) | flg as u16) % 31 != 0 {
         return Err("Invalid zlib header check bits".to_string());
     }
-    let has_fdict = (flg & 0x20) != 0;
-    let data_start = if has_fdict { 6 } else { 2 };
-    if input.len() < data_start + 4 {
-        return Err("zlib stream truncated".to_string());
+    if (flg & 0x20) != 0 {
+        return Err("Unsupported zlib preset dictionary (FDICT)".to_string());
     }
-    let out = inflate_raw(&input[data_start..], max_output, vm)?;
-    let expected = u32::from_be_bytes(input[input.len() - 4..].try_into().unwrap());
+    let data_end = input.len() - 4;
+    let out = inflate_raw(&input[2..data_end], max_output, vm)?;
+    let expected = u32::from_be_bytes(input[data_end..].try_into().unwrap());
     let actual = adler32_bytes(&out);
     if expected != actual {
         return Err("zlib Adler-32 checksum mismatch".to_string());
@@ -535,6 +543,7 @@ fn mod_deflate(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("compress.deflate() expects 1 argument (bytes/str)".to_string());
     }
     let raw = args[0].as_bytes_cow("compress.deflate")?;
+    vm.charge_work((raw.len() as u64) / 8 + 1)?;
     let out = deflate_raw(&raw);
     vm.charge_alloc(out.len())?;
     Ok(Value::Bytes(Rc::new(out)))
@@ -545,7 +554,7 @@ fn mod_inflate(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("compress.inflate() expects (bytes, max_size?)".to_string());
     }
     let max_out = max_out_arg(vm, args, 1)?;
-    let raw = args[0].as_bytes_cow("compress.inflate")?.into_owned();
+    let raw = args[0].as_bytes_cow("compress.inflate")?;
     let out = inflate_raw(&raw, max_out, Some(vm))?;
     Ok(Value::Bytes(Rc::new(out)))
 }
@@ -555,6 +564,7 @@ fn mod_zlib_compress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("compress.zlib_compress() expects 1 argument".to_string());
     }
     let raw = args[0].as_bytes_cow("compress.zlib_compress")?;
+    vm.charge_work((raw.len() as u64) / 8 + 1)?;
     let body = deflate_raw(&raw);
     let adler = adler32_bytes(&raw);
     let mut out = Vec::with_capacity(body.len() + 6);
@@ -571,9 +581,7 @@ fn mod_zlib_decompress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("compress.zlib_decompress() expects (bytes, max_size?)".to_string());
     }
     let max_out = max_out_arg(vm, args, 1)?;
-    let raw = args[0]
-        .as_bytes_cow("compress.zlib_decompress")?
-        .into_owned();
+    let raw = args[0].as_bytes_cow("compress.zlib_decompress")?;
     let out = inflate_zlib(&raw, max_out, Some(vm))?;
     Ok(Value::Bytes(Rc::new(out)))
 }
@@ -583,6 +591,7 @@ fn mod_gzip_compress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("compress.gzip_compress() expects 1 argument".to_string());
     }
     let raw = args[0].as_bytes_cow("compress.gzip_compress")?;
+    vm.charge_work((raw.len() as u64) / 8 + 1)?;
     let body = deflate_raw(&raw);
     let crc = crc32_bytes(&raw);
     let isize_val = (raw.len() as u32).to_le_bytes();
@@ -600,9 +609,7 @@ fn mod_gzip_decompress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("compress.gzip_decompress() expects (bytes, max_size?)".to_string());
     }
     let max_out = max_out_arg(vm, args, 1)?;
-    let raw = args[0]
-        .as_bytes_cow("compress.gzip_decompress")?
-        .into_owned();
+    let raw = args[0].as_bytes_cow("compress.gzip_decompress")?;
     if raw.len() < 18 || raw[0] != 0x1F || raw[1] != 0x8B || raw[2] != 8 {
         return Err("Invalid gzip header".to_string());
     }
@@ -613,18 +620,25 @@ fn mod_gzip_decompress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             return Err("Truncated gzip extra header".to_string());
         }
         let xlen = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
-        pos += 2 + xlen;
+        pos = pos
+            .checked_add(2 + xlen)
+            .ok_or_else(|| "Corrupt gzip extra header".to_string())?;
     }
     for flag in [0x08u8, 0x10u8] {
         if (flg & flag) != 0 {
             while pos < raw.len() && raw[pos] != 0 {
                 pos += 1;
             }
+            if pos >= raw.len() {
+                return Err("Truncated gzip string header".to_string());
+            }
             pos += 1;
         }
     }
     if (flg & 0x02) != 0 {
-        pos += 2;
+        pos = pos
+            .checked_add(2)
+            .ok_or_else(|| "Truncated gzip CRC16 header".to_string())?;
     }
     if pos + 8 > raw.len() {
         return Err("Truncated gzip stream".to_string());
@@ -638,18 +652,20 @@ fn mod_gzip_decompress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Bytes(Rc::new(out)))
 }
 
-fn mod_crc32(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn mod_crc32(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("compress.crc32() expects 1 argument".to_string());
     }
     let raw = args[0].as_bytes_cow("compress.crc32")?;
+    vm.charge_work((raw.len() as u64) / 32 + 1)?;
     Ok(Value::Int(crc32_bytes(&raw) as i64))
 }
 
-fn mod_adler32(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn mod_adler32(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("compress.adler32() expects 1 argument".to_string());
     }
     let raw = args[0].as_bytes_cow("compress.adler32")?;
+    vm.charge_work((raw.len() as u64) / 32 + 1)?;
     Ok(Value::Int(adler32_bytes(&raw) as i64))
 }

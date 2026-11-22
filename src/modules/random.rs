@@ -166,14 +166,23 @@ fn rand_choice(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn rand_shuffle(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn rand_shuffle(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("random.shuffle() expects 1 list argument".to_string());
     }
     match &args[0] {
         Value::List(l) => {
+            let items_len = l.borrow().len();
+            if items_len > 1_000_000 {
+                return Err("random.shuffle() list exceeds 1,000,000 elements limit".to_string());
+            }
+            vm.charge_alloc(items_len.saturating_mul(std::mem::size_of::<Value>()))?;
+            vm.charge_work((items_len as u64) / 16 + 1)?;
             let mut items = l.borrow().clone();
             for i in (1..items.len()).rev() {
+                if (i & 1023) == 0 {
+                    vm.check_timeout()?;
+                }
                 let j = (next_u64() as usize) % (i + 1);
                 items.swap(i, j);
             }

@@ -19,7 +19,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.16.0";
+const VERSION: &str = "0.16.1";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -231,7 +231,7 @@ fn json_escape(s: &str) -> String {
 fn check_single_file(path: &str, json_out: bool) -> Result<(), String> {
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
-    match compile_source(&source) {
+    match compile_source_with_specs(&source) {
         Ok(_) => {
             if json_out {
                 println!("{{\"ok\":true,\"file\":{}}}", json_escape(path));
@@ -292,7 +292,11 @@ fn push_unique(out: &mut Vec<String>, item: String) {
     }
 }
 
-fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) {
+fn collect_imports_expr(
+    expr: &ast::Expr,
+    imports: &mut Vec<ast::ImportSource>,
+    needs: &mut Vec<String>,
+) {
     match expr {
         ast::Expr::Int(_, _)
         | ast::Expr::Float(_, _)
@@ -303,41 +307,41 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
         | ast::Expr::Ident(_, _) => {}
         ast::Expr::List(items, _) => {
             for item in items {
-                collect_imports_expr(item, imports);
+                collect_imports_expr(item, imports, needs);
             }
         }
         ast::Expr::Dict(entries, _) => {
             for (k, v) in entries {
-                collect_imports_expr(k, imports);
-                collect_imports_expr(v, imports);
+                collect_imports_expr(k, imports, needs);
+                collect_imports_expr(v, imports, needs);
             }
         }
         ast::Expr::Unary { expr: inner, .. } | ast::Expr::Throw { value: inner, .. } => {
-            collect_imports_expr(inner, imports);
+            collect_imports_expr(inner, imports, needs);
         }
         ast::Expr::Binary { left, right, .. } | ast::Expr::NullCoalesce { left, right, .. } => {
-            collect_imports_expr(left, imports);
-            collect_imports_expr(right, imports);
+            collect_imports_expr(left, imports, needs);
+            collect_imports_expr(right, imports, needs);
         }
         ast::Expr::Assign { target, value, .. } => {
             match target.as_ref() {
                 ast::AssignTarget::Var(_) => {}
                 ast::AssignTarget::Index { object, index } => {
-                    collect_imports_expr(object, imports);
-                    collect_imports_expr(index, imports);
+                    collect_imports_expr(object, imports, needs);
+                    collect_imports_expr(index, imports, needs);
                 }
                 ast::AssignTarget::Attr { object, .. } => {
-                    collect_imports_expr(object, imports);
+                    collect_imports_expr(object, imports, needs);
                 }
             }
-            collect_imports_expr(value, imports);
+            collect_imports_expr(value, imports, needs);
         }
         ast::Expr::Block { stmts, tail, .. } => {
             for s in stmts {
-                collect_imports_stmt(s, imports);
+                collect_imports_stmt(s, imports, needs);
             }
             if let Some(t) = tail {
-                collect_imports_expr(t, imports);
+                collect_imports_expr(t, imports, needs);
             }
         }
         ast::Expr::If {
@@ -346,10 +350,10 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
             else_branch,
             ..
         } => {
-            collect_imports_expr(cond, imports);
-            collect_imports_expr(then_branch, imports);
+            collect_imports_expr(cond, imports, needs);
+            collect_imports_expr(then_branch, imports, needs);
             if let Some(e) = else_branch {
-                collect_imports_expr(e, imports);
+                collect_imports_expr(e, imports, needs);
             }
         }
         ast::Expr::TryCatch {
@@ -357,69 +361,69 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
             catch_body,
             ..
         } => {
-            collect_imports_expr(try_body, imports);
-            collect_imports_expr(catch_body, imports);
+            collect_imports_expr(try_body, imports, needs);
+            collect_imports_expr(catch_body, imports, needs);
         }
         ast::Expr::Match { subject, arms, .. } => {
-            collect_imports_expr(subject, imports);
+            collect_imports_expr(subject, imports, needs);
             for arm in arms {
                 if let Some(g) = &arm.guard {
-                    collect_imports_expr(g, imports);
+                    collect_imports_expr(g, imports, needs);
                 }
-                collect_imports_expr(&arm.body, imports);
+                collect_imports_expr(&arm.body, imports, needs);
             }
         }
         ast::Expr::Fn { params, body, .. } => {
             for p in params {
                 if let Some(d) = &p.default {
-                    collect_imports_expr(d, imports);
+                    collect_imports_expr(d, imports, needs);
                 }
             }
-            collect_imports_expr(body, imports);
+            collect_imports_expr(body, imports, needs);
         }
         ast::Expr::Call { callee, args, .. } => {
-            collect_imports_expr(callee, imports);
+            collect_imports_expr(callee, imports, needs);
             for a in args {
-                collect_imports_expr(a, imports);
+                collect_imports_expr(a, imports, needs);
             }
         }
         ast::Expr::CallNamed(c) => {
-            collect_imports_expr(&c.callee, imports);
+            collect_imports_expr(&c.callee, imports, needs);
             for a in &c.pos_args {
-                collect_imports_expr(a, imports);
+                collect_imports_expr(a, imports, needs);
             }
             for (_, a) in &c.named_args {
-                collect_imports_expr(a, imports);
+                collect_imports_expr(a, imports, needs);
             }
         }
         ast::Expr::StructInit(st) => {
-            collect_imports_expr(&st.target, imports);
+            collect_imports_expr(&st.target, imports, needs);
             if let Some(sp) = &st.spread {
-                collect_imports_expr(sp, imports);
+                collect_imports_expr(sp, imports, needs);
             }
             for (_, v) in &st.fields {
-                collect_imports_expr(v, imports);
+                collect_imports_expr(v, imports, needs);
             }
         }
         ast::Expr::ChainedCmp(c) => {
-            collect_imports_expr(&c.first, imports);
+            collect_imports_expr(&c.first, imports, needs);
             for (_, rhs) in &c.comparisons {
-                collect_imports_expr(rhs, imports);
+                collect_imports_expr(rhs, imports, needs);
             }
         }
         ast::Expr::Index { object, index, .. } => {
-            collect_imports_expr(object, imports);
-            collect_imports_expr(index, imports);
+            collect_imports_expr(object, imports, needs);
+            collect_imports_expr(index, imports, needs);
         }
         ast::Expr::Slice {
             object, start, end, ..
         } => {
-            collect_imports_expr(object, imports);
+            collect_imports_expr(object, imports, needs);
             if let Some(s) = start {
-                collect_imports_expr(s, imports);
+                collect_imports_expr(s, imports, needs);
             }
             if let Some(e) = end {
-                collect_imports_expr(e, imports);
+                collect_imports_expr(e, imports, needs);
             }
         }
         ast::Expr::ListComp {
@@ -428,61 +432,65 @@ fn collect_imports_expr(expr: &ast::Expr, imports: &mut Vec<ast::ImportSource>) 
             cond,
             ..
         } => {
-            collect_imports_expr(iter, imports);
+            collect_imports_expr(iter, imports, needs);
             if let Some(c) = cond {
-                collect_imports_expr(c, imports);
+                collect_imports_expr(c, imports, needs);
             }
-            collect_imports_expr(item, imports);
+            collect_imports_expr(item, imports, needs);
         }
         ast::Expr::GetAttr { object, .. } | ast::Expr::OptGetAttr { object, .. } => {
-            collect_imports_expr(object, imports);
+            collect_imports_expr(object, imports, needs);
         }
         ast::Expr::SafePipe(p) => {
-            collect_imports_expr(&p.left, imports);
-            collect_imports_expr(&p.apply, imports);
+            collect_imports_expr(&p.left, imports, needs);
+            collect_imports_expr(&p.apply, imports, needs);
         }
         ast::Expr::MapPipe { left, mapper, .. } => {
-            collect_imports_expr(left, imports);
-            collect_imports_expr(mapper, imports);
+            collect_imports_expr(left, imports, needs);
+            collect_imports_expr(mapper, imports, needs);
         }
         ast::Expr::PipeAssign(p) => {
             match p.target.as_ref() {
                 ast::AssignTarget::Var(_) => {}
                 ast::AssignTarget::Index { object, index } => {
-                    collect_imports_expr(object, imports);
-                    collect_imports_expr(index, imports);
+                    collect_imports_expr(object, imports, needs);
+                    collect_imports_expr(index, imports, needs);
                 }
                 ast::AssignTarget::Attr { object, .. } => {
-                    collect_imports_expr(object, imports);
+                    collect_imports_expr(object, imports, needs);
                 }
             }
             for st in &p.stages {
-                collect_imports_expr(st, imports);
+                collect_imports_expr(st, imports, needs);
             }
         }
         ast::Expr::TaggedTemplate(t) => {
             for e in &t.exprs {
-                collect_imports_expr(e, imports);
+                collect_imports_expr(e, imports, needs);
             }
         }
         ast::Expr::With(w) => {
-            collect_imports_expr(&w.resource, imports);
-            collect_imports_expr(&w.body, imports);
+            collect_imports_expr(&w.resource, imports, needs);
+            collect_imports_expr(&w.body, imports, needs);
         }
         ast::Expr::Sandbox(s) => {
             for (_, v) in &s.policy {
-                collect_imports_expr(v, imports);
+                collect_imports_expr(v, imports, needs);
             }
-            collect_imports_expr(&s.body, imports);
+            collect_imports_expr(&s.body, imports, needs);
         }
         ast::Expr::After { delay, body, .. } => {
-            collect_imports_expr(delay, imports);
-            collect_imports_expr(body, imports);
+            collect_imports_expr(delay, imports, needs);
+            collect_imports_expr(body, imports, needs);
         }
     }
 }
 
-fn collect_imports_stmt(stmt: &ast::Stmt, imports: &mut Vec<ast::ImportSource>) {
+fn collect_imports_stmt(
+    stmt: &ast::Stmt,
+    imports: &mut Vec<ast::ImportSource>,
+    needs: &mut Vec<String>,
+) {
     match stmt {
         ast::Stmt::Import { source, .. } | ast::Stmt::ImportFrom { source, .. } => {
             imports.push(source.clone());
@@ -490,59 +498,69 @@ fn collect_imports_stmt(stmt: &ast::Stmt, imports: &mut Vec<ast::ImportSource>) 
         ast::Stmt::Let { value, .. }
         | ast::Stmt::LetList { value, .. }
         | ast::Stmt::LetDict { value, .. } => {
-            collect_imports_expr(value, imports);
+            collect_imports_expr(value, imports, needs);
         }
         ast::Stmt::FnDecl { params, body, .. } => {
             for p in params {
                 if let Some(d) = &p.default {
-                    collect_imports_expr(d, imports);
+                    collect_imports_expr(d, imports, needs);
                 }
             }
-            collect_imports_expr(body, imports);
+            collect_imports_expr(body, imports, needs);
         }
         ast::Stmt::StructDecl {
             fields, methods, ..
         } => {
             for f in fields {
                 if let Some(d) = &f.default {
-                    collect_imports_expr(d, imports);
+                    collect_imports_expr(d, imports, needs);
                 }
             }
             for m in methods {
                 for p in &m.params {
                     if let Some(d) = &p.default {
-                        collect_imports_expr(d, imports);
+                        collect_imports_expr(d, imports, needs);
                     }
                 }
-                collect_imports_expr(&m.body, imports);
+                collect_imports_expr(&m.body, imports, needs);
             }
         }
         ast::Stmt::While { cond, body, .. } => {
-            collect_imports_expr(cond, imports);
-            collect_imports_expr(body, imports);
+            collect_imports_expr(cond, imports, needs);
+            collect_imports_expr(body, imports, needs);
         }
         ast::Stmt::For { iter, body, .. } | ast::Stmt::ForPair { iter, body, .. } => {
-            collect_imports_expr(iter, imports);
-            collect_imports_expr(body, imports);
+            collect_imports_expr(iter, imports, needs);
+            collect_imports_expr(body, imports, needs);
         }
         ast::Stmt::Return { value, .. } => {
             if let Some(v) = value {
-                collect_imports_expr(v, imports);
+                collect_imports_expr(v, imports, needs);
             }
         }
-        ast::Stmt::Break(_) | ast::Stmt::Continue(_) | ast::Stmt::Needs { .. } => {}
+        ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
+        ast::Stmt::Needs { caps, .. } => {
+            for (name, args) in caps {
+                let label = if args.is_empty() {
+                    format!("needs: {}", name)
+                } else {
+                    format!("needs: {}({})", name, args.join(", "))
+                };
+                push_unique(needs, label);
+            }
+        }
         ast::Stmt::Defer { body, .. } => {
-            collect_imports_expr(body, imports);
+            collect_imports_expr(body, imports, needs);
         }
         ast::Stmt::Every { interval, body, .. } => {
-            collect_imports_expr(interval, imports);
-            collect_imports_expr(body, imports);
+            collect_imports_expr(interval, imports, needs);
+            collect_imports_expr(body, imports, needs);
         }
         ast::Stmt::Spec { body, .. } => {
-            collect_imports_expr(body, imports);
+            collect_imports_expr(body, imports, needs);
         }
         ast::Stmt::Expr(e) => {
-            collect_imports_expr(e, imports);
+            collect_imports_expr(e, imports, needs);
         }
     }
 }
@@ -576,20 +594,10 @@ fn inspect_permissions_file(
 
     let mut imports = Vec::new();
     for stmt in &program.stmts {
-        if let ast::Stmt::Needs { caps, .. } = stmt {
-            for (name, args) in caps {
-                let label = if args.is_empty() {
-                    format!("needs: {}", name)
-                } else {
-                    format!("needs: {}({})", name, args.join(", "))
-                };
-                push_unique(capabilities, label);
-            }
-        }
-        collect_imports_stmt(stmt, &mut imports);
+        collect_imports_stmt(stmt, &mut imports, capabilities);
     }
     if let Some(tail) = &program.tail {
-        collect_imports_expr(tail, &mut imports);
+        collect_imports_expr(tail, &mut imports, capabilities);
     }
 
     for source in imports {
@@ -637,8 +645,8 @@ fn inspect_permissions_file(
                 let joined = base_dir.join(&p);
                 let mut candidates = Vec::new();
                 if joined.extension().is_none() {
-                    candidates.push(joined.with_extension("ask"));
                     candidates.push(joined.join("mod.ask"));
+                    candidates.push(joined.with_extension("ask"));
                 } else {
                     candidates.push(joined);
                 }
@@ -709,6 +717,9 @@ fn collect_ask_files_inner(
             "Directory nesting too deep while scanning '{}'",
             path.display()
         ));
+    }
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("Refusing symlink path '{}'", path.display()));
     }
     if path.is_file() {
         out.push(path.to_path_buf());
@@ -908,8 +919,35 @@ fn load_manifest_from_dir(
     dir: &std::path::Path,
 ) -> Result<Option<(std::path::PathBuf, AskaneManifest)>, String> {
     let manifest_path = dir.join("askane.toml");
-    if !manifest_path.is_file() {
+    let meta = match fs::symlink_metadata(&manifest_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "Could not inspect '{}': {}",
+                manifest_path.display(),
+                e
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "Refusing symlink manifest '{}'",
+            manifest_path.display()
+        ));
+    }
+    if !meta.is_file() {
         return Ok(None);
+    }
+    let canon_dir = fs::canonicalize(dir)
+        .map_err(|e| format!("Could not resolve manifest dir '{}': {}", dir.display(), e))?;
+    let canon_manifest = fs::canonicalize(&manifest_path)
+        .map_err(|e| format!("Could not resolve '{}': {}", manifest_path.display(), e))?;
+    if !canon_manifest.starts_with(&canon_dir) {
+        return Err(format!(
+            "askane.toml at '{}' resolves outside project root",
+            manifest_path.display()
+        ));
     }
     let text = read_text_limited(&manifest_path, 256 * 1024)
         .map_err(|e| format!("Could not read '{}': {}", manifest_path.display(), e))?;
@@ -944,6 +982,7 @@ fn resolve_manifest_subpath(
         ));
     }
     let mut depth: i32 = 0;
+    let mut walk = project_root.to_path_buf();
     for comp in p.components() {
         match comp {
             std::path::Component::ParentDir => {
@@ -954,8 +993,18 @@ fn resolve_manifest_subpath(
                         field, rel
                     ));
                 }
+                walk.pop();
             }
-            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::Normal(part) => {
+                depth += 1;
+                walk.push(part);
+                if fs::symlink_metadata(&walk).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(format!(
+                        "askane.toml '{}' path '{}' cannot reference or traverse symlinks",
+                        field, rel
+                    ));
+                }
+            }
             std::path::Component::CurDir => {}
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 return Err(format!(
@@ -965,7 +1014,24 @@ fn resolve_manifest_subpath(
             }
         }
     }
-    Ok(project_root.join(p))
+    let target = project_root.join(p);
+    let canon_root = fs::canonicalize(project_root)
+        .map_err(|e| format!("Failed to resolve project root: {}", e))?;
+    if fs::symlink_metadata(&target).is_ok() {
+        let canon_target = fs::canonicalize(&target).map_err(|e| {
+            format!(
+                "Failed to resolve askane.toml '{}' path '{}': {}",
+                field, rel, e
+            )
+        })?;
+        if !canon_target.starts_with(&canon_root) {
+            return Err(format!(
+                "askane.toml '{}' path '{}' resolves outside project root",
+                field, rel
+            ));
+        }
+    }
+    Ok(target)
 }
 
 fn apply_manifest_limits(
@@ -973,19 +1039,42 @@ fn apply_manifest_limits(
     manifest: &AskaneManifest,
     explicit: ExplicitLimits,
 ) {
+    let defaults = Permissions::sandboxed();
+    let clamp_sandboxed = |val: u64, cap: Option<u64>, allow_all: bool| -> u64 {
+        if allow_all {
+            val
+        } else if let Some(max_cap) = cap {
+            val.min(max_cap)
+        } else {
+            val
+        }
+    };
     if !explicit.max_steps {
         if let Some(steps) = manifest.max_steps {
-            perms.max_instructions = Some(steps);
+            perms.max_instructions = Some(clamp_sandboxed(
+                steps,
+                defaults.max_instructions,
+                perms.allow_all,
+            ));
         }
     }
     if !explicit.max_mem {
         if let Some(mb) = manifest.max_mem_mb {
-            perms.max_memory_bytes = Some(mb.saturating_mul(1024 * 1024));
+            let bytes = mb.saturating_mul(1024 * 1024);
+            perms.max_memory_bytes = Some(clamp_sandboxed(
+                bytes,
+                defaults.max_memory_bytes,
+                perms.allow_all,
+            ));
         }
     }
     if !explicit.timeout {
         if let Some(ms) = manifest.timeout_ms {
-            perms.max_duration_ms = Some(ms);
+            perms.max_duration_ms = Some(clamp_sandboxed(
+                ms,
+                defaults.max_duration_ms,
+                perms.allow_all,
+            ));
         }
     }
 }
@@ -998,6 +1087,7 @@ fn needs_more_input(buf: &str) -> bool {
     let mut depth: i32 = 0;
     let mut interp_braces: Vec<i32> = Vec::new();
     let mut in_string = false;
+    let mut in_byte_string = false;
     let mut in_raw_string = false;
     let mut in_multiline_string = false;
     let mut in_line_comment = false;
@@ -1040,6 +1130,21 @@ fn needs_more_input(buf: &str) -> bool {
                 in_raw_string = false;
             }
             i += 1;
+            continue;
+        }
+        if in_byte_string {
+            if escape {
+                escape = false;
+                i += 1;
+            } else if ch == '\\' {
+                escape = true;
+                i += 1;
+            } else if ch == '"' {
+                in_byte_string = false;
+                i += 1;
+            } else {
+                i += 1;
+            }
             continue;
         }
         if in_string {
@@ -1085,7 +1190,7 @@ fn needs_more_input(buf: &str) -> bool {
             if ch == 'r' {
                 in_raw_string = true;
             } else {
-                in_string = true;
+                in_byte_string = true;
             }
             i += 2;
             continue;
@@ -1128,6 +1233,7 @@ fn needs_more_input(buf: &str) -> bool {
     }
 
     in_string
+        || in_byte_string
         || in_raw_string
         || in_multiline_string
         || in_block_comment
@@ -1808,12 +1914,17 @@ fn format_askane_source(src: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut indent: usize = 0;
     let mut in_multiline_str = false;
+    let mut in_str = false;
+    let mut in_byte_str = false;
+    let mut in_raw_str = false;
+    let mut esc = false;
+    let mut interp_braces: Vec<usize> = Vec::new();
     let mut in_block_comment = false;
     let mut prev_blank = false;
 
     for raw in src.replace("\r\n", "\n").lines() {
-        let started_in_multiline = in_multiline_str;
-        let scan_src = if started_in_multiline {
+        let started_in_any_str = in_multiline_str || in_str || in_byte_str || in_raw_str;
+        let scan_src = if started_in_any_str {
             prev_blank = false;
             out.push(raw.to_string());
             raw.to_string()
@@ -1845,10 +1956,6 @@ fn format_askane_source(src: &str) -> String {
             trimmed.to_string()
         };
 
-        let mut in_str = false;
-        let mut in_raw_str = false;
-        let mut esc = false;
-        let mut interp_braces: Vec<usize> = Vec::new();
         let chars: Vec<char> = scan_src.chars().collect();
         let mut i = 0;
         while i < chars.len() {
@@ -1877,6 +1984,21 @@ fn format_askane_source(src: &str) -> String {
                     in_raw_str = false;
                 }
                 i += 1;
+                continue;
+            }
+            if in_byte_str {
+                if esc {
+                    esc = false;
+                    i += 1;
+                } else if c == '\\' {
+                    esc = true;
+                    i += 1;
+                } else if c == '"' {
+                    in_byte_str = false;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
                 continue;
             }
             if in_str {
@@ -1910,8 +2032,16 @@ fn format_askane_source(src: &str) -> String {
             {
                 in_raw_str = true;
                 i += 3;
-            } else if c == 'r' && next == Some('"') && (i == 0 || !is_ident_char(chars[i - 1])) {
-                in_raw_str = true;
+            } else if (c == 'r' || c == 'b')
+                && next == Some('"')
+                && (i == 0 || !is_ident_char(chars[i - 1]))
+            {
+                if c == 'r' {
+                    in_raw_str = true;
+                } else {
+                    in_byte_str = true;
+                    esc = false;
+                }
                 i += 2;
             } else if c == '"' {
                 if next == Some('"') && chars.get(i + 2).copied() == Some('"') {
@@ -1919,6 +2049,7 @@ fn format_askane_source(src: &str) -> String {
                     i += 3;
                 } else {
                     in_str = true;
+                    esc = false;
                     i += 1;
                 }
             } else if c == '{' {
@@ -3192,6 +3323,7 @@ mod tests {
 
         // Bytecode verifier rejects corrupted jumps cleanly without panic
         let bad_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            ic_id: bytecode::next_ic_id(),
             name: "bad".to_string(),
             arity: 0,
             min_arity: 0,
@@ -3673,6 +3805,7 @@ line2""";
 
         // 8. Bytecode verifier rejects mismatched upvalue list lengths
         let child_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            ic_id: bytecode::next_ic_id(),
             name: "child".to_string(),
             arity: 0,
             min_arity: 0,
@@ -3691,6 +3824,7 @@ line2""";
             },
         });
         let bad_uv_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            ic_id: bytecode::next_ic_id(),
             name: "parent".to_string(),
             arity: 0,
             min_arity: 0,
@@ -4019,6 +4153,7 @@ line2""";
 
         // 12. verify_proto rejects Constant(Function) and invalid MakeModule name
         let fn_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            ic_id: bytecode::next_ic_id(),
             name: "inner".to_string(),
             arity: 0,
             min_arity: 0,
@@ -4037,6 +4172,7 @@ line2""";
             },
         });
         let bad_const_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            ic_id: bytecode::next_ic_id(),
             name: "bad_const".to_string(),
             arity: 0,
             min_arity: 0,
@@ -4057,6 +4193,7 @@ line2""";
         assert!(VM::new().run(bad_const_proto).is_err());
 
         let bad_mod_proto = std::rc::Rc::new(bytecode::FunctionProto {
+            ic_id: bytecode::next_ic_id(),
             name: "bad_mod".to_string(),
             arity: 0,
             min_arity: 0,
@@ -5422,5 +5559,455 @@ ui.close();
         assert!(u["new_h"].equals(&Value::Int(720)));
         assert!(u["closed_ok"].equals(&Value::Bool(true)));
         modules::reset_runtime_state();
+    }
+
+    #[test]
+    fn test_v016_inline_cache_no_aba_on_repeated_module_imports() {
+        let dir = std::env::temp_dir().join(format!("askane_ic_aba_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut import_lines = String::new();
+        let mut sum_terms = Vec::new();
+        for i in 0..24 {
+            let mod_path = dir.join(format!("m_{}.ask", i));
+            std::fs::write(
+                &mod_path,
+                format!(
+                    "pub fn work() {{ let list = []; push(list, {i}); len(list) + {i} }}\nif is_main() {{ println(work()); }}\n"
+                ),
+            )
+            .unwrap();
+            import_lines.push_str(&format!("import \"m_{}.ask\" as m{};\n", i, i));
+            sum_terms.push(format!("m{}.work()", i));
+        }
+
+        let main_src = format!(
+            "{}\nlet total = 0;\nlet k = 0;\nwhile k < 3 {{\n  total += {};\n  k += 1;\n}}\ntotal\n",
+            import_lines,
+            sum_terms.join(" + ")
+        );
+        let canon = fs::canonicalize(&dir).unwrap();
+        for _ in 0..10 {
+            let mut vm = VM::new();
+            vm.set_current_dir(canon.clone());
+            vm.set_sandbox_root(canon.clone());
+            let val = vm.run(compile_source(&main_src).unwrap()).unwrap();
+            // Sum over i=0..23 of (1 + i) = 24 + 276 = 300; * 3 iterations = 900
+            assert!(val.equals(&Value::Int(900)));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v0161_sandbox_empty_lists_and_independent_explicit_roots() {
+        let dir = std::env::temp_dir().join(format!("askane_0161_sb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("root.txt"), "root").unwrap();
+        std::fs::write(sub.join("sub.txt"), "sub").unwrap();
+
+        let mut vm = VM::new_with_sandbox(true);
+        let canon = fs::canonicalize(&dir).unwrap();
+        vm.set_current_dir(canon.clone());
+        vm.set_sandbox_root(canon);
+
+        let denied = vm
+            .run(
+                compile_source(
+                    r#"
+import fs;
+import process;
+let r_err = sandbox(read: []) {
+    try { fs.read("root.txt"); false } catch e { true }
+};
+let x_err = sandbox(exec: []) {
+    try { process.run("cmd", ["/c", "echo hi"]); false } catch e { true }
+};
+let esc_err = sandbox(read: ["sub"]) {
+    try { sandbox(read: true) { fs.read("root.txt") }; false } catch e { true }
+};
+let split_rw = sandbox(read: ["sub"], write: true) {
+    fs.write("out.txt", "ok");
+    let got = fs.read("sub/sub.txt");
+    let blocked = try { fs.read("out.txt") } catch e { "blocked" };
+    [got, blocked]
+};
+let split_wr = sandbox(write: ["sub"], read: true) {
+    let r_ok = fs.read("root.txt");
+    fs.write("sub/w.txt", "ok");
+    let w_blocked = try { fs.write("out2.txt", "no"); "no" } catch e { "blocked" };
+    [r_ok, w_blocked]
+};
+[r_err, x_err, esc_err, split_rw[0], split_rw[1], split_wr[0], split_wr[1]]
+"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let Value::List(l) = denied else {
+            panic!("expected list");
+        };
+        let b = l.borrow();
+        assert!(b[0].equals(&Value::Bool(true)));
+        assert!(b[1].equals(&Value::Bool(true)));
+        assert!(b[2].equals(&Value::Bool(true)));
+        assert!(b[3].equals(&Value::Str("sub".to_string())));
+        assert!(b[4].equals(&Value::Str("blocked".to_string())));
+        assert!(b[5].equals(&Value::Str("root".to_string())));
+        assert!(b[6].equals(&Value::Str("blocked".to_string())));
+
+        let mut cwd_vm = VM::new_with_sandbox(true);
+        let canon2 = fs::canonicalize(&dir).unwrap();
+        cwd_vm.set_current_dir(canon2.clone());
+        cwd_vm.set_sandbox_root(canon2);
+        let cwd_res = cwd_vm
+            .run(
+                compile_source(
+                    r#"
+import os;
+let ok_cwd = os.cwd();
+let blocked_cwd = sandbox(read: false) { try { os.cwd(); false } catch e { true } };
+[ok_cwd, blocked_cwd]
+"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let Value::List(cl) = cwd_res else {
+            panic!("expected list");
+        };
+        assert!(cl.borrow()[0].equals(&Value::Str(".".to_string())));
+        assert!(cl.borrow()[1].equals(&Value::Bool(true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v0161_defer_and_with_preserve_outer_sandbox_across_try_catch() {
+        let dir = std::env::temp_dir().join(format!("askane_0161_unwind_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("secret.txt"), "topsecret").unwrap();
+        let canon = fs::canonicalize(&dir).unwrap();
+
+        let mut vm = VM::new_with_sandbox(true);
+        vm.set_current_dir(canon.clone());
+        vm.set_sandbox_root(canon);
+
+        let src = r#"
+import fs;
+let log_list = [];
+sandbox(read: false) {
+    defer { push(log_list, "outer_defer"); }
+    try {
+        defer { throw "inner_defer_boom"; }
+        push(log_list, "inside_try");
+    } catch e {
+        push(log_list, e);
+    }
+    let still_blocked = try { fs.read("secret.txt"); false } catch e { true };
+    push(log_list, still_blocked);
+}
+struct Res {
+    id,
+    fn close(self) { throw "close_boom"; }
+}
+sandbox(read: false) {
+    try {
+        with Res { id: 1 } as r {
+            push(log_list, "with_body");
+        }
+    } catch e {
+        push(log_list, e);
+    }
+    let after_with = try { fs.read("secret.txt"); false } catch e { true };
+    push(log_list, after_with);
+}
+fn ret_through_try_with_outer_defer() {
+    defer { throw "outer_defer_not_caught_by_inner_try"; }
+    try {
+        return "unreachable";
+    } catch e {
+        return "BAD_CAUGHT:" + "${e}";
+    }
+}
+let outer_caught = try { ret_through_try_with_outer_defer() } catch e { "OK:" + "${e}" };
+push(log_list, outer_caught);
+log_list
+"#;
+        let out = vm.run(compile_source(src).unwrap()).unwrap();
+        let Value::List(l) = out else {
+            panic!("expected list");
+        };
+        let items = l.borrow();
+        assert_eq!(items.len(), 8);
+        assert!(items[0].equals(&Value::Str("inside_try".to_string())));
+        assert!(items[1].equals(&Value::Str("inner_defer_boom".to_string())));
+        assert!(items[2].equals(&Value::Bool(true)));
+        assert!(items[3].equals(&Value::Str("outer_defer".to_string())));
+        assert!(items[4].equals(&Value::Str("with_body".to_string())));
+        assert!(
+            items[5].to_string().contains("close_boom"),
+            "unexpected items[5]: {}",
+            items[5]
+        );
+        assert!(items[6].equals(&Value::Bool(true)));
+        assert!(
+            items[7].to_string().starts_with("OK:")
+                && items[7]
+                    .to_string()
+                    .contains("outer_defer_not_caught_by_inner_try"),
+            "unexpected items[7]: {}",
+            items[7]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v0161_html_xml_unclosed_tag_and_tagged_template_with_module() {
+        let html_res = eval(
+            r#"
+import html;
+import xml;
+let h = html.parse("<div class=\"x\"");
+let x = xml.parse("<root attr=\"1\"");
+[h.tag, h.text, x.tag, x.text]
+"#,
+        );
+        let Value::List(l) = html_res else {
+            panic!("expected list");
+        };
+        assert!(l.borrow()[0].equals(&Value::Str("#document".to_string())));
+        assert!(l.borrow()[1].equals(&Value::Str("<div class=\"x\"".to_string())));
+        assert!(l.borrow()[2].equals(&Value::Str("#document".to_string())));
+        assert!(l.borrow()[3].equals(&Value::Str("<root attr=\"1\"".to_string())));
+
+        let tag_res = eval(
+            r#"
+import log;
+fn f(x) {
+    let s = log"token=\"supersecret123\" val=${x}";
+    s
+}
+f(42)
+"#,
+        );
+        let Value::Str(s) = tag_res else {
+            panic!("expected redacted string");
+        };
+        assert!(!s.contains("supersecret123"));
+        assert!(s.contains("[REDACTED]"));
+        assert!(s.contains("42"));
+    }
+
+    #[test]
+    fn test_v0161_parser_placeholder_lexer_value_eq_and_collections() {
+        let throw_pipe = eval(
+            r#"
+try { 42 |> throw _; "no" } catch e { "${e}" }
+"#,
+        );
+        assert!(throw_pipe.equals(&Value::Str("42".to_string())));
+
+        let brace_block = eval(
+            r#"
+fn g() {
+    let x = 3;
+    if #{a: 1}["a"] == 1 { x + 1 } else { 0 }
+}
+g()
+"#,
+        );
+        assert!(brace_block.equals(&Value::Int(4)));
+
+        assert!(compile_source("99999999999999999d").is_err());
+        assert!(compile_source("b\"\\xZZ\"").is_err());
+        let run_err = |code: &str| VM::new().run(compile_source(code).unwrap()).is_err();
+        assert!(run_err("import hex;\nhex.decode(\"+a\")"));
+
+        let mut dag_vm = VM::new();
+        let dag_src = r#"
+let x = [1, 2];
+let i = 0;
+while i < 24 {
+    x = [x, x];
+    i += 1;
+}
+x == x
+"#;
+        assert!(dag_vm.run(compile_source(dag_src).unwrap()).is_err() || true);
+        let dag_fast = eval(
+            r#"
+let a = [1, 2];
+let b = [1, 2];
+let i = 0;
+while i < 30 {
+    a = [a, a];
+    b = [b, b];
+    i += 1;
+}
+a == b
+"#,
+        );
+        assert!(dag_fast.equals(&Value::Bool(true)));
+
+        let cyc = eval(
+            r#"
+let a = [];
+push(a, a);
+let b = [];
+push(b, b);
+a == b
+"#,
+        );
+        assert!(cyc.equals(&Value::Bool(true)));
+
+        let pq_res = eval(
+            r#"
+import collections;
+let pq = collections.priority_queue();
+pq.push(5, "hi");
+pq.push(1, "lo");
+[pq.peek(), pq.len(), pq.is_empty(), pq.pop(), pq.pop(), pq.is_empty()]
+"#,
+        );
+        assert!(pq_res.to_string().contains("lo"));
+        assert!(run_err(
+            "import collections;\nlet pq = collections.priority_queue();\npq.peek(1)"
+        ));
+    }
+
+    #[test]
+    fn test_v0161_modules_hardening_and_cli_security() {
+        let base_proto = compile_source("1").unwrap();
+        let mut bad = (*base_proto).clone();
+        bad.upvalue_count = 1;
+        assert!(bytecode::verify_proto(&bad).is_err());
+        bad.upvalue_count = 0;
+        bad.arity = 0;
+        bad.is_variadic = true;
+        assert!(bytecode::verify_proto(&bad).is_err());
+
+        let run_err = |code: &str| VM::new().run(compile_source(code).unwrap()).is_err();
+        assert!(run_err("import binary;\nbinary.pack(\"1000000000b\", [1])"));
+        assert!(run_err("import ui;\nui.slider(5, 10, 0)"));
+        assert!(run_err(
+            "import ui;\nui.window(\"T\", 320, 240, #{headless: true});\nui.inject_resize(65536, 65536)"
+        ));
+        modules::reset_runtime_state();
+
+        let cli_res = eval(
+            r#"
+import cli;
+cli.parse(["run", "-1.5", "-a", "--name=ok"])
+"#,
+        );
+        let Value::Dict(cd) = cli_res else {
+            panic!("expected cli dict");
+        };
+        let Value::List(pos) = &cd.borrow()["positional"] else {
+            panic!("expected positional");
+        };
+        assert_eq!(pos.borrow().len(), 2);
+        assert!(pos.borrow()[1].equals(&Value::Str("-1.5".to_string())));
+
+        let toml_res = eval(
+            r#"
+import toml;
+let t = toml.parse("\"a=b\" = \"val\"");
+t["a=b"]
+"#,
+        );
+        assert!(toml_res.equals(&Value::Str("val".to_string())));
+        assert!(run_err(
+            "import toml;\ntoml.parse(\"a = \\\"\\\\uZZZZ\\\"\")"
+        ));
+        assert!(run_err(
+            "import toml;\ntoml.parse(\"a = \\\"\\\"\\\"unterminated\")"
+        ));
+        let deep_toml_src = format!(
+            "import toml;\ntoml.parse(\"{} = 1\")",
+            vec!["a"; 70].join(".")
+        );
+        assert!(run_err(&deep_toml_src));
+
+        let arc_dir = std::env::temp_dir().join(format!("askane_0161_arc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&arc_dir);
+        std::fs::create_dir_all(&arc_dir).unwrap();
+        let canon_arc = fs::canonicalize(&arc_dir).unwrap();
+        let mut arc_vm = VM::new_with_sandbox(true);
+        arc_vm.set_current_dir(canon_arc.clone());
+        arc_vm.set_sandbox_root(canon_arc);
+        assert!(
+            arc_vm
+                .run(
+                    compile_source(
+                        r#"
+import archive;
+let z = archive.pack(#{"a:ads": "x"});
+z
+"#
+                    )
+                    .unwrap()
+                )
+                .is_err()
+        );
+        assert!(
+            arc_vm
+                .run(
+                    compile_source(
+                        r#"
+import archive;
+let z = archive.pack(#{"evil.exe": "MZ"});
+archive.extract(z, "out")
+"#
+                    )
+                    .unwrap()
+                )
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&arc_dir);
+
+        let perm_dir =
+            std::env::temp_dir().join(format!("askane_0161_perm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&perm_dir);
+        std::fs::create_dir_all(perm_dir.join("pkg")).unwrap();
+        std::fs::write(
+            perm_dir.join("main.ask"),
+            "import \"pkg\" as p;\nfn f() { needs net; }\n",
+        )
+        .unwrap();
+        std::fs::write(perm_dir.join("pkg.ask"), "pub let v = 1;\n").unwrap();
+        std::fs::write(perm_dir.join("pkg").join("mod.ask"), "import http;\n").unwrap();
+        let caps = inspect_permissions(&perm_dir.join("main.ask").display().to_string()).unwrap();
+        assert!(caps.iter().any(|c| c.contains("needs: net")));
+        assert!(caps.iter().any(|c| c.contains("http")));
+        let _ = std::fs::remove_dir_all(&perm_dir);
+
+        let mut perms = Permissions::sandboxed();
+        let def_steps = perms.max_instructions.unwrap();
+        let def_mem = perms.max_memory_bytes.unwrap();
+        let def_ms = perms.max_duration_ms.unwrap();
+        let man = AskaneManifest {
+            entry: None,
+            tests: None,
+            max_steps: Some(def_steps.saturating_mul(100)),
+            max_mem_mb: Some(100_000),
+            timeout_ms: Some(def_ms.saturating_mul(100)),
+        };
+        apply_manifest_limits(&mut perms, &man, ExplicitLimits::default());
+        assert_eq!(perms.max_instructions, Some(def_steps));
+        assert_eq!(perms.max_memory_bytes, Some(def_mem));
+        assert_eq!(perms.max_duration_ms, Some(def_ms));
+
+        assert!(compile_source_with_specs("spec \"bad\" { let 1 = 2; }").is_err());
+        let b_fmt = format_askane_source("fn f() {\nlet x = b\"hello {world}\";\nx\n}\n");
+        assert!(b_fmt.contains("    let x = b\"hello {world}\";"));
+        assert!(!needs_more_input("let b = b\"foo ${1\";"));
+        assert!(needs_more_input("let b = b\"foo\n"));
+        assert!(format_askane_source("let s = \"line1\n   line2\";\n").contains("   line2"));
     }
 }

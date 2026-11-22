@@ -1,0 +1,375 @@
+import gfx;
+import sys;
+import math;
+import random;
+
+import "stats.ask" as stats;
+import "ui.ask" as custom_ui;
+
+let W = 800;
+let H = 600;
+let STATS_FILE = "save_stats.json";
+
+fn init_stars() {
+    let list = [];
+    let i = 0;
+    while i < 70 {
+        let layer = if i % 4 == 0 { 2 } else { 1 };
+        push(list, #{
+                x: float(random.int(0, 799)),
+                y: float(random.int(0, 599)),
+                speed: if layer == 2 { 110.0 } else { 48.0 },
+                layer: layer,
+                bright: if layer == 2 { random.int(165, 235) } else { random.int(70, 145) },
+        });
+        i += 1;
+    }
+    list
+}
+
+fn update_stars(stars, dt) {
+    for s in stars {
+        s["y"] = s["y"] + s["speed"] * dt;
+        if s["y"] > float(H) {
+            s["y"] = 0.0;
+            s["x"] = float(random.int(0, 799));
+        }
+    }
+}
+
+fn spawn_asteroid(speed_mul, elapsed) {
+    let radius = random.int(11, 24);
+    let vy = (145.0 + float(random.int(0, 130)) + elapsed * 3.5) * speed_mul;
+    let vx = float(random.int(-55, 55)) * speed_mul;
+    #{
+        x: float(random.int(24, W - 24)),
+        y: -float(radius + 10),
+        vx: vx,
+        vy: vy,
+        r: radius,
+        near_counted: false,
+    }
+}
+
+fn spawn_orb(kind) {
+    #{
+        x: float(random.int(36, W - 36)),
+        y: -14.0,
+        vy: 135.0,
+        r: 9,
+        kind: kind,
+    }
+}
+
+fn spawn_burst(particles, cx, cy, count, r, g, b) {
+    let i = 0;
+    while i < count {
+        let ang = random.float() * 6.28318;
+        let spd = 60.0 + random.float() * 190.0;
+        push(particles, #{
+                x: cx,
+                y: cy,
+                vx: math.cos(ang) * spd,
+                vy: math.sin(ang) * spd,
+                life: 0.45 + random.float() * 0.35,
+                r: r,
+                g: g,
+                b: b,
+        });
+        i += 1;
+    }
+}
+
+fn new_session(diff_idx) {
+    let diff = custom_ui.diff_preset(diff_idx);
+    #{
+        px: float(W / 2),
+        py: float(H - 95),
+        score: 0,
+        orbs: 0,
+        near_misses: 0,
+        combo: 1,
+        max_combo: 1,
+        combo_timer: 0.0,
+        shield_t: 1.5,
+        elapsed: 0.0,
+        spawn_timer: 0.4,
+        orb_timer: 1.8,
+        speed_mul: diff["speed_mul"],
+        spawn_rate: diff["spawn_rate"],
+        diff_name: diff["name"],
+        rocks: [],
+        collectibles: [],
+        particles: [],
+    }
+}
+
+fn move_player(game, dt, mx, my, mouse_down) {
+    let spd = 320.0;
+    let dx = 0.0;
+    let dy = 0.0;
+    if gfx.key_down("LEFT") || gfx.key_down("A") { dx -= 1.0; }
+    if gfx.key_down("RIGHT") || gfx.key_down("D") { dx += 1.0; }
+    if gfx.key_down("UP") || gfx.key_down("W") { dy -= 1.0; }
+    if gfx.key_down("DOWN") || gfx.key_down("S") { dy += 1.0; }
+
+    if mouse_down && my > 44 {
+        let mdx = float(mx) - game["px"];
+        let mdy = float(my) - game["py"];
+        let md = math.sqrt(mdx * mdx + mdy * mdy);
+        if md > 6.0 {
+            dx = mdx / md;
+            dy = mdy / md;
+        }
+    } else if dx != 0.0 && dy != 0.0 {
+        dx *= 0.7071;
+        dy *= 0.7071;
+    }
+
+    game["px"] = math.clamp(game["px"] + dx * spd * dt, 20.0, float(W - 20));
+    game["py"] = math.clamp(game["py"] + dy * spd * dt, 62.0, float(H - 24));
+}
+
+fn update_particles(game, dt) {
+    let next_p = [];
+    for pt in game["particles"] {
+        pt["x"] = pt["x"] + pt["vx"] * dt;
+        pt["y"] = pt["y"] + pt["vy"] * dt;
+        pt["life"] = pt["life"] - dt;
+        if pt["life"] > 0.0 {
+            push(next_p, pt);
+        }
+    }
+    game["particles"] = next_p;
+}
+
+fn update_collectibles(game, dt) {
+    let next_c = [];
+    for cb in game["collectibles"] {
+        cb["y"] = cb["y"] + cb["vy"] * dt;
+        let dist = math.dist(game["px"], game["py"], cb["x"], cb["y"]);
+        if dist <= float(cb["r"] + 15) {
+            if cb["kind"] == "shield" {
+                game["shield_t"] = 4.5;
+                spawn_burst(game["particles"], cb["x"], cb["y"], 14, 85, 220, 255);
+            } else {
+                game["orbs"] = game["orbs"] + 1;
+                game["score"] = game["score"] + 50 * game["combo"];
+                spawn_burst(game["particles"], cb["x"], cb["y"], 12, 245, 189, 65);
+            }
+        } else if cb["y"] < float(H + 20) {
+            push(next_c, cb);
+        }
+    }
+    game["collectibles"] = next_c;
+}
+
+fn update_rocks(game, dt) {
+    let hit_fatal = false;
+    let next_rocks = [];
+    for rk in game["rocks"] {
+        rk["x"] = rk["x"] + rk["vx"] * dt;
+        rk["y"] = rk["y"] + rk["vy"] * dt;
+        let dist = math.dist(game["px"], game["py"], rk["x"], rk["y"]);
+        let hit_r = float(rk["r"] + 11);
+        let near_r = float(rk["r"] + 34);
+
+        if dist <= hit_r {
+            if game["shield_t"] > 0.0 {
+                game["shield_t"] = 0.0;
+                game["score"] = game["score"] + 25;
+                spawn_burst(game["particles"], rk["x"], rk["y"], 18, 85, 220, 255);
+            } else {
+                hit_fatal = true;
+                spawn_burst(game["particles"], game["px"], game["py"], 28, 244, 114, 128);
+            }
+        } else {
+            if !rk["near_counted"] && dist <= near_r {
+                rk["near_counted"] = true;
+                game["near_misses"] = game["near_misses"] + 1;
+                game["combo"] = math.min(5, game["combo"] + 1);
+                if game["combo"] > game["max_combo"] {
+                    game["max_combo"] = game["combo"];
+                }
+                game["combo_timer"] = 3.2;
+                game["score"] = game["score"] + 20 * game["combo"];
+                spawn_burst(game["particles"], game["px"], game["py"], 8, 79, 195, 247);
+            }
+            if rk["y"] < float(H + 40) && rk["x"] > -40.0 && rk["x"] < float(W + 40) {
+                push(next_rocks, rk);
+            }
+        }
+    }
+    game["rocks"] = next_rocks;
+    hit_fatal
+}
+
+fn step_playing(game, dt, mx, my, mouse_down) {
+    game["elapsed"] = game["elapsed"] + dt;
+    if game["shield_t"] > 0.0 {
+        game["shield_t"] = math.max(0.0, game["shield_t"] - dt);
+    }
+    if game["combo_timer"] > 0.0 {
+        game["combo_timer"] = game["combo_timer"] - dt;
+        if game["combo_timer"] <= 0.0 {
+            game["combo"] = 1;
+        }
+    }
+
+    move_player(game, dt, mx, my, mouse_down);
+
+    game["spawn_timer"] = game["spawn_timer"] - dt;
+    if game["spawn_timer"] <= 0.0 {
+        push(game["rocks"], spawn_asteroid(game["speed_mul"], game["elapsed"]));
+        let base_cd = 0.42 - math.min(0.24, game["elapsed"] * 0.004);
+        game["spawn_timer"] = base_cd * game["spawn_rate"];
+    }
+
+    game["orb_timer"] = game["orb_timer"] - dt;
+    if game["orb_timer"] <= 0.0 {
+        let kind = if random.int(1, 6) == 1 { "shield" } else { "core" };
+        push(game["collectibles"], spawn_orb(kind));
+        game["orb_timer"] = 2.0 + random.float() * 1.6;
+    }
+
+    update_particles(game, dt);
+    update_collectibles(game, dt);
+    let fatal = update_rocks(game, dt);
+    game["score"] = game["score"] + int(dt * 25.0);
+    fatal
+}
+
+fn render_gameplay(game, skin_idx, stars, total_t, st) {
+    let skin = custom_ui.skin_palette(skin_idx);
+    gfx.clear(13, 17, 24);
+    custom_ui.draw_stars(stars);
+
+    for pt in game["particles"] {
+        gfx.rect(int(pt["x"]), int(pt["y"]), 3, 3, pt["r"], pt["g"], pt["b"]);
+    }
+    for cb in game["collectibles"] {
+        if cb["kind"] == "shield" {
+            gfx.circle(int(cb["x"]), int(cb["y"]), cb["r"], 85, 220, 255);
+            gfx.circle_outline(int(cb["x"]), int(cb["y"]), cb["r"] + 4, 180, 245, 255);
+        } else {
+            gfx.circle(int(cb["x"]), int(cb["y"]), cb["r"], 245, 189, 65);
+            gfx.circle(int(cb["x"]), int(cb["y"]), 4, 255, 245, 180);
+        }
+    }
+    for rk in game["rocks"] {
+        let rx = int(rk["x"]);
+        let ry = int(rk["y"]);
+        let rr = rk["r"];
+        gfx.circle(rx, ry, rr, 118, 48, 66);
+        gfx.circle_outline(rx, ry, rr, 235, 95, 110);
+        gfx.circle(rx - int(rr / 3), ry - int(rr / 3), int(math.max(2, rr / 4)), 165, 72, 92);
+    }
+
+    custom_ui.draw_ship(game["px"], game["py"], skin["r"], skin["g"], skin["b"], game["shield_t"] > 0.0, total_t);
+    custom_ui.draw_hud(game["score"], st["best_score"], game["combo"], game["elapsed"], game["shield_t"], game["near_misses"], game["diff_name"]);
+}
+
+fn run_game() {
+    gfx.window("Askane Neon Dodge 2D", W, H);
+    let stars = init_stars();
+    let st = stats.load_stats(STATS_FILE);
+
+    let mode = "menu";
+    let diff_idx = 1;
+    let skin_idx = 0;
+    let total_t = 0.0;
+    let prev_mouse = false;
+    let prev_pause_key = false;
+    let game = new_session(diff_idx);
+    let last_result = #{ run: unit, is_new_best: false };
+
+    let _ = gfx.delta();
+    while gfx.is_open() {
+        let dt = gfx.delta();
+        if dt <= 0.0 || dt > 0.05 {
+            dt = 0.016;
+        }
+        total_t += dt;
+
+        let mx = gfx.mouse_x();
+        let my = gfx.mouse_y();
+        let mouse_down = gfx.mouse_down("left");
+        let just_clicked = mouse_down && !prev_mouse;
+        prev_mouse = mouse_down;
+
+        let pause_key = gfx.key_down("P") || gfx.key_down("ESC");
+        let just_paused = pause_key && !prev_pause_key;
+        prev_pause_key = pause_key;
+
+        update_stars(stars, dt);
+
+        if mode == "menu" {
+            let act = custom_ui.draw_menu_screen(mx, my, mouse_down, just_clicked, diff_idx, skin_idx, st, stars, total_t);
+            if act == "play" {
+                game = new_session(diff_idx);
+                mode = "playing";
+            } else if act == "diff" {
+                diff_idx = (diff_idx + 1) % 3;
+            } else if act == "skin" {
+                skin_idx = (skin_idx + 1) % 4;
+            } else if act == "stats" {
+                mode = "stats";
+            } else if act == "quit" {
+                break;
+            }
+        } else if mode == "stats" {
+            let act = custom_ui.draw_stats_screen(mx, my, mouse_down, just_clicked, st, stars);
+            if act == "back" {
+                mode = "menu";
+            } else if act == "reset" {
+                st = stats.reset_stats(STATS_FILE);
+            }
+        } else if mode == "playing" {
+            if just_paused {
+                mode = "paused";
+            } else {
+                let fatal = step_playing(game, dt, mx, my, mouse_down);
+                render_gameplay(game, skin_idx, stars, total_t, st);
+                if fatal {
+                    last_result = stats.record_run(
+                        STATS_FILE,
+                        st,
+                        game["score"],
+                        int(game["elapsed"]),
+                        game["orbs"],
+                        game["near_misses"],
+                        game["max_combo"],
+                        game["diff_name"],
+                    );
+                    mode = "gameover";
+                }
+            }
+        } else if mode == "paused" {
+            render_gameplay(game, skin_idx, stars, total_t, st);
+            let act = custom_ui.draw_pause_overlay(mx, my, mouse_down, just_clicked);
+            if just_paused || act == "resume" {
+                mode = "playing";
+            } else if act == "menu" {
+                mode = "menu";
+            }
+        } else if mode == "gameover" {
+            render_gameplay(game, skin_idx, stars, total_t, st);
+            let act = custom_ui.draw_gameover_overlay(mx, my, mouse_down, just_clicked, last_result["run"], last_result["is_new_best"]);
+            if act == "retry" {
+                game = new_session(diff_idx);
+                mode = "playing";
+            } else if act == "menu" {
+                mode = "menu";
+            }
+        }
+
+        gfx.present();
+        sys.sleep(16);
+    }
+
+    gfx.close();
+}
+
+if is_main() {
+    run_game();
+}

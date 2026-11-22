@@ -206,7 +206,7 @@ fn parse_tag_attrs(raw: &str) -> (String, HashMap<String, String>, bool) {
     (tag, attrs, self_close)
 }
 
-fn parse_dom(src: &str) -> DomNode {
+fn parse_dom(vm: &mut VM, src: &str) -> Result<DomNode, String> {
     let mut stack = vec![DomNode {
         tag: "#document".to_string(),
         attrs: HashMap::new(),
@@ -216,8 +216,14 @@ fn parse_dom(src: &str) -> DomNode {
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut nodes_created = 0usize;
+    let mut est_alloc = 0usize;
+    let mut steps = 0usize;
 
     while i < bytes.len() && nodes_created < 200_000 {
+        steps += 1;
+        if (steps & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         if bytes[i] == b'<' {
             if src[i..].starts_with("<!--") {
                 if let Some(end) = src[i + 4..].find("-->") {
@@ -254,6 +260,18 @@ fn parse_dom(src: &str) -> DomNode {
                     let (tag, attrs, self_close) = parse_tag_attrs(trimmed);
                     if !tag.is_empty() {
                         nodes_created += 1;
+                        let attr_bytes: usize = attrs
+                            .iter()
+                            .map(|(k, v)| k.len().saturating_add(v.len()).saturating_add(48))
+                            .sum();
+                        let delta = 256usize
+                            .saturating_add(tag.len())
+                            .saturating_add(attr_bytes);
+                        est_alloc = est_alloc.saturating_add(delta);
+                        if est_alloc >= 4096 {
+                            vm.charge_alloc(est_alloc)?;
+                            est_alloc = 0;
+                        }
                         let node = DomNode {
                             tag: tag.clone(),
                             attrs,
@@ -269,6 +287,15 @@ fn parse_dom(src: &str) -> DomNode {
                 }
                 continue;
             }
+            let tail_txt = unescape_str(&src[i..]);
+            if !tail_txt.trim().is_empty() {
+                let cur = stack.last_mut().unwrap();
+                if !cur.text.is_empty() && !cur.text.ends_with(' ') && !tail_txt.starts_with(' ') {
+                    cur.text.push(' ');
+                }
+                cur.text.push_str(tail_txt.trim());
+            }
+            break;
         }
         let next_lt = src[i..].find('<').map(|p| i + p).unwrap_or(src.len());
         let txt = unescape_str(&src[i..next_lt]);
@@ -281,12 +308,15 @@ fn parse_dom(src: &str) -> DomNode {
         }
         i = next_lt;
     }
+    if est_alloc > 0 {
+        vm.charge_alloc(est_alloc)?;
+    }
 
     while stack.len() > 1 {
         let finished = stack.pop().unwrap();
         stack.last_mut().unwrap().children.push(finished);
     }
-    stack.pop().unwrap()
+    Ok(stack.pop().unwrap())
 }
 
 pub(crate) fn html_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -299,8 +329,8 @@ pub(crate) fn html_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if src.len() > 16 * 1024 * 1024 {
         return Err("parse(): document exceeds 16 MiB limit".to_string());
     }
-    let dom = parse_dom(src);
-    vm.charge_alloc(src.len().saturating_mul(2))?;
+    vm.charge_alloc(src.len())?;
+    let dom = parse_dom(vm, src)?;
     Ok(dom.to_value())
 }
 
@@ -363,18 +393,29 @@ fn node_matches_simple(node: &HashMap<String, Value>, part: &str) -> bool {
 }
 
 fn collect_matching(
+    vm: &mut VM,
     node_val: &Value,
     parts: &[&str],
     stage: usize,
     out: &mut Vec<Value>,
     depth: usize,
-) {
-    if depth > 256 || out.len() > 20_000 {
-        return;
+    visited: &mut std::collections::HashSet<(usize, usize)>,
+    steps: &mut usize,
+) -> Result<(), String> {
+    if depth > 256 || out.len() >= 20_000 || *steps >= 500_000 {
+        return Ok(());
+    }
+    *steps += 1;
+    if (*steps & 1023) == 0 {
+        vm.check_timeout()?;
     }
     let Value::Dict(d_rc) = node_val else {
-        return;
+        return Ok(());
     };
+    let ptr = Rc::as_ptr(d_rc) as usize;
+    if !visited.insert((ptr, stage)) {
+        return Ok(());
+    }
     let d = d_rc.borrow();
     let mut next_stage = stage;
     if node_matches_simple(&d, parts[stage]) {
@@ -388,9 +429,22 @@ fn collect_matching(
         let children = ch_rc.borrow().clone();
         drop(d);
         for child in children {
-            collect_matching(&child, parts, next_stage, out, depth + 1);
+            if out.len() >= 20_000 || *steps >= 500_000 {
+                break;
+            }
+            collect_matching(
+                vm,
+                &child,
+                parts,
+                next_stage,
+                out,
+                depth + 1,
+                visited,
+                steps,
+            )?;
         }
     }
+    Ok(())
 }
 
 pub(crate) fn html_select(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -415,21 +469,39 @@ pub(crate) fn html_select(vm: &mut VM, args: &[Value]) -> Result<Value, String> 
         return Ok(Value::List(Rc::new(RefCell::new(Vec::new()))));
     }
     let mut out = Vec::new();
-    collect_matching(&root, &parts, 0, &mut out, 0);
+    let mut visited = std::collections::HashSet::new();
+    let mut steps = 0usize;
+    collect_matching(vm, &root, &parts, 0, &mut out, 0, &mut visited, &mut steps)?;
     vm.charge_alloc(out.len().saturating_mul(std::mem::size_of::<Value>()))?;
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
-fn extract_node_text(v: &Value, out: &mut String, depth: usize) {
-    if depth > 256 {
-        return;
+fn extract_node_text(
+    vm: &mut VM,
+    v: &Value,
+    out: &mut String,
+    depth: usize,
+    steps: &mut usize,
+) -> Result<(), String> {
+    const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
+    if depth > 256 || out.len() >= MAX_TEXT_BYTES || *steps >= 500_000 {
+        return Ok(());
+    }
+    *steps += 1;
+    if (*steps & 1023) == 0 {
+        vm.check_timeout()?;
     }
     let Value::Dict(d_rc) = v else {
-        return;
+        return Ok(());
     };
     let d = d_rc.borrow();
     if let Some(Value::Str(t)) = d.get("text") {
         if !t.is_empty() {
+            let need = t.len().saturating_add(1);
+            if out.len().saturating_add(need) > MAX_TEXT_BYTES {
+                return Err("text(): extracted text exceeds 16 MiB limit".to_string());
+            }
+            vm.charge_alloc(need)?;
             if !out.is_empty() && !out.ends_with(' ') {
                 out.push(' ');
             }
@@ -440,9 +512,13 @@ fn extract_node_text(v: &Value, out: &mut String, depth: usize) {
         let children = ch.borrow().clone();
         drop(d);
         for child in children {
-            extract_node_text(&child, out, depth + 1);
+            if out.len() >= MAX_TEXT_BYTES || *steps >= 500_000 {
+                break;
+            }
+            extract_node_text(vm, &child, out, depth + 1, steps)?;
         }
     }
+    Ok(())
 }
 
 pub(crate) fn html_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -450,7 +526,7 @@ pub(crate) fn html_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("text() expects 1 node argument".to_string());
     }
     let mut out = String::new();
-    extract_node_text(&args[0], &mut out, 0);
-    vm.charge_alloc(out.len())?;
+    let mut steps = 0usize;
+    extract_node_text(vm, &args[0], &mut out, 0, &mut steps)?;
     Ok(Value::Str(out))
 }

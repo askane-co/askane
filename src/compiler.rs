@@ -145,6 +145,7 @@ impl Compiler {
             return Err("Bytecode constant/local limit exceeded".to_string());
         }
         Ok(Rc::new(FunctionProto {
+            ic_id: crate::bytecode::next_ic_id(),
             name: frame.name,
             arity: frame.arity,
             min_arity: 0,
@@ -214,6 +215,7 @@ impl Compiler {
             return Err("Bytecode constant/local limit exceeded".to_string());
         }
         Ok(Rc::new(FunctionProto {
+            ic_id: crate::bytecode::next_ic_id(),
             name: frame.name,
             arity: frame.arity,
             min_arity: 0,
@@ -1408,10 +1410,14 @@ impl Compiler {
                 let (tag, parts, exprs, expr_labels, span) =
                     (&t.tag, &t.parts, &t.exprs, &t.expr_labels, t.span);
                 let frame_idx = self.frames.len() - 1;
-                let has_local_tag = Self::resolve_local(&self.frames[frame_idx], tag).is_some()
-                    || self.resolve_upvalue(frame_idx, tag).is_some();
-                let use_builtin_dispatch = !has_local_tag && (tag == "log" || tag == "sql");
-                if use_builtin_dispatch {
+                let local_slot = Self::resolve_local(&self.frames[frame_idx], tag).map(|(_, s)| s);
+                let upval_slot = if local_slot.is_none() {
+                    self.resolve_upvalue(frame_idx, tag)
+                } else {
+                    None
+                };
+                let has_local_tag = local_slot.is_some() || upval_slot.is_some();
+                if tag == "log" || tag == "sql" {
                     let helper_idx = self.current().chunk.add_string_constant("__tag_eval");
                     self.emit(Op::GetGlobal(helper_idx), span.line);
                     self.push_temps(1);
@@ -1442,13 +1448,26 @@ impl Compiler {
                     }
                     self.pop_temps(expr_labels.len());
                     self.emit(Op::MakeList(expr_labels.len() as u16), span.line);
-                    self.pop_temps(4);
-                    self.emit(Op::Call(4), span.line);
-                } else {
-                    if let Some((_, slot)) = Self::resolve_local(&self.frames[frame_idx], tag) {
+                    let extra_arg = if let Some(slot) = local_slot {
+                        self.push_temps(1);
                         self.emit(Op::GetLocal(slot), span.line);
-                    } else if let Some(upval) = self.resolve_upvalue(frame_idx, tag) {
-                        self.emit(Op::GetUpvalue(upval), span.line);
+                        1usize
+                    } else if let Some(uv) = upval_slot {
+                        self.push_temps(1);
+                        self.emit(Op::GetUpvalue(uv), span.line);
+                        1usize
+                    } else {
+                        0usize
+                    };
+                    self.pop_temps(4 + extra_arg);
+                    self.emit(Op::Call(4 + extra_arg as u8), span.line);
+                } else {
+                    if has_local_tag {
+                        if let Some(slot) = local_slot {
+                            self.emit(Op::GetLocal(slot), span.line);
+                        } else if let Some(upval) = upval_slot {
+                            self.emit(Op::GetUpvalue(upval), span.line);
+                        }
                     } else {
                         let idx = self.current().chunk.add_string_constant(tag);
                         self.emit(Op::GetGlobal(idx), span.line);
@@ -1961,6 +1980,7 @@ impl Compiler {
 
         let upvalues = compiled.upvalues.clone();
         let proto = Rc::new(FunctionProto {
+            ic_id: crate::bytecode::next_ic_id(),
             name: compiled.name,
             arity: compiled.arity,
             min_arity,

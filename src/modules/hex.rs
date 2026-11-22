@@ -43,6 +43,9 @@ fn hex_decode(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if s.len() % 2 != 0 {
         return Err("hex.decode(): hex string length must be even".to_string());
     }
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("hex.decode(): invalid hex digit".to_string());
+    }
     vm.charge_alloc(s.len() / 2)?;
     vm.charge_work((s.len() as u64) / 32 + 1)?;
     let mut out = Vec::with_capacity(s.len() / 2);

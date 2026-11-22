@@ -69,6 +69,7 @@ pub fn build_module(
         exports.insert((*k).to_string(), v.clone());
     }
     Value::Module(Rc::new(ModuleData {
+        ic_id: crate::bytecode::next_ic_id(),
         name: name.to_string(),
         exports: Rc::new(RefCell::new(exports)),
     }))

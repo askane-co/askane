@@ -97,7 +97,7 @@ pub struct Lexer {
     pos: usize,
     line: usize,
     col: usize,
-    interp_braces: Vec<(usize, usize)>,
+    interp_braces: Vec<(usize, usize, Option<usize>)>,
 }
 
 impl Lexer {
@@ -237,7 +237,7 @@ impl Lexer {
                 '}' => {
                     let brace_pos = self.pos;
                     self.advance();
-                    if let Some(&(depth, expr_start)) = self.interp_braces.last() {
+                    if let Some(&(depth, expr_start, last_eq)) = self.interp_braces.last() {
                         if depth == 0 {
                             self.interp_braces.pop();
                             if tokens
@@ -245,14 +245,7 @@ impl Lexer {
                                 .is_some_and(|t| matches!(t.kind, TokenKind::Assign))
                             {
                                 tokens.pop();
-                                let mut eq_pos = brace_pos;
-                                while eq_pos > expr_start && self.chars[eq_pos - 1].is_whitespace()
-                                {
-                                    eq_pos -= 1;
-                                }
-                                if eq_pos > expr_start && self.chars[eq_pos - 1] == '=' {
-                                    eq_pos -= 1;
-                                }
+                                let eq_pos = last_eq.unwrap_or(brace_pos);
                                 let raw_label: String =
                                     self.chars[expr_start..eq_pos].iter().collect();
                                 tokens.push(Token {
@@ -347,6 +340,7 @@ impl Lexer {
                     TokenKind::Percent
                 }
                 '=' => {
+                    let eq_idx = self.pos;
                     self.advance();
                     if self.peek() == Some('=') {
                         self.advance();
@@ -355,6 +349,11 @@ impl Lexer {
                         self.advance();
                         TokenKind::FatArrow
                     } else {
+                        if let Some((depth, _, last_eq)) = self.interp_braces.last_mut() {
+                            if *depth == 0 {
+                                *last_eq = Some(eq_idx);
+                            }
+                        }
                         TokenKind::Assign
                     }
                 }
@@ -510,20 +509,37 @@ impl Lexer {
         };
 
         let kind = if let Some(factor) = dur_factor {
-            let base: f64 = raw.parse().map_err(|_| {
-                format!(
-                    "[{}:{}] Invalid duration literal '{}'",
-                    span.line, span.col, raw
-                )
-            })?;
-            let ms = (base * factor).round();
-            if !ms.is_finite() || ms < 0.0 || ms > (i64::MAX as f64) {
-                return Err(format!(
-                    "[{}:{}] Duration literal out of range",
-                    span.line, span.col
-                ));
+            if !is_float {
+                let factor_u128 = factor as u128;
+                let base_u128 = raw.parse::<u128>().map_err(|_| {
+                    format!(
+                        "[{}:{}] Invalid duration literal '{}'",
+                        span.line, span.col, raw
+                    )
+                })?;
+                let ms = base_u128
+                    .checked_mul(factor_u128)
+                    .filter(|&v| v <= i64::MAX as u128)
+                    .ok_or_else(|| {
+                        format!("[{}:{}] Duration literal out of range", span.line, span.col)
+                    })?;
+                TokenKind::Int(ms as i64)
+            } else {
+                let base: f64 = raw.parse().map_err(|_| {
+                    format!(
+                        "[{}:{}] Invalid duration literal '{}'",
+                        span.line, span.col, raw
+                    )
+                })?;
+                let ms = (base * factor).round();
+                if !ms.is_finite() || ms < 0.0 || ms >= 9223372036854775808.0 {
+                    return Err(format!(
+                        "[{}:{}] Duration literal out of range",
+                        span.line, span.col
+                    ));
+                }
+                TokenKind::Int(ms as i64)
             }
-            TokenKind::Int(ms as i64)
         } else if is_float {
             let val: f64 = raw.parse().map_err(|_| {
                 format!(
@@ -605,7 +621,7 @@ impl Lexer {
             if c == '$' && self.peek_next() == Some('{') {
                 self.advance();
                 self.advance();
-                self.interp_braces.push((0, self.pos));
+                self.interp_braces.push((0, self.pos, None));
                 return Ok(Token {
                     kind: if in_interp {
                         TokenKind::InterpMid(out)
@@ -736,6 +752,12 @@ impl Lexer {
                             )
                         })?;
                         let hex = [h1, h2].iter().collect::<String>();
+                        if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
+                            return Err(format!(
+                                "[{}:{}] Invalid hex escape '\\x{}' in byte literal",
+                                span.line, span.col, hex
+                            ));
+                        }
                         let val = u8::from_str_radix(&hex, 16).map_err(|_| {
                             format!(
                                 "[{}:{}] Invalid hex escape '\\x{}' in byte literal",

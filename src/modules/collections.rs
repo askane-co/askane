@@ -40,6 +40,7 @@ fn make_struct_def(
         );
     }
     Rc::new(StructDef {
+        ic_id: crate::bytecode::next_ic_id(),
         name: name.to_string(),
         field_names,
         field_index,
@@ -50,8 +51,22 @@ fn make_struct_def(
 
 fn extract_items(vm: &mut VM, val: &Value, ctx: &str) -> Result<Vec<Value>, String> {
     match val {
-        Value::List(l) => Ok(l.borrow().clone()),
-        Value::Set(s) => Ok(s.borrow().items.clone()),
+        Value::List(l) => {
+            let len = l.borrow().len();
+            if len > 1_000_000 {
+                return Err(format!("{}: list exceeds 1,000,000 items", ctx));
+            }
+            vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
+            Ok(l.borrow().clone())
+        }
+        Value::Set(s) => {
+            let len = s.borrow().items.len();
+            if len > 1_000_000 {
+                return Err(format!("{}: set exceeds 1,000,000 items", ctx));
+            }
+            vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
+            Ok(s.borrow().items.clone())
+        }
         Value::Range { start, end } => {
             let len = end.saturating_sub(*start).max(0) as usize;
             if len > 1_000_000 {
@@ -60,8 +75,21 @@ fn extract_items(vm: &mut VM, val: &Value, ctx: &str) -> Result<Vec<Value>, Stri
             vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
             Ok((*start..*end).map(Value::Int).collect())
         }
-        Value::Bytes(b) => Ok(b.iter().map(|&x| Value::Int(x as i64)).collect()),
-        Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
+        Value::Bytes(b) => {
+            if b.len() > 1_000_000 {
+                return Err(format!("{}: bytes exceeds 1,000,000 items", ctx));
+            }
+            vm.charge_alloc(b.len().saturating_mul(std::mem::size_of::<Value>()))?;
+            Ok(b.iter().map(|&x| Value::Int(x as i64)).collect())
+        }
+        Value::Str(s) => {
+            let len = s.chars().count();
+            if len > 1_000_000 {
+                return Err(format!("{}: string exceeds 1,000,000 characters", ctx));
+            }
+            vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>().saturating_add(24)))?;
+            Ok(s.chars().map(|c| Value::Str(c.to_string())).collect())
+        }
         other => Err(format!(
             "{} expects iterable, got '{}'",
             ctx,
@@ -192,24 +220,36 @@ fn deque_pop_front(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn deque_peek_front(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("Deque.peek_front() expects 0 arguments".to_string());
+    }
     let (list_rc, _) = as_deque(&args[0], "Deque.peek_front")?;
     let val = list_rc.borrow().first().cloned().unwrap_or(Value::Unit);
     Ok(val)
 }
 
 fn deque_peek_back(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("Deque.peek_back() expects 0 arguments".to_string());
+    }
     let (list_rc, _) = as_deque(&args[0], "Deque.peek_back")?;
     let val = list_rc.borrow().last().cloned().unwrap_or(Value::Unit);
     Ok(val)
 }
 
 fn deque_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("Deque.len() expects 0 arguments".to_string());
+    }
     let (list_rc, _) = as_deque(&args[0], "Deque.len")?;
     let len = list_rc.borrow().len() as i64;
     Ok(Value::Int(len))
 }
 
 fn deque_to_list(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("Deque.to_list() expects 0 arguments".to_string());
+    }
     let (list_rc, _) = as_deque(&args[0], "Deque.to_list")?;
     let items = list_rc.borrow().clone();
     vm.charge_alloc(items.len().saturating_mul(std::mem::size_of::<Value>()))?;
@@ -217,6 +257,9 @@ fn deque_to_list(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn deque_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("Deque.clear() expects 0 arguments".to_string());
+    }
     let (list_rc, _) = as_deque(&args[0], "Deque.clear")?;
     list_rc.borrow_mut().clear();
     Ok(Value::Unit)
@@ -338,6 +381,9 @@ fn counter_most_common(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn counter_total(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("Counter.total() expects 0 arguments".to_string());
+    }
     let d_rc = as_counter(&args[0], "Counter.total")?;
     let mut sum = 0i64;
     for v in d_rc.borrow().values() {
@@ -348,8 +394,13 @@ fn counter_total(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int(sum))
 }
 
-fn counter_to_dict(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn counter_to_dict(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("Counter.to_dict() expects 0 arguments".to_string());
+    }
     let d_rc = as_counter(&args[0], "Counter.to_dict")?;
+    let count = d_rc.borrow().len();
+    vm.charge_alloc(count.saturating_mul(64))?;
     Ok(Value::Dict(Rc::new(RefCell::new(d_rc.borrow().clone()))))
 }
 
@@ -379,7 +430,9 @@ fn col_priority_queue(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 
 fn pq_entry_key(entry: &Value) -> (f64, i64) {
     if let Value::List(l) = entry {
-        let b = l.borrow();
+        let Ok(b) = l.try_borrow() else {
+            return (0.0, 0);
+        };
         let prio = match b.first() {
             Some(Value::Int(i)) => *i as f64,
             Some(Value::Float(f)) => *f,
@@ -410,7 +463,9 @@ fn pq_push(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let (heap_rc, seq) = {
         let mut f = inst.fields.borrow_mut();
         let next_seq = match f[1] {
-            Value::Int(s) => s + 1,
+            Value::Int(s) => s
+                .checked_add(1)
+                .ok_or_else(|| "PriorityQueue sequence overflow".to_string())?,
             _ => 1,
         };
         f[1] = Value::Int(next_seq);
@@ -480,6 +535,9 @@ fn pq_pop(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn pq_peek(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("PriorityQueue.peek() expects 0 arguments".to_string());
+    }
     let Value::StructInstance(inst) = &args[0] else {
         return Err("PriorityQueue.peek() invalid receiver".to_string());
     };
@@ -488,13 +546,19 @@ fn pq_peek(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
     let heap = heap_rc.borrow();
     if let Some(Value::List(entry_rc)) = heap.first() {
-        Ok(entry_rc.borrow().get(2).cloned().unwrap_or(Value::Unit))
+        let b = entry_rc
+            .try_borrow()
+            .map_err(|_| "PriorityQueue entry is currently borrowed".to_string())?;
+        Ok(b.get(2).cloned().unwrap_or(Value::Unit))
     } else {
         Ok(Value::Unit)
     }
 }
 
 fn pq_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("PriorityQueue.len() expects 0 arguments".to_string());
+    }
     let Value::StructInstance(inst) = &args[0] else {
         return Err("PriorityQueue.len() invalid receiver".to_string());
     };
@@ -506,6 +570,9 @@ fn pq_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn pq_is_empty(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("PriorityQueue.is_empty() expects 0 arguments".to_string());
+    }
     let Value::Int(n) = pq_len(vm, args)? else {
         unreachable!();
     };
@@ -557,20 +624,30 @@ fn col_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
     let items = extract_items(vm, &args[0], "collections.window")?;
     let size = sz as usize;
-    let mut out = Vec::new();
+    if items.len() < size {
+        return Ok(Value::List(Rc::new(RefCell::new(Vec::new()))));
+    }
+    let num_windows = ((items.len() - size) / step) + 1;
+    let total_elems = num_windows
+        .checked_mul(size)
+        .filter(|&tot| num_windows <= 1_000_000 && tot <= 5_000_000)
+        .ok_or_else(|| "collections.window() result exceeds safety limit".to_string())?;
+    vm.charge_alloc(
+        total_elems
+            .saturating_add(num_windows)
+            .saturating_mul(std::mem::size_of::<Value>()),
+    )?;
+    vm.charge_work((total_elems / 64).max(1) as u64)?;
+    let mut out = Vec::with_capacity(num_windows);
     let mut i = 0usize;
     while i + size <= items.len() {
+        if (out.len() & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         out.push(Value::List(Rc::new(RefCell::new(
             items[i..i + size].to_vec(),
         ))));
         i += step;
-        if out.len() > 1_000_000 {
-            return Err("collections.window() result exceeds safety limit".to_string());
-        }
     }
-    vm.charge_alloc(
-        out.len()
-            .saturating_mul(size.saturating_mul(std::mem::size_of::<Value>())),
-    )?;
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }

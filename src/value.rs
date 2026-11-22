@@ -37,6 +37,24 @@ pub enum SetKey {
     Unit,
 }
 
+#[inline]
+pub(crate) fn float_as_exact_i64(f: f64) -> Option<i64> {
+    if !f.is_finite() || f.fract() != 0.0 || f < (i64::MIN as f64) || f >= 9223372036854775808.0 {
+        return None;
+    }
+    let as_int = f as i64;
+    if (as_int as f64) == f {
+        Some(as_int)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn int_eq_float(i: i64, f: f64) -> bool {
+    float_as_exact_i64(f).is_some_and(|fi| fi == i)
+}
+
 impl SetKey {
     pub fn from_value(v: &Value) -> Result<Self, String> {
         match v {
@@ -46,15 +64,8 @@ impl SetKey {
                     return Err("Cannot store NaN in a set".to_string());
                 }
                 let normalized = if *f == 0.0 { 0.0 } else { *f };
-                if normalized.is_finite()
-                    && normalized.fract() == 0.0
-                    && normalized >= (i64::MIN as f64)
-                    && normalized < (i64::MAX as f64)
-                {
-                    let as_int = normalized as i64;
-                    if (as_int as f64) == normalized {
-                        return Ok(SetKey::Int(as_int));
-                    }
+                if let Some(as_int) = float_as_exact_i64(normalized) {
+                    return Ok(SetKey::Int(as_int));
                 }
                 Ok(SetKey::FloatBits(normalized.to_bits()))
             }
@@ -109,6 +120,7 @@ impl AskaneSet {
 }
 
 pub struct StructDef {
+    pub ic_id: u64,
     pub name: String,
     pub field_names: Vec<String>,
     pub field_index: HashMap<String, usize>,
@@ -128,6 +140,7 @@ pub struct BoundMethod {
 }
 
 pub struct ModuleData {
+    pub ic_id: u64,
     pub name: String,
     pub exports: Rc<RefCell<HashMap<String, Value>>>,
 }
@@ -214,114 +227,231 @@ impl Value {
     }
 
     pub fn equals(&self, other: &Value) -> bool {
-        let mut budget = 10_000_005usize;
-        let mut memo = HashSet::new();
-        self.equals_depth(other, 0, &mut budget, &mut memo)
+        self.equals_inner(other, None).unwrap_or(false)
     }
 
+    pub fn equals_vm(&self, other: &Value, vm: &mut VM) -> Result<bool, String> {
+        self.equals_inner(other, Some(vm))
+    }
+
+    fn equals_inner(&self, other: &Value, vm: Option<&mut VM>) -> Result<bool, String> {
+        let mut budget = 1_000_005usize;
+        let mut work_since_check = 0usize;
+        let mut visiting: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut memo: HashMap<(usize, usize), bool> = HashMap::new();
+        let mut vm = vm;
+        let (eq, _) = self.equals_depth(
+            other,
+            0,
+            &mut budget,
+            &mut work_since_check,
+            &mut visiting,
+            &mut memo,
+            &mut vm,
+        )?;
+        Ok(eq)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn equals_depth(
         &self,
         other: &Value,
         depth: usize,
         budget: &mut usize,
-        memo: &mut HashSet<(usize, usize)>,
-    ) -> bool {
-        if depth > 128 || *budget == 0 {
-            return false;
+        work_since_check: &mut usize,
+        visiting: &mut HashMap<(usize, usize), usize>,
+        memo: &mut HashMap<(usize, usize), bool>,
+        vm: &mut Option<&mut VM>,
+    ) -> Result<(bool, usize), String> {
+        if depth > 256 || *budget == 0 {
+            return Ok((false, usize::MAX));
         }
         *budget -= 1;
-        match (self, other) {
+        *work_since_check += 1;
+        if (*work_since_check & 1023) == 0 {
+            if let Some(v) = vm.as_deref_mut() {
+                v.charge_work(64)?;
+            }
+        }
+        let eq = match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+            (Value::Int(a), Value::Float(b)) => int_eq_float(*a, *b),
+            (Value::Float(a), Value::Int(b)) => int_eq_float(*b, *a),
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b) || **a == **b,
             (Value::Unit, Value::Unit) => true,
             (Value::List(a), Value::List(b)) => {
                 if Rc::ptr_eq(a, b) {
-                    return true;
+                    return Ok((true, usize::MAX));
                 }
-                let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
-                if memo.contains(&key) {
-                    return true;
+                let pa = Rc::as_ptr(a) as usize;
+                let pb = Rc::as_ptr(b) as usize;
+                let key = if pa <= pb { (pa, pb) } else { (pb, pa) };
+                if let Some(&d) = visiting.get(&key) {
+                    return Ok((true, d));
+                }
+                if let Some(&cached) = memo.get(&key) {
+                    return Ok((cached, usize::MAX));
                 }
                 let a_ref = a.borrow();
                 let b_ref = b.borrow();
                 if a_ref.len() != b_ref.len() {
-                    return false;
+                    if memo.len() < 100_000 {
+                        memo.insert(key, false);
+                    }
+                    return Ok((false, usize::MAX));
                 }
-                let eq = a_ref
-                    .iter()
-                    .zip(b_ref.iter())
-                    .all(|(x, y)| x.equals_depth(y, depth + 1, budget, memo));
-                if eq && memo.len() < 100_000 {
-                    memo.insert(key);
+                visiting.insert(key, depth);
+                let mut eq = true;
+                let mut min_assump = usize::MAX;
+                for (x, y) in a_ref.iter().zip(b_ref.iter()) {
+                    let (item_eq, item_assump) =
+                        x.equals_depth(y, depth + 1, budget, work_since_check, visiting, memo, vm)?;
+                    min_assump = min_assump.min(item_assump);
+                    if !item_eq {
+                        eq = false;
+                        break;
+                    }
                 }
-                eq
+                visiting.remove(&key);
+                if (!eq && *budget > 0) || (eq && min_assump >= depth) {
+                    if memo.len() < 100_000 {
+                        memo.insert(key, eq);
+                    }
+                }
+                return Ok((eq, min_assump));
             }
             (Value::Dict(a), Value::Dict(b)) => {
                 if Rc::ptr_eq(a, b) {
-                    return true;
+                    return Ok((true, usize::MAX));
                 }
-                let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
-                if memo.contains(&key) {
-                    return true;
+                let pa = Rc::as_ptr(a) as usize;
+                let pb = Rc::as_ptr(b) as usize;
+                let key = if pa <= pb { (pa, pb) } else { (pb, pa) };
+                if let Some(&d) = visiting.get(&key) {
+                    return Ok((true, d));
+                }
+                if let Some(&cached) = memo.get(&key) {
+                    return Ok((cached, usize::MAX));
                 }
                 let a_ref = a.borrow();
                 let b_ref = b.borrow();
                 if a_ref.len() != b_ref.len() {
-                    return false;
+                    if memo.len() < 100_000 {
+                        memo.insert(key, false);
+                    }
+                    return Ok((false, usize::MAX));
                 }
-                let eq = a_ref.iter().all(|(k, v)| {
-                    b_ref
-                        .get(k)
-                        .is_some_and(|bv| v.equals_depth(bv, depth + 1, budget, memo))
-                });
-                if eq && memo.len() < 100_000 {
-                    memo.insert(key);
+                visiting.insert(key, depth);
+                let mut eq = true;
+                let mut min_assump = usize::MAX;
+                for (k, v) in a_ref.iter() {
+                    let Some(bv) = b_ref.get(k) else {
+                        eq = false;
+                        break;
+                    };
+                    let (item_eq, item_assump) = v.equals_depth(
+                        bv,
+                        depth + 1,
+                        budget,
+                        work_since_check,
+                        visiting,
+                        memo,
+                        vm,
+                    )?;
+                    min_assump = min_assump.min(item_assump);
+                    if !item_eq {
+                        eq = false;
+                        break;
+                    }
                 }
-                eq
+                visiting.remove(&key);
+                if (!eq && *budget > 0) || (eq && min_assump >= depth) {
+                    if memo.len() < 100_000 {
+                        memo.insert(key, eq);
+                    }
+                }
+                return Ok((eq, min_assump));
             }
             (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
             (Value::NativeFn(a), Value::NativeFn(b)) => std::ptr::fn_addr_eq(a.func, b.func),
             (Value::BoundMethod(a), Value::BoundMethod(b)) => {
-                Rc::ptr_eq(a, b)
-                    || (a
-                        .receiver
-                        .equals_depth(&b.receiver, depth + 1, budget, memo)
-                        && a.func.equals_depth(&b.func, depth + 1, budget, memo))
+                if Rc::ptr_eq(a, b) {
+                    return Ok((true, usize::MAX));
+                }
+                let (req, rd) = a.receiver.equals_depth(
+                    &b.receiver,
+                    depth + 1,
+                    budget,
+                    work_since_check,
+                    visiting,
+                    memo,
+                    vm,
+                )?;
+                if !req {
+                    return Ok((false, usize::MAX));
+                }
+                let (feq, fd) = a.func.equals_depth(
+                    &b.func,
+                    depth + 1,
+                    budget,
+                    work_since_check,
+                    visiting,
+                    memo,
+                    vm,
+                )?;
+                return Ok((feq, rd.min(fd)));
             }
             (Value::StructDef(a), Value::StructDef(b)) => Rc::ptr_eq(a, b),
             (Value::StructInstance(a), Value::StructInstance(b)) => {
                 if Rc::ptr_eq(a, b) {
-                    return true;
+                    return Ok((true, usize::MAX));
                 }
                 if !Rc::ptr_eq(&a.def, &b.def) {
-                    return false;
+                    return Ok((false, usize::MAX));
                 }
-                let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
-                if memo.contains(&key) {
-                    return true;
+                let pa = Rc::as_ptr(a) as usize;
+                let pb = Rc::as_ptr(b) as usize;
+                let key = if pa <= pb { (pa, pb) } else { (pb, pa) };
+                if let Some(&d) = visiting.get(&key) {
+                    return Ok((true, d));
+                }
+                if let Some(&cached) = memo.get(&key) {
+                    return Ok((cached, usize::MAX));
                 }
                 let a_fields = a.fields.borrow();
                 let b_fields = b.fields.borrow();
                 if a_fields.len() != b_fields.len() {
-                    return false;
+                    if memo.len() < 100_000 {
+                        memo.insert(key, false);
+                    }
+                    return Ok((false, usize::MAX));
                 }
-                let eq = a_fields
-                    .iter()
-                    .zip(b_fields.iter())
-                    .all(|(x, y)| x.equals_depth(y, depth + 1, budget, memo));
-                if eq && memo.len() < 100_000 {
-                    memo.insert(key);
+                visiting.insert(key, depth);
+                let mut eq = true;
+                let mut min_assump = usize::MAX;
+                for (x, y) in a_fields.iter().zip(b_fields.iter()) {
+                    let (item_eq, item_assump) =
+                        x.equals_depth(y, depth + 1, budget, work_since_check, visiting, memo, vm)?;
+                    min_assump = min_assump.min(item_assump);
+                    if !item_eq {
+                        eq = false;
+                        break;
+                    }
                 }
-                eq
+                visiting.remove(&key);
+                if (!eq && *budget > 0) || (eq && min_assump >= depth) {
+                    if memo.len() < 100_000 {
+                        memo.insert(key, eq);
+                    }
+                }
+                return Ok((eq, min_assump));
             }
             (Value::Set(a), Value::Set(b)) => {
                 if Rc::ptr_eq(a, b) {
-                    return true;
+                    return Ok((true, usize::MAX));
                 }
                 let a_ref = a.borrow();
                 let b_ref = b.borrow();
@@ -333,7 +463,8 @@ impl Value {
             }
             (Value::Module(a), Value::Module(b)) => Rc::ptr_eq(&a.exports, &b.exports),
             _ => false,
-        }
+        };
+        Ok((eq, usize::MAX))
     }
 }
 

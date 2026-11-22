@@ -314,8 +314,10 @@ pub(crate) fn parse_color_str(s: &str, theme: &Theme) -> Result<u32, String> {
 
 fn as_i32(val: &Value, ctx: &str) -> Result<i32, String> {
     match val {
-        Value::Int(i) => Ok(*i as i32),
-        Value::Float(f) if f.is_finite() => Ok(*f as i32),
+        Value::Int(i) => i32::try_from(*i).map_err(|_| format!("{} integer out of i32 range", ctx)),
+        Value::Float(f) if f.is_finite() && *f >= (i32::MIN as f64) && *f <= (i32::MAX as f64) => {
+            Ok(*f as i32)
+        }
         other => Err(format!("{} expects int, got '{}'", ctx, other.type_name())),
     }
 }
@@ -563,8 +565,11 @@ fn mod_slider(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let val = as_f64(&args[0], "ui.slider value")?;
     let min = as_f64(&args[1], "ui.slider min")?;
     let max = as_f64(&args[2], "ui.slider max")?;
+    if min > max {
+        return Err("ui.slider() min cannot be greater than max".to_string());
+    }
     let mut fields = HashMap::new();
-    fields.insert("value".to_string(), Value::Float(val));
+    fields.insert("value".to_string(), Value::Float(val.clamp(min, max)));
     fields.insert("min".to_string(), Value::Float(min));
     fields.insert("max".to_string(), Value::Float(max));
     make_node_dict("slider", args.get(3), fields)
@@ -595,10 +600,15 @@ fn parse_widget_node(
     val: &Value,
     theme: &Theme,
     auto_id: &mut usize,
+    node_count: &mut usize,
     depth: usize,
 ) -> Result<WidgetNode, String> {
     if depth > 64 {
         return Err("UI widget tree exceeds maximum nesting depth (64)".to_string());
+    }
+    *node_count += 1;
+    if *node_count > 10_000 {
+        return Err("UI widget tree exceeds maximum node limit (10000)".to_string());
     }
     let Value::Dict(d) = val else {
         return Err(format!(
@@ -648,6 +658,9 @@ fn parse_widget_node(
         Some(v) => as_f64(v, "slider.max")?,
         None => 100.0,
     };
+    if matches!(kind, WidgetKind::Slider) && min_num > max_num {
+        return Err("slider.min cannot be greater than slider.max".to_string());
+    }
     let value_num = match map.get("value") {
         Some(v) if matches!(kind, WidgetKind::Slider) => as_f64(v, "slider.value")?,
         _ => min_num,
@@ -659,7 +672,11 @@ fn parse_widget_node(
 
     let mut options = Vec::new();
     if let Some(Value::List(list)) = map.get("options") {
-        for item in list.borrow().iter() {
+        let items = list.borrow();
+        if items.len() > 10_000 {
+            return Err("ui.select() options list exceeds 10000 items limit".to_string());
+        }
+        for item in items.iter() {
             options.push(item.to_string());
         }
     }
@@ -676,15 +693,15 @@ fn parse_widget_node(
     };
 
     let size_opt = match map.get("size") {
-        Some(v) => Some(as_i32(v, "widget.size")?.max(0)),
+        Some(v) => Some(as_i32(v, "widget.size")?.clamp(0, 4096)),
         None => None,
     };
     let width_hint = match map.get("width") {
-        Some(v) => Some(as_i32(v, "widget.width")?.max(16)),
+        Some(v) => Some(as_i32(v, "widget.width")?.clamp(16, 4096)),
         None => size_opt,
     };
     let height_hint = match map.get("height") {
-        Some(v) => Some(as_i32(v, "widget.height")?.max(8)),
+        Some(v) => Some(as_i32(v, "widget.height")?.clamp(8, 4096)),
         None => size_opt,
     };
     let padding = match map.get("padding") {
@@ -717,7 +734,13 @@ fn parse_widget_node(
     let mut children = Vec::new();
     if let Some(Value::List(list)) = map.get("children") {
         for ch in list.borrow().iter() {
-            children.push(parse_widget_node(ch, theme, auto_id, depth + 1)?);
+            children.push(parse_widget_node(
+                ch,
+                theme,
+                auto_id,
+                node_count,
+                depth + 1,
+            )?);
         }
     }
 
@@ -754,16 +777,17 @@ fn parse_widget_node(
 fn measure_node(node: &WidgetNode, theme: &Theme) -> (i32, i32) {
     let f = theme.font_size;
     let base_h = (f + 16).max(28);
+    let text_chars = node.text.chars().count().min(4096) as i32;
     match node.kind {
         WidgetKind::Label => {
             let w = node
                 .width_hint
-                .unwrap_or_else(|| (node.text.chars().count() as i32) * (f * 6 / 10).max(7) + 8);
+                .unwrap_or_else(|| text_chars * (f * 6 / 10).max(7) + 8);
             let h = node.height_hint.unwrap_or(f + 8);
             (w, h)
         }
         WidgetKind::Button => {
-            let text_w = (node.text.chars().count() as i32) * (f * 6 / 10).max(8) + 28;
+            let text_w = text_chars * (f * 6 / 10).max(8) + 28;
             let w = node.width_hint.unwrap_or_else(|| text_w.max(96));
             let h = node.height_hint.unwrap_or(base_h.max(34));
             (w, h)
@@ -774,7 +798,7 @@ fn measure_node(node: &WidgetNode, theme: &Theme) -> (i32, i32) {
             (w, h)
         }
         WidgetKind::Checkbox => {
-            let label_w = (node.text.chars().count() as i32) * (f * 6 / 10).max(7);
+            let label_w = text_chars * (f * 6 / 10).max(7);
             let w = node.width_hint.unwrap_or(28 + label_w + 8);
             let h = node.height_hint.unwrap_or(26.max(f + 8));
             (w, h)
@@ -790,7 +814,8 @@ fn measure_node(node: &WidgetNode, theme: &Theme) -> (i32, i32) {
                 .iter()
                 .map(|o| o.chars().count())
                 .max()
-                .unwrap_or(6) as i32;
+                .unwrap_or(6)
+                .min(4096) as i32;
             let w = node
                 .width_hint
                 .unwrap_or_else(|| (longest * 8 + 44).max(160));
@@ -809,14 +834,14 @@ fn measure_node(node: &WidgetNode, theme: &Theme) -> (i32, i32) {
             for (idx, ch) in node.children.iter().enumerate() {
                 let (cw, ch_h) = measure_node(ch, theme);
                 max_w = max_w.max(cw);
-                sum_h += ch_h;
+                sum_h = sum_h.saturating_add(ch_h);
                 if idx + 1 < node.children.len() {
-                    sum_h += sp;
+                    sum_h = sum_h.saturating_add(sp);
                 }
             }
             (
-                node.width_hint.unwrap_or(max_w + pad * 2),
-                node.height_hint.unwrap_or(sum_h + pad * 2),
+                node.width_hint.unwrap_or(max_w.saturating_add(pad * 2)),
+                node.height_hint.unwrap_or(sum_h.saturating_add(pad * 2)),
             )
         }
         WidgetKind::Row => {
@@ -826,15 +851,15 @@ fn measure_node(node: &WidgetNode, theme: &Theme) -> (i32, i32) {
             let mut max_h = 0i32;
             for (idx, ch) in node.children.iter().enumerate() {
                 let (cw, ch_h) = measure_node(ch, theme);
-                sum_w += cw;
+                sum_w = sum_w.saturating_add(cw);
                 if idx + 1 < node.children.len() {
-                    sum_w += sp;
+                    sum_w = sum_w.saturating_add(sp);
                 }
                 max_h = max_h.max(ch_h);
             }
             (
-                node.width_hint.unwrap_or(sum_w + pad * 2),
-                node.height_hint.unwrap_or(max_h + pad * 2),
+                node.width_hint.unwrap_or(sum_w.saturating_add(pad * 2)),
+                node.height_hint.unwrap_or(max_h.saturating_add(pad * 2)),
             )
         }
     }
@@ -904,41 +929,79 @@ fn layout_node(
 }
 
 fn fill_rect(buf: &mut [u32], bw: i32, bh: i32, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    if bw <= 0 || bh <= 0 || w <= 0 || h <= 0 {
+        return;
+    }
     let x0 = x.max(0);
     let y0 = y.max(0);
-    let x1 = (x + w).min(bw);
-    let y1 = (y + h).min(bh);
+    let x1 = x.saturating_add(w).min(bw);
+    let y1 = y.saturating_add(h).min(bh);
     if x0 >= x1 || y0 >= y1 {
         return;
     }
+    let bw_usize = bw as usize;
     for py in y0..y1 {
-        let row = (py * bw) as usize;
+        let Some(row) = (py as usize).checked_mul(bw_usize) else {
+            break;
+        };
         for px in x0..x1 {
-            buf[row + px as usize] = color;
+            if let Some(cell) = buf.get_mut(row + px as usize) {
+                *cell = color;
+            }
         }
     }
 }
 
 fn stroke_rect(buf: &mut [u32], bw: i32, bh: i32, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
     fill_rect(buf, bw, bh, x, y, w, 1, color);
-    fill_rect(buf, bw, bh, x, y + h - 1, w, 1, color);
+    fill_rect(
+        buf,
+        bw,
+        bh,
+        x,
+        y.saturating_add(h).saturating_sub(1),
+        w,
+        1,
+        color,
+    );
     fill_rect(buf, bw, bh, x, y, 1, h, color);
-    fill_rect(buf, bw, bh, x + w - 1, y, 1, h, color);
+    fill_rect(
+        buf,
+        bw,
+        bh,
+        x.saturating_add(w).saturating_sub(1),
+        y,
+        1,
+        h,
+        color,
+    );
 }
 
 fn fill_circle(buf: &mut [u32], bw: i32, bh: i32, cx: i32, cy: i32, r: i32, color: u32) {
-    let r2 = r * r;
+    if bw <= 0 || bh <= 0 || r <= 0 {
+        return;
+    }
+    let r = r.min(4096);
+    let r2 = (r as i64) * (r as i64);
     for dy in -r..=r {
-        let py = cy + dy;
+        let py = cy.saturating_add(dy);
         if py < 0 || py >= bh {
             continue;
         }
         for dx in -r..=r {
-            let px = cx + dx;
-            if px < 0 || px >= bw || dx * dx + dy * dy > r2 {
+            let px = cx.saturating_add(dx);
+            if px < 0 || px >= bw || (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64) > r2 {
                 continue;
             }
-            buf[(py * bw + px) as usize] = color;
+            let idx = (py as usize)
+                .saturating_mul(bw as usize)
+                .saturating_add(px as usize);
+            if let Some(cell) = buf.get_mut(idx) {
+                *cell = color;
+            }
         }
     }
 }
@@ -970,7 +1033,9 @@ fn sync_widget_state(sess: &mut UiSession, node: &WidgetNode) {
                 .map(|p| (p - node.value_num).abs() > 1e-9)
                 .unwrap_or(true);
             if entry.slider_val.is_none() || prop_changed {
-                entry.slider_val = Some(node.value_num.clamp(node.min_num, node.max_num));
+                let lo = node.min_num.min(node.max_num);
+                let hi = node.min_num.max(node.max_num);
+                entry.slider_val = Some(node.value_num.clamp(lo, hi));
                 entry.last_slider_prop = Some(node.value_num);
             }
         }
@@ -990,7 +1055,7 @@ fn sync_widget_state(sess: &mut UiSession, node: &WidgetNode) {
 }
 
 fn point_in_rect(px: i32, py: i32, r: &LayoutRect) -> bool {
-    px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h
+    px >= r.x && px < r.x.saturating_add(r.w) && py >= r.y && py < r.y.saturating_add(r.h)
 }
 
 fn emit_event(events: &mut Vec<Value>, kind: &str, id: &str, val: Option<Value>) {
@@ -1004,10 +1069,17 @@ fn emit_event(events: &mut Vec<Value>, kind: &str, id: &str, val: Option<Value>)
 }
 
 fn snap_slider(raw: f64, min: f64, max: f64, step: f64) -> f64 {
-    let clamped = raw.clamp(min, max);
-    if step > 0.0 {
-        let steps = ((clamped - min) / step).round();
-        (min + steps * step).clamp(min, max)
+    let lo = min.min(max);
+    let hi = min.max(max);
+    let clamped = raw.clamp(lo, hi);
+    if step > 0.0 && ((hi - lo) / step).is_finite() {
+        let steps = ((clamped - lo) / step).round();
+        let snapped = lo + steps * step;
+        if snapped.is_finite() {
+            snapped.clamp(lo, hi)
+        } else {
+            clamped
+        }
     } else {
         clamped
     }
@@ -1271,12 +1343,14 @@ fn render_and_interact_node(
             });
         }
         WidgetKind::Slider => {
+            let lo = node.min_num.min(node.max_num);
+            let hi = node.min_num.max(node.max_num);
             let mut val = sess
                 .widgets
                 .get(&node.id)
                 .and_then(|w| w.slider_val)
                 .unwrap_or(node.value_num)
-                .clamp(node.min_num, node.max_num);
+                .clamp(lo, hi);
 
             let drag_x = if was_clicked {
                 Some(clicked_points.last().map(|p| p.0).unwrap_or(sess.mouse_x))
@@ -1291,12 +1365,7 @@ fn render_and_interact_node(
             if let Some(mx) = drag_x {
                 let track_w = (rect.w - 16).max(1) as f64;
                 let ratio = ((mx - (rect.x + 8)) as f64 / track_w).clamp(0.0, 1.0);
-                let next = snap_slider(
-                    node.min_num + ratio * (node.max_num - node.min_num),
-                    node.min_num,
-                    node.max_num,
-                    node.step_num,
-                );
+                let next = snap_slider(lo + ratio * (hi - lo), lo, hi, node.step_num);
                 if (next - val).abs() > 1e-9 {
                     val = next;
                     if let Some(st) = sess.widgets.get_mut(&node.id) {
@@ -1409,13 +1478,18 @@ fn render_and_interact_node(
     }
 }
 
-fn mod_window(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn mod_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 3 || args.len() > 4 {
         return Err("ui.window() expects (title, width, height, [opts])".to_string());
     }
     let title = as_str(&args[0], "ui.window title")?.to_string();
     let width = as_i32(&args[1], "ui.window width")?.clamp(120, 4096);
     let height = as_i32(&args[2], "ui.window height")?.clamp(120, 4096);
+    vm.charge_alloc(
+        (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(std::mem::size_of::<u32>()),
+    )?;
 
     let mut headless = false;
     let mut theme = Theme::default();
@@ -1532,14 +1606,23 @@ fn mod_render(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
 
         let mut auto_id = 0usize;
-        let tree = parse_widget_node(&args[0], &sess.theme, &mut auto_id, 0)?;
+        let mut node_count = 0usize;
+        let tree = parse_widget_node(&args[0], &sess.theme, &mut auto_id, &mut node_count, 0)?;
         sess.next_auto_id = auto_id;
         sync_widget_state(sess, &tree);
 
-        let w = sess.width.max(1);
-        let h = sess.height.max(1);
-        if sess.buffer.len() != (w * h) as usize {
-            sess.buffer.resize((w * h) as usize, sess.theme.bg);
+        let w = sess.width.clamp(1, 4096);
+        let h = sess.height.clamp(1, 4096);
+        sess.width = w;
+        sess.height = h;
+        let target_len = (w as usize).saturating_mul(h as usize);
+        if target_len > sess.buffer.len() {
+            vm.charge_alloc(
+                (target_len - sess.buffer.len()).saturating_mul(std::mem::size_of::<u32>()),
+            )?;
+        }
+        if sess.buffer.len() != target_len {
+            sess.buffer.resize(target_len, sess.theme.bg);
         }
         sess.buffer.fill(sess.theme.bg);
         sess.texts.clear();
@@ -1608,15 +1691,17 @@ fn mod_events(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-fn mod_layout(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn mod_layout(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 3 || args.len() > 4 {
         return Err("ui.layout() expects (root, width, height, [theme])".to_string());
     }
-    let width = as_i32(&args[1], "ui.layout width")?.max(16);
-    let height = as_i32(&args[2], "ui.layout height")?.max(16);
+    let width = as_i32(&args[1], "ui.layout width")?.clamp(16, 4096);
+    let height = as_i32(&args[2], "ui.layout height")?.clamp(16, 4096);
     let theme = parse_theme(args.get(3), &Theme::default())?;
     let mut auto_id = 0usize;
-    let tree = parse_widget_node(&args[0], &theme, &mut auto_id, 0)?;
+    let mut node_count = 0usize;
+    let tree = parse_widget_node(&args[0], &theme, &mut auto_id, &mut node_count, 0)?;
+    vm.charge_alloc(node_count.saturating_mul(128))?;
 
     let mut rects = Vec::new();
     let pad = theme.padding;
@@ -1699,7 +1784,10 @@ fn mod_set_state(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 st.slider_val = Some(*i as f64);
                 st.select_idx = Some((*i).max(0) as usize);
             }
-            Value::Float(f) => st.slider_val = Some(*f),
+            Value::Float(f) if f.is_finite() => st.slider_val = Some(*f),
+            Value::Float(_) => {
+                return Err("ui.set_state() numeric value must be finite".to_string());
+            }
             _ => {}
         }
         Ok(Value::Unit)
@@ -1724,38 +1812,64 @@ fn mod_inject_click(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-fn mod_inject_key(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn mod_inject_key(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("ui.inject_key() expects 1 argument (text)".to_string());
     }
     let s = as_str(&args[0], "ui.inject_key")?;
+    vm.charge_alloc(s.len())?;
     UI_SESSION.with(|slot| {
         let mut borrow = slot.borrow_mut();
         let sess = borrow
             .as_mut()
             .ok_or_else(|| "No active ui.window".to_string())?;
         match s {
-            "backspace" | "Backspace" => sess.pressed_vks.push(0x08),
-            "enter" | "Enter" => sess.pressed_vks.push(0x0D),
-            other => sess.typed_chars.extend(other.chars()),
+            "backspace" | "Backspace" => {
+                if sess.pressed_vks.len() < 65_536 {
+                    sess.pressed_vks.push(0x08);
+                }
+            }
+            "enter" | "Enter" => {
+                if sess.pressed_vks.len() < 65_536 {
+                    sess.pressed_vks.push(0x0D);
+                }
+            }
+            other => {
+                let avail = 65_536usize.saturating_sub(sess.typed_chars.len());
+                sess.typed_chars.extend(other.chars().take(avail));
+            }
         }
         Ok(Value::Unit)
     })
 }
 
-fn mod_inject_resize(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn mod_inject_resize(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("ui.inject_resize() expects 2 arguments (width, height)".to_string());
     }
-    let w = as_i32(&args[0], "ui.inject_resize width")?.max(16);
-    let h = as_i32(&args[1], "ui.inject_resize height")?.max(16);
+    let raw_w = as_i32(&args[0], "ui.inject_resize width")?;
+    let raw_h = as_i32(&args[1], "ui.inject_resize height")?;
+    if raw_w > 4096 || raw_h > 4096 {
+        return Err("ui.inject_resize() width and height must not exceed 4096".to_string());
+    }
+    let w = raw_w.max(16);
+    let h = raw_h.max(16);
     UI_SESSION.with(|slot| {
         let mut borrow = slot.borrow_mut();
         let sess = borrow
             .as_mut()
             .ok_or_else(|| "No active ui.window".to_string())?;
-        sess.width = w.max(sess.min_width);
-        sess.height = h.max(sess.min_height);
+        let new_w = w.clamp(sess.min_width.clamp(1, 4096), 4096);
+        let new_h = h.clamp(sess.min_height.clamp(1, 4096), 4096);
+        let new_bytes = (new_w as usize)
+            .saturating_mul(new_h as usize)
+            .saturating_mul(std::mem::size_of::<u32>());
+        let old_bytes = sess.buffer.len().saturating_mul(std::mem::size_of::<u32>());
+        if new_bytes > old_bytes {
+            vm.charge_alloc(new_bytes - old_bytes)?;
+        }
+        sess.width = new_w;
+        sess.height = new_h;
         emit_event(&mut sess.events, "resize", "window", None);
         Ok(Value::Unit)
     })
@@ -2110,8 +2224,8 @@ mod win32_ui {
                     b.closed = false;
                 }
                 if let Some((w, h)) = b.resized.take() {
-                    sess.width = w.max(sess.min_width);
-                    sess.height = h.max(sess.min_height);
+                    sess.width = w.clamp(sess.min_width.clamp(1, 4096), 4096);
+                    sess.height = h.clamp(sess.min_height.clamp(1, 4096), 4096);
                     emit_event(&mut sess.events, "resize", "window", None);
                 }
                 if let Some((mx, my)) = b.mouse_pos.take() {
@@ -2127,6 +2241,10 @@ mod win32_ui {
         }
 
         pub fn present(&self, sess: &UiSession) -> Result<(), String> {
+            let needed = (sess.width.max(0) as usize).saturating_mul(sess.height.max(0) as usize);
+            if sess.width <= 0 || sess.height <= 0 || sess.buffer.len() < needed {
+                return Ok(());
+            }
             unsafe {
                 let hdc = GetDC(self.hwnd);
                 if hdc.is_null() {

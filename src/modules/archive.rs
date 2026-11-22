@@ -33,11 +33,15 @@ fn validate_entry_name(name: &str) -> Result<String, String> {
         return Err(format!("Unsafe archive entry path '{}'", name));
     }
     let norm = name.replace('\\', "/");
-    if norm.len() >= 2 && norm.as_bytes()[1] == b':' {
-        return Err(format!("Unsafe archive drive path '{}'", name));
+    if norm.contains(':') || norm.starts_with("//") {
+        return Err(format!("Unsafe archive entry path '{}'", name));
     }
-    for part in norm.split('/') {
-        if part == ".." || part == "." && norm == "." {
+    let check_norm = norm.strip_suffix('/').unwrap_or(&norm);
+    if check_norm.is_empty() {
+        return Err(format!("Unsafe archive entry path '{}'", name));
+    }
+    for part in check_norm.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
             return Err(format!("Archive path traversal blocked: '{}'", name));
         }
     }
@@ -45,26 +49,51 @@ fn validate_entry_name(name: &str) -> Result<String, String> {
 }
 
 fn build_zip_bytes(vm: &mut VM, entries: &HashMap<String, Value>) -> Result<Vec<u8>, String> {
+    if entries.len() > u16::MAX as usize {
+        return Err("archive.pack() entry count exceeds ZIP limit (65535)".to_string());
+    }
     let mut keys: Vec<&String> = entries.keys().collect();
     keys.sort();
     let mut out = Vec::new();
     let mut central = Vec::new();
 
-    for key in keys {
+    for (idx, key) in keys.iter().enumerate() {
+        if (idx & 63) == 0 {
+            vm.check_timeout()?;
+        }
         let name = validate_entry_name(key)?;
-        let raw = entries[key].as_bytes_cow("archive.pack")?;
+        let raw = entries[*key].as_bytes_cow("archive.pack")?;
+        vm.charge_work((raw.len() as u64) / 32 + 1)?;
         let crc = crc32_bytes(&raw);
-        let uncomp_len = raw.len() as u32;
+        let uncomp_len = u32::try_from(raw.len())
+            .map_err(|_| "archive.pack() entry exceeds 4 GiB ZIP limit".to_string())?;
         let deflated = deflate_raw(&raw);
         let (method, payload): (u16, &[u8]) = if deflated.len() < raw.len() {
             (8, &deflated)
         } else {
             (0, &raw)
         };
-        let comp_len = payload.len() as u32;
-        let offset = out.len() as u32;
+        let comp_len = u32::try_from(payload.len())
+            .map_err(|_| "archive.pack() compressed entry exceeds 4 GiB ZIP limit".to_string())?;
+        let offset = u32::try_from(out.len())
+            .map_err(|_| "archive.pack() archive offset exceeds 4 GiB ZIP limit".to_string())?;
         let name_bytes = name.as_bytes();
-        let name_len = name_bytes.len() as u16;
+        let name_len = u16::try_from(name_bytes.len())
+            .map_err(|_| "archive.pack() entry name exceeds 65535 bytes".to_string())?;
+
+        let add_bytes = 30usize
+            .saturating_add(46)
+            .saturating_add(name_bytes.len().saturating_mul(2))
+            .saturating_add(payload.len());
+        if out
+            .len()
+            .saturating_add(central.len())
+            .saturating_add(add_bytes)
+            > DEFAULT_MAX_DECOMPRESS.saturating_mul(4)
+        {
+            return Err("archive.pack() exceeds maximum archive size limit".to_string());
+        }
+        vm.charge_alloc(add_bytes)?;
 
         // Local file header
         out.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
@@ -102,9 +131,12 @@ fn build_zip_bytes(vm: &mut VM, entries: &HashMap<String, Value>) -> Result<Vec<
         central.extend_from_slice(name_bytes);
     }
 
-    let cd_offset = out.len() as u32;
-    let cd_size = central.len() as u32;
-    let count = entries.len() as u16;
+    let cd_offset = u32::try_from(out.len())
+        .map_err(|_| "archive.pack() central directory offset exceeds 4 GiB limit".to_string())?;
+    let cd_size = u32::try_from(central.len())
+        .map_err(|_| "archive.pack() central directory exceeds 4 GiB limit".to_string())?;
+    let count = u16::try_from(entries.len())
+        .map_err(|_| "archive.pack() entry count exceeds ZIP limit".to_string())?;
     out.extend_from_slice(&central);
 
     // EOCD
@@ -117,7 +149,6 @@ fn build_zip_bytes(vm: &mut VM, entries: &HashMap<String, Value>) -> Result<Vec<
     out.extend_from_slice(&cd_offset.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
 
-    vm.charge_alloc(out.len())?;
     Ok(out)
 }
 
@@ -130,7 +161,7 @@ struct ZipEntryMeta {
     local_header_off: usize,
 }
 
-fn parse_zip_cd(data: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
+fn parse_zip_cd(vm: &mut VM, data: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
     if data.len() < 22 {
         return Err("Not a valid ZIP archive (too short)".to_string());
     }
@@ -146,17 +177,25 @@ fn parse_zip_cd(data: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
     let total_entries = u16::from_le_bytes([data[eocd + 10], data[eocd + 11]]) as usize;
     let cd_size = u32::from_le_bytes(data[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
     let cd_off = u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
-    if cd_off.saturating_add(cd_size) > eocd {
-        return Err("Invalid ZIP central directory bounds".to_string());
-    }
+    let cd_end = cd_off
+        .checked_add(cd_size)
+        .filter(|&end| end <= eocd)
+        .ok_or_else(|| "Invalid ZIP central directory bounds".to_string())?;
     if total_entries > 20_000 {
         return Err("ZIP entry count exceeds 20,000 limit".to_string());
     }
+    vm.charge_alloc(total_entries.saturating_mul(std::mem::size_of::<ZipEntryMeta>()))?;
+    vm.charge_work((total_entries as u64) / 8 + 1)?;
 
     let mut pos = cd_off;
     let mut out = Vec::with_capacity(total_entries);
-    for _ in 0..total_entries {
-        if pos + 46 > cd_off + cd_size || data[pos..pos + 4] != [0x50, 0x4B, 0x01, 0x02] {
+    for i in 0..total_entries {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        if pos.checked_add(46).is_none_or(|p| p > cd_end)
+            || data[pos..pos + 4] != [0x50, 0x4B, 0x01, 0x02]
+        {
             return Err("Corrupt ZIP central directory entry".to_string());
         }
         let method = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
@@ -168,10 +207,13 @@ fn parse_zip_cd(data: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
         let cmt_len = u16::from_le_bytes([data[pos + 32], data[pos + 33]]) as usize;
         let local_header_off =
             u32::from_le_bytes(data[pos + 42..pos + 46].try_into().unwrap()) as usize;
-        let header_end = pos + 46 + name_len + extra_len + cmt_len;
-        if header_end > cd_off + cd_size {
-            return Err("ZIP central directory entry truncated".to_string());
-        }
+        let header_end = pos
+            .checked_add(46)
+            .and_then(|p| p.checked_add(name_len))
+            .and_then(|p| p.checked_add(extra_len))
+            .and_then(|p| p.checked_add(cmt_len))
+            .filter(|&end| end <= cd_end)
+            .ok_or_else(|| "ZIP central directory entry truncated".to_string())?;
         let raw_name = std::str::from_utf8(&data[pos + 46..pos + 46 + name_len])
             .map_err(|_| "ZIP entry filename is not valid UTF-8".to_string())?;
         let name = validate_entry_name(raw_name)?;
@@ -201,23 +243,29 @@ fn read_zip_entry_bytes(
         ));
     }
     let lh = meta.local_header_off;
-    if lh + 30 > data.len() || data[lh..lh + 4] != [0x50, 0x4B, 0x03, 0x04] {
+    if lh.checked_add(30).is_none_or(|p| p > data.len())
+        || data[lh..lh + 4] != [0x50, 0x4B, 0x03, 0x04]
+    {
         return Err(format!("Corrupt local header for '{}'", meta.name));
     }
     let name_len = u16::from_le_bytes([data[lh + 26], data[lh + 27]]) as usize;
     let extra_len = u16::from_le_bytes([data[lh + 28], data[lh + 29]]) as usize;
-    let payload_start = lh + 30 + name_len + extra_len;
-    let payload_end = payload_start.saturating_add(meta.comp_size);
-    if payload_end > data.len() {
-        return Err(format!("Truncated payload for '{}'", meta.name));
-    }
+    let payload_start = lh
+        .checked_add(30)
+        .and_then(|p| p.checked_add(name_len))
+        .and_then(|p| p.checked_add(extra_len))
+        .ok_or_else(|| format!("Corrupt local header bounds for '{}'", meta.name))?;
+    let payload_end = payload_start
+        .checked_add(meta.comp_size)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| format!("Truncated payload for '{}'", meta.name))?;
     let payload = &data[payload_start..payload_end];
     let out = match meta.method {
         0 => {
             vm.charge_alloc(payload.len())?;
             payload.to_vec()
         }
-        8 => inflate_raw(payload, max_entry.min(meta.uncomp_size.max(4096)), Some(vm))?,
+        8 => inflate_raw(payload, max_entry.min(meta.uncomp_size), Some(vm))?,
         other => {
             return Err(format!(
                 "Unsupported ZIP compression method {} for '{}'",
@@ -231,15 +279,43 @@ fn read_zip_entry_bytes(
     Ok(out)
 }
 
-fn read_archive_source(vm: &mut VM, arg: &Value) -> Result<Vec<u8>, String> {
+fn read_archive_source<'a>(
+    vm: &mut VM,
+    arg: &'a Value,
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
     match arg {
-        Value::Bytes(b) => Ok((**b).clone()),
+        Value::Bytes(b) => Ok(std::borrow::Cow::Borrowed(b.as_slice())),
         Value::Str(path) => {
+            use std::io::Read;
             let resolved = vm.resolve_read_path(path)?;
-            let data =
-                fs::read(&resolved).map_err(|e| format!("archive read '{}': {}", path, e))?;
-            vm.charge_io(data.len())?;
-            Ok(data)
+            let file =
+                fs::File::open(&resolved).map_err(|e| format!("archive read '{}': {}", path, e))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("archive read '{}': {}", path, e))?;
+            if !meta.is_file() {
+                return Err(format!("archive read '{}': not a regular file", path));
+            }
+            if meta.len() > DEFAULT_MAX_DECOMPRESS as u64 {
+                return Err(format!(
+                    "archive read '{}': exceeds {} byte limit",
+                    path, DEFAULT_MAX_DECOMPRESS
+                ));
+            }
+            let expected = meta.len() as usize;
+            vm.charge_io(expected)?;
+            vm.charge_alloc(expected)?;
+            let mut data = Vec::with_capacity(expected);
+            file.take(DEFAULT_MAX_DECOMPRESS as u64 + 1)
+                .read_to_end(&mut data)
+                .map_err(|e| format!("archive read '{}': {}", path, e))?;
+            if data.len() > DEFAULT_MAX_DECOMPRESS {
+                return Err(format!(
+                    "archive read '{}': exceeds {} byte limit",
+                    path, DEFAULT_MAX_DECOMPRESS
+                ));
+            }
+            Ok(std::borrow::Cow::Owned(data))
         }
         other => Err(format!(
             "archive expects path string or bytes, got '{}'",
@@ -271,6 +347,7 @@ fn archive_create(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("archive.create() second argument must be a dict".to_string());
     };
     let resolved = vm.resolve_write_path(path)?;
+    crate::modules::fs::check_safe_write_target(vm, &resolved, path)?;
     let map = dict_rc.borrow().clone();
     let bytes = build_zip_bytes(vm, &map)?;
     vm.charge_io(bytes.len())?;
@@ -283,7 +360,8 @@ fn archive_list(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("archive.list() expects 1 argument (zip_path or bytes)".to_string());
     }
     let data = read_archive_source(vm, &args[0])?;
-    let metas = parse_zip_cd(&data)?;
+    let metas = parse_zip_cd(vm, &data)?;
+    vm.charge_alloc(metas.len().saturating_mul(128))?;
     let out: Vec<Value> = metas
         .into_iter()
         .map(|m| {
@@ -298,7 +376,6 @@ fn archive_list(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             Value::Dict(Rc::new(RefCell::new(map)))
         })
         .collect();
-    vm.charge_alloc(out.len().saturating_mul(64))?;
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
@@ -311,12 +388,31 @@ fn archive_read_entry(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
     let norm_target = validate_entry_name(target)?;
     let data = read_archive_source(vm, &args[0])?;
-    let metas = parse_zip_cd(&data)?;
+    let metas = parse_zip_cd(vm, &data)?;
     let Some(meta) = metas.into_iter().find(|m| m.name == norm_target) else {
         return Err(format!("ZIP entry '{}' not found", norm_target));
     };
     let bytes = read_zip_entry_bytes(vm, &data, &meta, DEFAULT_MAX_DECOMPRESS)?;
     Ok(Value::Bytes(Rc::new(bytes)))
+}
+
+fn ensure_no_symlink_components(
+    root: &std::path::Path,
+    rel_name: &str,
+) -> Result<std::path::PathBuf, String> {
+    let mut cur = root.to_path_buf();
+    for part in rel_name.split('/') {
+        cur.push(part);
+        if let Ok(meta) = fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing to traverse or overwrite symlink '{}'",
+                    rel_name
+                ));
+            }
+        }
+    }
+    Ok(cur)
 }
 
 fn archive_extract(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -327,23 +423,50 @@ fn archive_extract(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("archive.extract() dest_dir must be a string".to_string());
     };
     let dest_root = vm.resolve_write_path(dest_dir)?;
+    if let Ok(meta) = fs::symlink_metadata(&dest_root) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "archive.extract() dest_dir '{}' cannot be a symlink",
+                dest_dir
+            ));
+        }
+    }
     fs::create_dir_all(&dest_root)
         .map_err(|e| format!("archive.extract() mkdir '{}': {}", dest_dir, e))?;
+    let canon_dest_root = fs::canonicalize(&dest_root)
+        .map_err(|e| format!("archive.extract() canonicalize '{}': {}", dest_dir, e))?;
 
     let data = read_archive_source(vm, &args[0])?;
-    let metas = parse_zip_cd(&data)?;
+    let metas = parse_zip_cd(vm, &data)?;
     let mut total_written = 0usize;
     let mut files_count = 0i64;
 
-    for meta in metas {
+    for (idx, meta) in metas.into_iter().enumerate() {
+        if (idx & 63) == 0 {
+            vm.check_timeout()?;
+        }
         if meta.name.ends_with('/') {
             continue;
         }
         let joined = PathBuf::from(dest_dir).join(&meta.name);
         let joined_str = joined.to_string_lossy().to_string();
         let target_path = vm.resolve_write_path(&joined_str)?;
-        if let Some(parent) = target_path.parent() {
+        crate::modules::fs::check_safe_write_target(vm, &target_path, &meta.name)?;
+        let checked_rel = ensure_no_symlink_components(&dest_root, &meta.name)?;
+        if let Some(parent) = checked_rel.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            let canon_parent = fs::canonicalize(parent).map_err(|e| e.to_string())?;
+            if !canon_parent.starts_with(&canon_dest_root) {
+                return Err(format!(
+                    "Archive extraction path '{}' escapes destination directory",
+                    meta.name
+                ));
+            }
+        }
+        if let Ok(tmeta) = fs::symlink_metadata(&target_path) {
+            if tmeta.file_type().is_symlink() {
+                return Err(format!("Refusing to overwrite symlink '{}'", meta.name));
+            }
         }
         let bytes = read_zip_entry_bytes(
             vm,

@@ -42,22 +42,33 @@ enum Endian {
     Big,
 }
 
+#[derive(Clone, Copy)]
 enum FmtOp {
-    I8,
-    U8,
-    I16,
-    U16,
-    I32,
-    U32,
-    I64,
-    U64,
-    F32,
-    F64,
+    I8(usize),
+    U8(usize),
+    I16(usize),
+    U16(usize),
+    I32(usize),
+    U32(usize),
+    I64(usize),
+    U64(usize),
+    F32(usize),
+    F64(usize),
     FixedBytes(usize),
     Pad(usize),
 }
 
-fn parse_format(fmt: &str) -> Result<(Endian, Vec<FmtOp>), String> {
+const MAX_BINARY_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BINARY_TOTAL_VALS: usize = 1_048_576;
+
+struct ParsedFmt {
+    endian: Endian,
+    ops: Vec<FmtOp>,
+    total_bytes: usize,
+    total_vals: usize,
+}
+
+fn parse_format(fmt: &str) -> Result<ParsedFmt, String> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0usize;
     let endian = match chars.first().copied() {
@@ -81,6 +92,8 @@ fn parse_format(fmt: &str) -> Result<(Endian, Vec<FmtOp>), String> {
     };
 
     let mut ops = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut total_vals = 0usize;
     while i < chars.len() {
         if chars[i].is_whitespace() {
             i += 1;
@@ -104,23 +117,44 @@ fn parse_format(fmt: &str) -> Result<(Endian, Vec<FmtOp>), String> {
             return Err("Trailing count without format specifier".to_string());
         };
         i += 1;
-        match code {
-            's' => ops.push(FmtOp::FixedBytes(repeat)),
-            'x' => ops.push(FmtOp::Pad(repeat)),
-            'b' => ops.extend((0..repeat).map(|_| FmtOp::I8)),
-            'B' => ops.extend((0..repeat).map(|_| FmtOp::U8)),
-            'h' => ops.extend((0..repeat).map(|_| FmtOp::I16)),
-            'H' => ops.extend((0..repeat).map(|_| FmtOp::U16)),
-            'i' => ops.extend((0..repeat).map(|_| FmtOp::I32)),
-            'I' => ops.extend((0..repeat).map(|_| FmtOp::U32)),
-            'q' => ops.extend((0..repeat).map(|_| FmtOp::I64)),
-            'Q' => ops.extend((0..repeat).map(|_| FmtOp::U64)),
-            'f' => ops.extend((0..repeat).map(|_| FmtOp::F32)),
-            'd' => ops.extend((0..repeat).map(|_| FmtOp::F64)),
+        let (op, elem_size, consumes_vals) = match code {
+            's' => (FmtOp::FixedBytes(repeat), repeat, 1usize),
+            'x' => (FmtOp::Pad(repeat), repeat, 0usize),
+            'b' => (FmtOp::I8(repeat), 1, repeat),
+            'B' => (FmtOp::U8(repeat), 1, repeat),
+            'h' => (FmtOp::I16(repeat), 2, repeat),
+            'H' => (FmtOp::U16(repeat), 2, repeat),
+            'i' => (FmtOp::I32(repeat), 4, repeat),
+            'I' => (FmtOp::U32(repeat), 4, repeat),
+            'q' => (FmtOp::I64(repeat), 8, repeat),
+            'Q' => (FmtOp::U64(repeat), 8, repeat),
+            'f' => (FmtOp::F32(repeat), 4, repeat),
+            'd' => (FmtOp::F64(repeat), 8, repeat),
             other => return Err(format!("Unknown binary format code '{}'", other)),
-        }
+        };
+        let add_bytes = if matches!(code, 's' | 'x') {
+            elem_size
+        } else {
+            elem_size
+                .checked_mul(repeat)
+                .ok_or_else(|| "binary format total size overflow".to_string())?
+        };
+        total_bytes = total_bytes
+            .checked_add(add_bytes)
+            .filter(|&b| b <= MAX_BINARY_TOTAL_BYTES)
+            .ok_or_else(|| "binary format total output size exceeds 32 MiB cap".to_string())?;
+        total_vals = total_vals
+            .checked_add(consumes_vals)
+            .filter(|&v| v <= MAX_BINARY_TOTAL_VALS)
+            .ok_or_else(|| "binary format value count exceeds safety cap".to_string())?;
+        ops.push(op);
     }
-    Ok((endian, ops))
+    Ok(ParsedFmt {
+        endian,
+        ops,
+        total_bytes,
+        total_vals,
+    })
 }
 
 fn expect_int(v: &Value, ctx: &str) -> Result<i64, String> {
@@ -156,7 +190,7 @@ fn bin_pack(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let Value::Str(fmt) = &args[0] else {
         return Err("binary.pack() first argument must be format string".to_string());
     };
-    let (endian, ops) = parse_format(fmt)?;
+    let parsed = parse_format(fmt)?;
     let vals = if args.len() == 2 && matches!(&args[1], Value::List(_)) {
         if let Value::List(l) = &args[1] {
             l.borrow().clone()
@@ -167,65 +201,85 @@ fn bin_pack(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         args[1..].to_vec()
     };
 
-    let expected = ops.iter().filter(|op| !matches!(op, FmtOp::Pad(_))).count();
-    if vals.len() != expected {
+    if vals.len() != parsed.total_vals {
         return Err(format!(
             "binary.pack() expects {} value(s) for format '{}', got {}",
-            expected,
+            parsed.total_vals,
             fmt,
             vals.len()
         ));
     }
 
-    let mut out = Vec::new();
+    vm.charge_alloc(parsed.total_bytes)?;
+    vm.charge_work((parsed.total_bytes as u64 / 32).max(1))?;
+    let mut out = Vec::with_capacity(parsed.total_bytes);
     let mut vi = 0usize;
-    for op in ops {
+    let endian = parsed.endian;
+    for op in parsed.ops {
         match op {
             FmtOp::Pad(n) => out.resize(out.len() + n, 0),
-            FmtOp::I8 => {
-                let v = expect_int(&vals[vi], "binary.pack(b)")?;
-                vi += 1;
-                out.push((v as i8) as u8);
+            FmtOp::I8(rep) => {
+                for _ in 0..rep {
+                    let v = expect_int(&vals[vi], "binary.pack(b)")?;
+                    vi += 1;
+                    out.push((v as i8) as u8);
+                }
             }
-            FmtOp::U8 => {
-                let v = expect_int(&vals[vi], "binary.pack(B)")?;
-                vi += 1;
-                out.push(v as u8);
+            FmtOp::U8(rep) => {
+                for _ in 0..rep {
+                    let v = expect_int(&vals[vi], "binary.pack(B)")?;
+                    vi += 1;
+                    out.push(v as u8);
+                }
             }
-            FmtOp::I16 => {
-                let v = expect_int(&vals[vi], "binary.pack(h)")?;
-                vi += 1;
-                push_ordered(&mut out, &(v as i16).to_le_bytes(), endian);
+            FmtOp::I16(rep) => {
+                for _ in 0..rep {
+                    let v = expect_int(&vals[vi], "binary.pack(h)")?;
+                    vi += 1;
+                    push_ordered(&mut out, &(v as i16).to_le_bytes(), endian);
+                }
             }
-            FmtOp::U16 => {
-                let v = expect_int(&vals[vi], "binary.pack(H)")?;
-                vi += 1;
-                push_ordered(&mut out, &(v as u16).to_le_bytes(), endian);
+            FmtOp::U16(rep) => {
+                for _ in 0..rep {
+                    let v = expect_int(&vals[vi], "binary.pack(H)")?;
+                    vi += 1;
+                    push_ordered(&mut out, &(v as u16).to_le_bytes(), endian);
+                }
             }
-            FmtOp::I32 => {
-                let v = expect_int(&vals[vi], "binary.pack(i)")?;
-                vi += 1;
-                push_ordered(&mut out, &(v as i32).to_le_bytes(), endian);
+            FmtOp::I32(rep) => {
+                for _ in 0..rep {
+                    let v = expect_int(&vals[vi], "binary.pack(i)")?;
+                    vi += 1;
+                    push_ordered(&mut out, &(v as i32).to_le_bytes(), endian);
+                }
             }
-            FmtOp::U32 => {
-                let v = expect_int(&vals[vi], "binary.pack(I)")?;
-                vi += 1;
-                push_ordered(&mut out, &(v as u32).to_le_bytes(), endian);
+            FmtOp::U32(rep) => {
+                for _ in 0..rep {
+                    let v = expect_int(&vals[vi], "binary.pack(I)")?;
+                    vi += 1;
+                    push_ordered(&mut out, &(v as u32).to_le_bytes(), endian);
+                }
             }
-            FmtOp::I64 | FmtOp::U64 => {
-                let v = expect_int(&vals[vi], "binary.pack(q)")?;
-                vi += 1;
-                push_ordered(&mut out, &v.to_le_bytes(), endian);
+            FmtOp::I64(rep) | FmtOp::U64(rep) => {
+                for _ in 0..rep {
+                    let v = expect_int(&vals[vi], "binary.pack(q)")?;
+                    vi += 1;
+                    push_ordered(&mut out, &v.to_le_bytes(), endian);
+                }
             }
-            FmtOp::F32 => {
-                let v = expect_float(&vals[vi], "binary.pack(f)")? as f32;
-                vi += 1;
-                push_ordered(&mut out, &v.to_le_bytes(), endian);
+            FmtOp::F32(rep) => {
+                for _ in 0..rep {
+                    let v = expect_float(&vals[vi], "binary.pack(f)")? as f32;
+                    vi += 1;
+                    push_ordered(&mut out, &v.to_le_bytes(), endian);
+                }
             }
-            FmtOp::F64 => {
-                let v = expect_float(&vals[vi], "binary.pack(d)")?;
-                vi += 1;
-                push_ordered(&mut out, &v.to_le_bytes(), endian);
+            FmtOp::F64(rep) => {
+                for _ in 0..rep {
+                    let v = expect_float(&vals[vi], "binary.pack(d)")?;
+                    vi += 1;
+                    push_ordered(&mut out, &v.to_le_bytes(), endian);
+                }
             }
             FmtOp::FixedBytes(n) => {
                 let raw = vals[vi].as_bytes_cow("binary.pack(s)")?;
@@ -236,7 +290,6 @@ fn bin_pack(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             }
         }
     }
-    vm.charge_alloc(out.len())?;
     Ok(Value::Bytes(Rc::new(out)))
 }
 
@@ -246,10 +299,7 @@ fn slice_bytes<'a>(args: &'a [Value], ctx: &str) -> Result<(&'a [u8], usize), St
     }
     let offset = if args.len() == 2 {
         let i = expect_int(&args[1], ctx)?;
-        if i < 0 {
-            return Err(format!("{} offset must be >= 0", ctx));
-        }
-        i as usize
+        usize::try_from(i).map_err(|_| format!("{} offset out of range", ctx))?
     } else {
         0
     };
@@ -270,79 +320,96 @@ fn bin_unpack(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let Value::Str(fmt) = &args[0] else {
         return Err("binary.unpack() format must be a string".to_string());
     };
-    let (endian, ops) = parse_format(fmt)?;
+    let parsed = parse_format(fmt)?;
     let raw = args[1].as_bytes_cow("binary.unpack")?;
-    let mut off = 0usize;
-    let mut out = Vec::new();
-    for op in ops {
-        let need = match op {
-            FmtOp::Pad(n) | FmtOp::FixedBytes(n) => n,
-            FmtOp::I8 | FmtOp::U8 => 1,
-            FmtOp::I16 | FmtOp::U16 => 2,
-            FmtOp::I32 | FmtOp::U32 | FmtOp::F32 => 4,
-            FmtOp::I64 | FmtOp::U64 | FmtOp::F64 => 8,
-        };
-        if off + need > raw.len() {
-            return Err(format!(
-                "binary.unpack(): buffer too short (need {} bytes at offset {}, len {})",
-                need,
-                off,
-                raw.len()
-            ));
-        }
-        let s = &raw[off..off + need];
-        off += need;
-        let val = match op {
-            FmtOp::Pad(_) => continue,
-            FmtOp::I8 => Value::Int((s[0] as i8) as i64),
-            FmtOp::U8 => Value::Int(s[0] as i64),
-            FmtOp::I16 => Value::Int(match endian {
-                Endian::Little => i16::from_le_bytes([s[0], s[1]]) as i64,
-                Endian::Big => i16::from_be_bytes([s[0], s[1]]) as i64,
-            }),
-            FmtOp::U16 => Value::Int(match endian {
-                Endian::Little => u16::from_le_bytes([s[0], s[1]]) as i64,
-                Endian::Big => u16::from_be_bytes([s[0], s[1]]) as i64,
-            }),
-            FmtOp::I32 => Value::Int(match endian {
-                Endian::Little => i32::from_le_bytes(s.try_into().unwrap()) as i64,
-                Endian::Big => i32::from_be_bytes(s.try_into().unwrap()) as i64,
-            }),
-            FmtOp::U32 => Value::Int(match endian {
-                Endian::Little => u32::from_le_bytes(s.try_into().unwrap()) as i64,
-                Endian::Big => u32::from_be_bytes(s.try_into().unwrap()) as i64,
-            }),
-            FmtOp::I64 | FmtOp::U64 => Value::Int(match endian {
-                Endian::Little => i64::from_le_bytes(s.try_into().unwrap()),
-                Endian::Big => i64::from_be_bytes(s.try_into().unwrap()),
-            }),
-            FmtOp::F32 => Value::Float(match endian {
-                Endian::Little => f32::from_le_bytes(s.try_into().unwrap()) as f64,
-                Endian::Big => f32::from_be_bytes(s.try_into().unwrap()) as f64,
-            }),
-            FmtOp::F64 => Value::Float(match endian {
-                Endian::Little => f64::from_le_bytes(s.try_into().unwrap()),
-                Endian::Big => f64::from_be_bytes(s.try_into().unwrap()),
-            }),
-            FmtOp::FixedBytes(_) => Value::Bytes(Rc::new(s.to_vec())),
-        };
-        out.push(val);
+    if raw.len() < parsed.total_bytes {
+        return Err(format!(
+            "binary.unpack(): buffer too short (need {} bytes, got {})",
+            parsed.total_bytes,
+            raw.len()
+        ));
     }
-    vm.charge_alloc(out.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    vm.charge_alloc(
+        parsed
+            .total_vals
+            .saturating_mul(std::mem::size_of::<Value>()),
+    )?;
+    vm.charge_work((parsed.total_bytes as u64 / 32).max(1))?;
+    let mut off = 0usize;
+    let mut out = Vec::with_capacity(parsed.total_vals);
+    let endian = parsed.endian;
+    for op in parsed.ops {
+        let (unit, rep, is_bytes, is_pad) = match op {
+            FmtOp::Pad(n) => (n, 1, false, true),
+            FmtOp::FixedBytes(n) => (n, 1, true, false),
+            FmtOp::I8(rep) | FmtOp::U8(rep) => (1, rep, false, false),
+            FmtOp::I16(rep) | FmtOp::U16(rep) => (2, rep, false, false),
+            FmtOp::I32(rep) | FmtOp::U32(rep) | FmtOp::F32(rep) => (4, rep, false, false),
+            FmtOp::I64(rep) | FmtOp::U64(rep) | FmtOp::F64(rep) => (8, rep, false, false),
+        };
+        if is_pad {
+            off += unit;
+            continue;
+        }
+        if is_bytes {
+            let s = &raw[off..off + unit];
+            off += unit;
+            vm.charge_alloc(s.len())?;
+            out.push(Value::Bytes(Rc::new(s.to_vec())));
+            continue;
+        }
+        for idx in 0..rep {
+            if (idx & 1023) == 0 {
+                vm.check_timeout()?;
+            }
+            let s = &raw[off..off + unit];
+            off += unit;
+            let val = match op {
+                FmtOp::I8(_) => Value::Int((s[0] as i8) as i64),
+                FmtOp::U8(_) => Value::Int(s[0] as i64),
+                FmtOp::I16(_) => Value::Int(match endian {
+                    Endian::Little => i16::from_le_bytes([s[0], s[1]]) as i64,
+                    Endian::Big => i16::from_be_bytes([s[0], s[1]]) as i64,
+                }),
+                FmtOp::U16(_) => Value::Int(match endian {
+                    Endian::Little => u16::from_le_bytes([s[0], s[1]]) as i64,
+                    Endian::Big => u16::from_be_bytes([s[0], s[1]]) as i64,
+                }),
+                FmtOp::I32(_) => Value::Int(match endian {
+                    Endian::Little => i32::from_le_bytes(s.try_into().unwrap()) as i64,
+                    Endian::Big => i32::from_be_bytes(s.try_into().unwrap()) as i64,
+                }),
+                FmtOp::U32(_) => Value::Int(match endian {
+                    Endian::Little => u32::from_le_bytes(s.try_into().unwrap()) as i64,
+                    Endian::Big => u32::from_be_bytes(s.try_into().unwrap()) as i64,
+                }),
+                FmtOp::I64(_) | FmtOp::U64(_) => Value::Int(match endian {
+                    Endian::Little => i64::from_le_bytes(s.try_into().unwrap()),
+                    Endian::Big => i64::from_be_bytes(s.try_into().unwrap()),
+                }),
+                FmtOp::F32(_) => Value::Float(match endian {
+                    Endian::Little => f32::from_le_bytes(s.try_into().unwrap()) as f64,
+                    Endian::Big => f32::from_be_bytes(s.try_into().unwrap()) as f64,
+                }),
+                FmtOp::F64(_) => Value::Float(match endian {
+                    Endian::Little => f64::from_le_bytes(s.try_into().unwrap()),
+                    Endian::Big => f64::from_be_bytes(s.try_into().unwrap()),
+                }),
+                FmtOp::Pad(_) | FmtOp::FixedBytes(_) => unreachable!(),
+            };
+            out.push(val);
+        }
+    }
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
 fn read_n<const N: usize>(args: &[Value], ctx: &str) -> Result<[u8; N], String> {
     let (b, off) = slice_bytes(args, ctx)?;
-    if off + N > b.len() {
-        return Err(format!(
-            "{} offset {} out of range (len {})",
-            ctx,
-            off,
-            b.len()
-        ));
-    }
-    Ok(b[off..off + N].try_into().unwrap())
+    let end = off
+        .checked_add(N)
+        .filter(|&e| e <= b.len())
+        .ok_or_else(|| format!("{} offset {} out of range (len {})", ctx, off, b.len()))?;
+    Ok(b[off..end].try_into().unwrap())
 }
 
 fn read_u16_le(_vm: &mut VM, a: &[Value]) -> Result<Value, String> {

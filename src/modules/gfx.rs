@@ -570,7 +570,7 @@ fn as_int(v: &Value, fn_name: &str) -> Result<i64, String> {
 }
 
 #[cfg(windows)]
-fn gfx_window(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn gfx_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err("gfx.window() expects 3 arguments (title, width, height)".to_string());
     }
@@ -588,6 +588,11 @@ fn gfx_window(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !(1..=4096).contains(&w) || !(1..=4096).contains(&h) {
         return Err("gfx.window() width and height must be between 1 and 4096".to_string());
     }
+    vm.charge_alloc(
+        (w as usize)
+            .saturating_mul(h as usize)
+            .saturating_mul(std::mem::size_of::<u32>()),
+    )?;
     win32_gfx::create_window(title, w as i32, h as i32)?;
     Ok(Value::Unit)
 }

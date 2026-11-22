@@ -152,7 +152,8 @@ fn mod_key_name(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("input.key_name() expects 1 integer argument (vk)".to_string());
     }
     let vk = match &args[0] {
-        Value::Int(i) => *i as i32,
+        Value::Int(i) if (0..=255).contains(i) => *i as i32,
+        Value::Int(_) => return Err("input.key_name() vk must be between 0 and 255".to_string()),
         other => {
             return Err(format!(
                 "input.key_name() expects int, got '{}'",

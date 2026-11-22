@@ -1,0 +1,296 @@
+import gfx;
+import math;
+
+pub fn point_in(mx, my, x, y, w, h) {
+    mx >= x && mx <= x + w && my >= y && my <= y + h
+}
+
+pub fn skin_palette(skin_idx) {
+    let idx = skin_idx % 4;
+    if idx == 0 {
+        return #{ name: "CYAN", r: 79, g: 195, b: 247 };
+    }
+    if idx == 1 {
+        return #{ name: "EMERALD", r: 63, g: 185, b: 80 };
+    }
+    if idx == 2 {
+        return #{ name: "CORAL", r: 244, g: 114, b: 128 };
+    }
+    #{ name: "GOLD", r: 245, g: 189, b: 65 }
+}
+
+pub fn diff_preset(diff_idx) {
+    let idx = diff_idx % 3;
+    if idx == 0 {
+        return #{ name: "EASY", speed_mul: 0.78, spawn_rate: 1.3, r: 63, g: 185, b: 80 };
+    }
+    if idx == 1 {
+        return #{ name: "NORMAL", speed_mul: 1.0, spawn_rate: 1.0, r: 79, g: 143, b: 247 };
+    }
+    #{ name: "HARD", speed_mul: 1.32, spawn_rate: 0.72, r: 235, g: 87, b: 87 }
+}
+
+pub fn draw_panel(x, y, w, h, r, g, b) {
+    gfx.rect(x + 4, y + 4, w, h, 8, 10, 16);
+    gfx.rect(x, y, w, h, 22, 27, 38);
+    gfx.rect(x, y, w, 3, r, g, b);
+    gfx.rect_outline(x, y, w, h, 54, 65, 86);
+    // Corner accent ticks
+    gfx.rect(x, y, 10, 3, r, g, b);
+    gfx.rect(x + w - 10, y + h - 3, 10, 3, r, g, b);
+}
+
+pub fn draw_button(x, y, w, h, label, hovered, mouse_down, ar, ag, ab) {
+    let dy = if hovered && mouse_down { 2 } else { 0 };
+    let bg_r = if hovered { 38 } else { 28 };
+    let bg_g = if hovered { 46 } else { 34 };
+    let bg_b = if hovered { 64 } else { 47 };
+
+    gfx.rect(x + 3, y + 4, w, h, 7, 9, 14);
+    gfx.rect(x, y + dy, w, h, bg_r, bg_g, bg_b);
+    if hovered {
+        gfx.rect(x, y + dy, 6, h, ar, ag, ab);
+        gfx.rect_outline(x, y + dy, w, h, ar, ag, ab);
+    } else {
+        gfx.rect(x, y + dy, 4, h, int(ar * 0.7), int(ag * 0.7), int(ab * 0.7));
+        gfx.rect_outline(x, y + dy, w, h, 58, 69, 92);
+    }
+
+    let txt_x = x + int(w / 2) - len(label) * 4;
+    let txt_y = y + dy + int(h / 2) - 8;
+    if hovered {
+        gfx.text(txt_x, txt_y, label, 245, 248, 255);
+    } else {
+        gfx.text(txt_x, txt_y, label, 210, 220, 236);
+    }
+}
+
+pub fn draw_stars(stars) {
+    for s in stars {
+        let b = s["bright"];
+        if s["layer"] == 2 {
+            gfx.rect(int(s["x"]), int(s["y"]), 2, 2, b, b + 15, 255);
+        } else {
+            gfx.pixel(int(s["x"]), int(s["y"]), b, b, b + 20);
+        }
+    }
+}
+
+pub fn draw_ship(cx, cy, r, g, b, shield_on, tick) {
+    let x = int(cx);
+    let y = int(cy);
+    if shield_on {
+        let pulse = 20 + int(math.sin(tick * 8.0) * 2.0);
+        gfx.circle_outline(x, y, pulse, 85, 220, 255);
+        gfx.circle_outline(x, y, pulse - 3, 50, 160, 220);
+    }
+    // Engine glow
+    let flame = 10 + int((tick * 25.0) % 6.0);
+    gfx.line(x - 4, y + 10, x, y + 10 + flame, 255, 190, 60);
+    gfx.line(x + 4, y + 10, x, y + 10 + flame, 255, 140, 40);
+
+    // Outer wings & hull silhouette
+    gfx.line(x, y - 16, x - 14, y + 12, r, g, b);
+    gfx.line(x, y - 16, x + 14, y + 12, r, g, b);
+    gfx.line(x - 14, y + 12, x - 5, y + 8, r, g, b);
+    gfx.line(x + 14, y + 12, x + 5, y + 8, r, g, b);
+    gfx.line(x - 5, y + 8, x + 5, y + 8, r, g, b);
+    // Cockpit core
+    gfx.circle(x, y - 2, 4, 240, 248, 255);
+    gfx.circle(x, y - 2, 2, r, g, b);
+}
+
+pub fn draw_menu_screen(mx, my, mouse_down, just_clicked, diff_idx, skin_idx, st, stars, t) {
+    gfx.clear(13, 17, 24);
+    draw_stars(stars);
+
+    let skin = skin_palette(skin_idx);
+    let diff = diff_preset(diff_idx);
+
+    // Subtle grid backdrop lines
+    let gx = 40;
+    while gx < 800 {
+        gfx.line(gx, 0, gx, 600, 18, 23, 33);
+        gx += 80;
+    }
+
+    // Header Title Card
+    draw_panel(46, 36, 708, 92, skin["r"], skin["g"], skin["b"]);
+    gfx.text(72, 54, "ASKANE // NEON DODGE 2D", 236, 240, 246);
+    gfx.text(72, 82, "Dodge asteroids, farm Near-Miss combos & energy cores", 148, 158, 179);
+    gfx.text(560, 56, "BEST: " + str(st["best_score"]), 245, 189, 65);
+    gfx.text(560, 82, "RUNS: " + str(st["games_played"]), 148, 158, 179);
+
+    // Left Navigation Column (Buttons)
+    let bx = 56;
+    let bw = 310;
+    let bh = 50;
+
+    let h_play = point_in(mx, my, bx, 165, bw, bh);
+    draw_button(bx, 165, bw, bh, "PLAY MISSION", h_play, mouse_down, 63, 185, 80);
+
+    let h_diff = point_in(mx, my, bx, 230, bw, bh);
+    draw_button(bx, 230, bw, bh, "DIFFICULTY: " + diff["name"], h_diff, mouse_down, diff["r"], diff["g"], diff["b"]);
+
+    let h_skin = point_in(mx, my, bx, 295, bw, bh);
+    draw_button(bx, 295, bw, bh, "SHIP SKIN: " + skin["name"], h_skin, mouse_down, skin["r"], skin["g"], skin["b"]);
+
+    let h_stats = point_in(mx, my, bx, 360, bw, bh);
+    draw_button(bx, 360, bw, bh, "STATISTICS & HISTORY", h_stats, mouse_down, 79, 143, 247);
+
+    let h_quit = point_in(mx, my, bx, 425, bw, bh);
+    draw_button(bx, 425, bw, bh, "EXIT GAME", h_quit, mouse_down, 224, 82, 82);
+
+    // Right Preview & Pilot Telemetry Panel
+    draw_panel(402, 165, 344, 310, 79, 143, 247);
+    gfx.text(426, 184, "SHIP TELEMETRY PREVIEW", 148, 158, 179);
+    gfx.rect(426, 212, 296, 132, 14, 18, 26);
+    gfx.rect_outline(426, 212, 296, 132, 42, 50, 68);
+
+    let bob_y = 278.0 + math.sin(t * 3.0) * 8.0;
+    draw_ship(574, bob_y, skin["r"], skin["g"], skin["b"], true, t);
+
+    gfx.text(426, 362, "Controls: WASD / Arrows or Hold LMB", 210, 220, 236);
+    gfx.text(426, 388, "Pause: P / ESC", 148, 158, 179);
+    gfx.text(426, 420, "Best Time: " + str(st["best_time_sec"]) + "s  |  Max Combo: x" + str(st["best_combo"]), 79, 195, 247);
+    gfx.text(426, 444, "Total Cores: " + str(st["total_orbs"]) + "  |  Near Miss: " + str(st["total_near_misses"]), 245, 189, 65);
+
+    gfx.text(56, 548, "Askane v0.16.0  |  3-Module Example (stats.ask + ui.ask + main.ask)", 110, 122, 145);
+
+    if just_clicked {
+        if h_play { return "play"; }
+        if h_diff { return "diff"; }
+        if h_skin { return "skin"; }
+        if h_stats { return "stats"; }
+        if h_quit { return "quit"; }
+    }
+    ""
+}
+
+pub fn draw_stats_screen(mx, my, mouse_down, just_clicked, st, stars) {
+    gfx.clear(13, 17, 24);
+    draw_stars(stars);
+
+    draw_panel(46, 34, 708, 520, 79, 143, 247);
+    gfx.text(72, 56, "PILOT CAREER STATISTICS", 236, 240, 246);
+
+    // Summary stat boxes
+    gfx.rect(72, 92, 150, 72, 16, 20, 29);
+    gfx.rect_outline(72, 92, 150, 72, 50, 62, 84);
+    gfx.text(86, 104, "BEST SCORE", 148, 158, 179);
+    gfx.text(86, 130, str(st["best_score"]), 245, 189, 65);
+
+    gfx.rect(238, 92, 150, 72, 16, 20, 29);
+    gfx.rect_outline(238, 92, 150, 72, 50, 62, 84);
+    gfx.text(252, 104, "BEST TIME", 148, 158, 179);
+    gfx.text(252, 130, str(st["best_time_sec"]) + "s", 63, 185, 80);
+
+    gfx.rect(404, 92, 150, 72, 16, 20, 29);
+    gfx.rect_outline(404, 92, 150, 72, 50, 62, 84);
+    gfx.text(418, 104, "NEAR MISSES", 148, 158, 179);
+    gfx.text(418, 130, str(st["total_near_misses"]), 79, 195, 247);
+
+    gfx.rect(570, 92, 158, 72, 16, 20, 29);
+    gfx.rect_outline(570, 92, 158, 72, 50, 62, 84);
+    gfx.text(584, 104, "TOTAL GAMES", 148, 158, 179);
+    gfx.text(584, 130, str(st["games_played"]), 236, 240, 246);
+
+    gfx.text(72, 188, "RECENT MISSIONS (LAST 5)", 148, 158, 179);
+    gfx.rect(72, 214, 656, 245, 15, 19, 27);
+    gfx.rect_outline(72, 214, 656, 245, 45, 54, 72);
+
+    let hist = st["history"];
+    if len(hist) == 0 {
+        gfx.text(260, 326, "No runs recorded yet. Launch a mission!", 148, 158, 179);
+    } else {
+        let ry = 232;
+        let idx = 1;
+        for r in hist {
+            let line = "#" + str(idx) + " [" + r["rank"] + "]  Score: " + str(r["score"]) + "   Time: " + str(r["time_sec"]) + "s   Cores: " + str(r["orbs"]) + "   Near: " + str(r["near_misses"]) + "   (" + r["diff"] + ")";
+            let c_r = if r["rank"] == "S+" || r["rank"] == "S" { 245 } else { 215 };
+            let c_g = if r["rank"] == "S+" || r["rank"] == "S" { 189 } else { 225 };
+            let c_b = if r["rank"] == "S+" || r["rank"] == "S" { 65 } else { 240 };
+            gfx.text(92, ry, line, c_r, c_g, c_b);
+            gfx.line(88, ry + 26, 712, ry + 26, 30, 36, 50);
+            ry += 44;
+            idx += 1;
+        }
+    }
+
+    let h_back = point_in(mx, my, 72, 482, 200, 48);
+    draw_button(72, 482, 200, 48, "BACK TO MENU", h_back, mouse_down, 79, 143, 247);
+
+    let h_reset = point_in(mx, my, 528, 482, 200, 48);
+    draw_button(528, 482, 200, 48, "RESET RECORDS", h_reset, mouse_down, 224, 82, 82);
+
+    if just_clicked {
+        if h_back { return "back"; }
+        if h_reset { return "reset"; }
+    }
+    ""
+}
+
+pub fn draw_hud(score, best, combo, time_sec, shield_t, near_misses, diff_name) {
+    gfx.rect(0, 0, 800, 40, 16, 20, 28);
+    gfx.line(0, 40, 800, 40, 45, 56, 78);
+
+    gfx.text(16, 12, "SCORE: " + str(score), 236, 240, 246);
+    gfx.text(160, 12, "BEST: " + str(best), 148, 158, 179);
+    gfx.text(290, 12, "COMBO x" + str(combo), 245, 189, 65);
+    gfx.text(405, 12, "NEAR: " + str(near_misses), 79, 195, 247);
+    gfx.text(515, 12, "TIME: " + str(int(time_sec)) + "s", 63, 185, 80);
+    gfx.text(630, 12, diff_name, 148, 158, 179);
+
+    if shield_t > 0.0 {
+        let bar_w = int((shield_t / 4.5) * 90.0);
+        if bar_w > 90 { bar_w = 90; }
+        gfx.rect(695, 13, 90, 14, 28, 36, 52);
+        gfx.rect(695, 13, bar_w, 14, 85, 220, 255);
+        gfx.rect_outline(695, 13, 90, 14, 150, 235, 255);
+    }
+}
+
+pub fn draw_pause_overlay(mx, my, mouse_down, just_clicked) {
+    draw_panel(230, 180, 340, 230, 245, 189, 65);
+    gfx.text(350, 206, "GAME PAUSED", 245, 189, 65);
+
+    let h_res = point_in(mx, my, 270, 254, 260, 48);
+    draw_button(270, 254, 260, 48, "RESUME MISSION", h_res, mouse_down, 63, 185, 80);
+
+    let h_menu = point_in(mx, my, 270, 318, 260, 48);
+    draw_button(270, 318, 260, 48, "ABORT TO MENU", h_menu, mouse_down, 224, 82, 82);
+
+    if just_clicked {
+        if h_res { return "resume"; }
+        if h_menu { return "menu"; }
+    }
+    ""
+}
+
+pub fn draw_gameover_overlay(mx, my, mouse_down, just_clicked, last_run, is_new_best) {
+    draw_panel(190, 125, 420, 350, 224, 82, 82);
+    gfx.text(330, 148, "SHIP DESTROYED", 244, 114, 128);
+    if is_new_best {
+        gfx.text(334, 174, "NEW HIGH SCORE!", 245, 189, 65);
+    }
+
+    gfx.rect(220, 206, 360, 150, 15, 19, 27);
+    gfx.rect_outline(220, 206, 360, 150, 48, 58, 78);
+
+    gfx.text(244, 222, "Final Score: " + str(last_run["score"]) + "   (Rank " + last_run["rank"] + ")", 236, 240, 246);
+    gfx.text(244, 252, "Survived: " + str(last_run["time_sec"]) + " sec", 63, 185, 80);
+    gfx.text(244, 282, "Energy Cores: " + str(last_run["orbs"]), 245, 189, 65);
+    gfx.text(244, 312, "Near Misses: " + str(last_run["near_misses"]) + "   (Max x" + str(last_run["max_combo"]) + ")", 79, 195, 247);
+
+    let h_retry = point_in(mx, my, 220, 382, 170, 50);
+    draw_button(220, 382, 170, 50, "PLAY AGAIN", h_retry, mouse_down, 63, 185, 80);
+
+    let h_menu = point_in(mx, my, 410, 382, 170, 50);
+    draw_button(410, 382, 170, 50, "MAIN MENU", h_menu, mouse_down, 79, 143, 247);
+
+    if just_clicked {
+        if h_retry { return "retry"; }
+        if h_menu { return "menu"; }
+    }
+    ""
+}

@@ -149,9 +149,11 @@ impl Parser {
         let starts_with_lparen = matches!(first, TokenKind::LParen);
         let mut pdepth = 0usize;
         let mut bdepth = 0usize;
-        let limit = (self.pos + 64).min(self.tokens.len());
+        let mut dict_depth = 0usize;
         let mut i = self.pos + 1;
-        while i < limit {
+        while i < self.tokens.len() {
+            let prev_is_hash =
+                i > self.pos + 1 && matches!(self.tokens[i - 1].kind, TokenKind::Hash);
             match &self.tokens[i].kind {
                 TokenKind::LParen => pdepth += 1,
                 TokenKind::RParen => {
@@ -159,9 +161,9 @@ impl Parser {
                         return false;
                     }
                     pdepth -= 1;
-                    if starts_with_lparen && pdepth == 0 && bdepth == 0 {
+                    if starts_with_lparen && pdepth == 0 && bdepth == 0 && dict_depth == 0 {
                         let next_ok = match self.tokens.get(i + 1).map(|t| &t.kind) {
-                            Some(TokenKind::LBrace) => true,
+                            Some(TokenKind::LBrace) if self.allow_struct_literal => true,
                             Some(TokenKind::As) if allow_as => true,
                             _ => false,
                         };
@@ -188,8 +190,21 @@ impl Parser {
                     }
                     bdepth -= 1;
                 }
-                TokenKind::LBrace if pdepth == 0 && bdepth == 0 => return true,
-                TokenKind::As if allow_as && pdepth == 0 && bdepth == 0 => {
+                TokenKind::LBrace => {
+                    if prev_is_hash || dict_depth > 0 {
+                        dict_depth += 1;
+                    } else if pdepth == 0 && bdepth == 0 {
+                        return self.allow_struct_literal;
+                    }
+                }
+                TokenKind::RBrace if pdepth == 0 && bdepth == 0 => {
+                    if dict_depth > 0 {
+                        dict_depth -= 1;
+                    } else {
+                        return false;
+                    }
+                }
+                TokenKind::As if allow_as && pdepth == 0 && bdepth == 0 && dict_depth == 0 => {
                     return matches!(
                         self.tokens.get(i + 1).map(|t| &t.kind),
                         Some(TokenKind::Ident(_))
@@ -198,16 +213,23 @@ impl Parser {
                         Some(TokenKind::LBrace)
                     );
                 }
-                TokenKind::Semicolon
+                TokenKind::Eq
+                | TokenKind::Ne
+                | TokenKind::Lt
+                | TokenKind::Le
+                | TokenKind::Gt
+                | TokenKind::Ge
+                | TokenKind::And
+                | TokenKind::Or
+                | TokenKind::Semicolon
                 | TokenKind::Assign
                 | TokenKind::PlusAssign
                 | TokenKind::MinusAssign
                 | TokenKind::StarAssign
                 | TokenKind::SlashAssign
                 | TokenKind::PipeAssign
-                | TokenKind::RBrace
                 | TokenKind::Eof
-                    if pdepth == 0 && bdepth == 0 =>
+                    if pdepth == 0 && bdepth == 0 && dict_depth == 0 =>
                 {
                     return false;
                 }
@@ -730,6 +752,66 @@ impl Parser {
         }
     }
 
+    fn count_placeholders_stmt(stmt: &Stmt) -> (usize, bool) {
+        match stmt {
+            Stmt::Let { name, value, .. } => (Self::count_placeholders(value), name == "_"),
+            Stmt::LetList { names, value, .. } => (
+                Self::count_placeholders(value),
+                names.iter().any(|n| n == "_"),
+            ),
+            Stmt::LetDict { fields, value, .. } => (
+                Self::count_placeholders(value),
+                fields.iter().any(|f| f == "_"),
+            ),
+            Stmt::FnDecl {
+                name, params, body, ..
+            } => {
+                let c = if params.iter().any(|p| p.name == "_") {
+                    0
+                } else {
+                    Self::count_placeholders(body)
+                };
+                (c, name == "_")
+            }
+            Stmt::While { cond, body, .. } => (
+                Self::count_placeholders(cond) + Self::count_placeholders(body),
+                false,
+            ),
+            Stmt::For {
+                var, iter, body, ..
+            } => {
+                let mut c = Self::count_placeholders(iter);
+                if var != "_" {
+                    c += Self::count_placeholders(body);
+                }
+                (c, false)
+            }
+            Stmt::ForPair {
+                var1,
+                var2,
+                iter,
+                body,
+                ..
+            } => {
+                let mut c = Self::count_placeholders(iter);
+                if var1 != "_" && var2 != "_" {
+                    c += Self::count_placeholders(body);
+                }
+                (c, false)
+            }
+            Stmt::Return { value, .. } => {
+                (value.as_ref().map_or(0, Self::count_placeholders), false)
+            }
+            Stmt::Defer { body, .. } => (Self::count_placeholders(body), false),
+            Stmt::Every { interval, body, .. } => (
+                Self::count_placeholders(interval) + Self::count_placeholders(body),
+                false,
+            ),
+            Stmt::Expr(e) => (Self::count_placeholders(e), false),
+            _ => (0, false),
+        }
+    }
+
     fn count_placeholders(expr: &Expr) -> usize {
         match expr {
             Expr::Ident(name, _) if name == "_" => 1,
@@ -738,6 +820,66 @@ impl Parser {
             }
             Expr::Binary { left, right, .. } | Expr::NullCoalesce { left, right, .. } => {
                 Self::count_placeholders(left) + Self::count_placeholders(right)
+            }
+            Expr::Assign { target, value, .. } => {
+                let tc = match target.as_ref() {
+                    AssignTarget::Var(_) => 0,
+                    AssignTarget::Index { object, index } => {
+                        Self::count_placeholders(object) + Self::count_placeholders(index)
+                    }
+                    AssignTarget::Attr { object, .. } => Self::count_placeholders(object),
+                };
+                tc + Self::count_placeholders(value)
+            }
+            Expr::Block { stmts, tail, .. } => {
+                let mut total = 0usize;
+                let mut shadowed = false;
+                for s in stmts {
+                    let (c, sh) = Self::count_placeholders_stmt(s);
+                    total += c;
+                    if sh {
+                        shadowed = true;
+                        break;
+                    }
+                }
+                if !shadowed {
+                    if let Some(t) = tail {
+                        total += Self::count_placeholders(t);
+                    }
+                }
+                total
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::count_placeholders(cond)
+                    + Self::count_placeholders(then_branch)
+                    + else_branch.as_deref().map_or(0, Self::count_placeholders)
+            }
+            Expr::Match { subject, arms, .. } => {
+                Self::count_placeholders(subject)
+                    + arms
+                        .iter()
+                        .map(|a| {
+                            a.guard.as_ref().map_or(0, Self::count_placeholders)
+                                + Self::count_placeholders(&a.body)
+                        })
+                        .sum::<usize>()
+            }
+            Expr::Fn { params, body, .. } => {
+                let def_count: usize = params
+                    .iter()
+                    .filter_map(|p| p.default.as_ref())
+                    .map(Self::count_placeholders)
+                    .sum();
+                if params.iter().any(|p| p.name == "_") {
+                    def_count
+                } else {
+                    def_count + Self::count_placeholders(body)
+                }
             }
             Expr::List(items, _) => items.iter().map(Self::count_placeholders).sum(),
             Expr::Dict(entries, _) => entries
@@ -759,13 +901,271 @@ impl Parser {
                         .map(|(_, v)| Self::count_placeholders(v))
                         .sum::<usize>()
             }
+            Expr::StructInit(s) => {
+                Self::count_placeholders(&s.target)
+                    + s.spread.as_deref().map_or(0, Self::count_placeholders)
+                    + s.fields
+                        .iter()
+                        .map(|(_, v)| Self::count_placeholders(v))
+                        .sum::<usize>()
+            }
+            Expr::ChainedCmp(c) => {
+                Self::count_placeholders(&c.first)
+                    + c.comparisons
+                        .iter()
+                        .map(|(_, rhs)| Self::count_placeholders(rhs))
+                        .sum::<usize>()
+            }
             Expr::Index { object, index, .. } => {
                 Self::count_placeholders(object) + Self::count_placeholders(index)
+            }
+            Expr::Slice {
+                object, start, end, ..
+            } => {
+                Self::count_placeholders(object)
+                    + start.as_deref().map_or(0, Self::count_placeholders)
+                    + end.as_deref().map_or(0, Self::count_placeholders)
+            }
+            Expr::ListComp {
+                expr,
+                var,
+                iter,
+                cond,
+                ..
+            } => {
+                let mut c = Self::count_placeholders(iter);
+                if var != "_" {
+                    c += Self::count_placeholders(expr)
+                        + cond.as_deref().map_or(0, Self::count_placeholders);
+                }
+                c
             }
             Expr::GetAttr { object, .. } | Expr::OptGetAttr { object, .. } => {
                 Self::count_placeholders(object)
             }
+            Expr::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+                ..
+            } => {
+                Self::count_placeholders(try_body)
+                    + if catch_var.as_deref() == Some("_") {
+                        0
+                    } else {
+                        Self::count_placeholders(catch_body)
+                    }
+            }
+            Expr::SafePipe(p) => {
+                Self::count_placeholders(&p.left)
+                    + if p.param == "_" {
+                        0
+                    } else {
+                        Self::count_placeholders(&p.apply)
+                    }
+            }
+            Expr::MapPipe { left, mapper, .. } => {
+                Self::count_placeholders(left) + Self::count_placeholders(mapper)
+            }
+            Expr::PipeAssign(p) => {
+                let tc = match p.target.as_ref() {
+                    AssignTarget::Var(_) => 0,
+                    AssignTarget::Index { object, index } => {
+                        Self::count_placeholders(object) + Self::count_placeholders(index)
+                    }
+                    AssignTarget::Attr { object, .. } => Self::count_placeholders(object),
+                };
+                tc + if p.param == "_" {
+                    0
+                } else {
+                    p.stages.iter().map(Self::count_placeholders).sum()
+                }
+            }
+            Expr::TaggedTemplate(t) => t.exprs.iter().map(Self::count_placeholders).sum(),
+            Expr::With(w) => {
+                Self::count_placeholders(&w.resource)
+                    + if w.alias.as_deref() == Some("_") {
+                        0
+                    } else {
+                        Self::count_placeholders(&w.body)
+                    }
+            }
+            Expr::Sandbox(s) => {
+                s.policy
+                    .iter()
+                    .map(|(_, v)| Self::count_placeholders(v))
+                    .sum::<usize>()
+                    + Self::count_placeholders(&s.body)
+            }
+            Expr::After { delay, body, .. } => {
+                Self::count_placeholders(delay) + Self::count_placeholders(body)
+            }
             _ => 0,
+        }
+    }
+
+    fn replace_placeholders_stmt(stmt: Stmt, replacement: &Expr) -> (Stmt, bool) {
+        match stmt {
+            Stmt::Let {
+                name,
+                value,
+                is_pub,
+                span,
+            } => {
+                let sh = name == "_";
+                (
+                    Stmt::Let {
+                        name,
+                        value: Self::replace_placeholders(value, replacement),
+                        is_pub,
+                        span,
+                    },
+                    sh,
+                )
+            }
+            Stmt::LetList {
+                names,
+                value,
+                is_pub,
+                span,
+            } => {
+                let sh = names.iter().any(|n| n == "_");
+                (
+                    Stmt::LetList {
+                        names,
+                        value: Self::replace_placeholders(value, replacement),
+                        is_pub,
+                        span,
+                    },
+                    sh,
+                )
+            }
+            Stmt::LetDict {
+                fields,
+                value,
+                is_pub,
+                span,
+            } => {
+                let sh = fields.iter().any(|f| f == "_");
+                (
+                    Stmt::LetDict {
+                        fields,
+                        value: Self::replace_placeholders(value, replacement),
+                        is_pub,
+                        span,
+                    },
+                    sh,
+                )
+            }
+            Stmt::FnDecl {
+                name,
+                params,
+                body,
+                is_pub,
+                span,
+            } => {
+                let sh = name == "_";
+                let new_body = if params.iter().any(|p| p.name == "_") {
+                    body
+                } else {
+                    Self::replace_placeholders(body, replacement)
+                };
+                (
+                    Stmt::FnDecl {
+                        name,
+                        params,
+                        body: new_body,
+                        is_pub,
+                        span,
+                    },
+                    sh,
+                )
+            }
+            Stmt::While { cond, body, span } => (
+                Stmt::While {
+                    cond: Self::replace_placeholders(cond, replacement),
+                    body: Self::replace_placeholders(body, replacement),
+                    span,
+                },
+                false,
+            ),
+            Stmt::For {
+                var,
+                iter,
+                body,
+                span,
+            } => {
+                let new_iter = Self::replace_placeholders(iter, replacement);
+                let new_body = if var == "_" {
+                    body
+                } else {
+                    Self::replace_placeholders(body, replacement)
+                };
+                (
+                    Stmt::For {
+                        var,
+                        iter: new_iter,
+                        body: new_body,
+                        span,
+                    },
+                    false,
+                )
+            }
+            Stmt::ForPair {
+                var1,
+                var2,
+                iter,
+                body,
+                span,
+            } => {
+                let new_iter = Self::replace_placeholders(iter, replacement);
+                let new_body = if var1 == "_" || var2 == "_" {
+                    body
+                } else {
+                    Self::replace_placeholders(body, replacement)
+                };
+                (
+                    Stmt::ForPair {
+                        var1,
+                        var2,
+                        iter: new_iter,
+                        body: new_body,
+                        span,
+                    },
+                    false,
+                )
+            }
+            Stmt::Return { value, span } => (
+                Stmt::Return {
+                    value: value.map(|v| Self::replace_placeholders(v, replacement)),
+                    span,
+                },
+                false,
+            ),
+            Stmt::Defer { body, span } => (
+                Stmt::Defer {
+                    body: Self::replace_placeholders(body, replacement),
+                    span,
+                },
+                false,
+            ),
+            Stmt::Every {
+                interval,
+                body,
+                span,
+            } => (
+                Stmt::Every {
+                    interval: Self::replace_placeholders(interval, replacement),
+                    body: Self::replace_placeholders(body, replacement),
+                    span,
+                },
+                false,
+            ),
+            Stmt::Expr(e) => (
+                Stmt::Expr(Self::replace_placeholders(e, replacement)),
+                false,
+            ),
+            other => (other, false),
         }
     }
 
@@ -779,6 +1179,10 @@ impl Parser {
             } => Expr::Unary {
                 op,
                 expr: Box::new(Self::replace_placeholders(*inner, replacement)),
+                span,
+            },
+            Expr::Throw { value: inner, span } => Expr::Throw {
+                value: Box::new(Self::replace_placeholders(*inner, replacement)),
                 span,
             },
             Expr::Binary {
@@ -797,6 +1201,106 @@ impl Parser {
                 right: Box::new(Self::replace_placeholders(*right, replacement)),
                 span,
             },
+            Expr::Assign {
+                target,
+                op,
+                value,
+                span,
+            } => {
+                let new_target = match *target {
+                    AssignTarget::Var(v) => AssignTarget::Var(v),
+                    AssignTarget::Index { object, index } => AssignTarget::Index {
+                        object: Box::new(Self::replace_placeholders(*object, replacement)),
+                        index: Box::new(Self::replace_placeholders(*index, replacement)),
+                    },
+                    AssignTarget::Attr { object, name } => AssignTarget::Attr {
+                        object: Box::new(Self::replace_placeholders(*object, replacement)),
+                        name,
+                    },
+                };
+                Expr::Assign {
+                    target: Box::new(new_target),
+                    op,
+                    value: Box::new(Self::replace_placeholders(*value, replacement)),
+                    span,
+                }
+            }
+            Expr::Block { stmts, tail, span } => {
+                let mut new_stmts = Vec::with_capacity(stmts.len());
+                let mut shadowed = false;
+                let mut iter = stmts.into_iter();
+                while let Some(s) = iter.next() {
+                    let (ns, sh) = Self::replace_placeholders_stmt(s, replacement);
+                    new_stmts.push(ns);
+                    if sh {
+                        shadowed = true;
+                        new_stmts.extend(iter);
+                        break;
+                    }
+                }
+                let new_tail = if shadowed {
+                    tail
+                } else {
+                    tail.map(|t| Box::new(Self::replace_placeholders(*t, replacement)))
+                };
+                Expr::Block {
+                    stmts: new_stmts,
+                    tail: new_tail,
+                    span,
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                span,
+            } => Expr::If {
+                cond: Box::new(Self::replace_placeholders(*cond, replacement)),
+                then_branch: Box::new(Self::replace_placeholders(*then_branch, replacement)),
+                else_branch: else_branch
+                    .map(|e| Box::new(Self::replace_placeholders(*e, replacement))),
+                span,
+            },
+            Expr::Match {
+                subject,
+                arms,
+                span,
+            } => Expr::Match {
+                subject: Box::new(Self::replace_placeholders(*subject, replacement)),
+                arms: arms
+                    .into_iter()
+                    .map(|a| MatchArm {
+                        pattern: a.pattern,
+                        guard: a.guard.map(|g| Self::replace_placeholders(g, replacement)),
+                        body: Self::replace_placeholders(a.body, replacement),
+                        span: a.span,
+                    })
+                    .collect(),
+                span,
+            },
+            Expr::Fn { params, body, span } => {
+                let has_shadow = params.iter().any(|p| p.name == "_");
+                let new_params = params
+                    .into_iter()
+                    .map(|p| FnParam {
+                        name: p.name,
+                        default: p
+                            .default
+                            .map(|d| Self::replace_placeholders(d, replacement)),
+                        is_variadic: p.is_variadic,
+                    })
+                    .collect();
+                let new_body = if has_shadow {
+                    body
+                } else {
+                    Box::new(Self::replace_placeholders(*body, replacement))
+                };
+                Expr::Fn {
+                    params: new_params,
+                    body: new_body,
+                    span,
+                }
+            }
             Expr::List(items, span) => Expr::List(
                 items
                     .into_iter()
@@ -838,6 +1342,27 @@ impl Parser {
                     .collect();
                 Expr::CallNamed(c)
             }
+            Expr::StructInit(mut s) => {
+                s.target = Box::new(Self::replace_placeholders(*s.target, replacement));
+                s.spread = s
+                    .spread
+                    .map(|sp| Box::new(Self::replace_placeholders(*sp, replacement)));
+                s.fields = s
+                    .fields
+                    .into_iter()
+                    .map(|(k, v)| (k, Self::replace_placeholders(v, replacement)))
+                    .collect();
+                Expr::StructInit(s)
+            }
+            Expr::ChainedCmp(mut c) => {
+                c.first = Box::new(Self::replace_placeholders(*c.first, replacement));
+                c.comparisons = c
+                    .comparisons
+                    .into_iter()
+                    .map(|(op, rhs)| (op, Self::replace_placeholders(rhs, replacement)))
+                    .collect();
+                Expr::ChainedCmp(c)
+            }
             Expr::Index {
                 object,
                 index,
@@ -847,6 +1372,43 @@ impl Parser {
                 index: Box::new(Self::replace_placeholders(*index, replacement)),
                 span,
             },
+            Expr::Slice {
+                object,
+                start,
+                end,
+                inclusive,
+                span,
+            } => Expr::Slice {
+                object: Box::new(Self::replace_placeholders(*object, replacement)),
+                start: start.map(|s| Box::new(Self::replace_placeholders(*s, replacement))),
+                end: end.map(|e| Box::new(Self::replace_placeholders(*e, replacement))),
+                inclusive,
+                span,
+            },
+            Expr::ListComp {
+                expr,
+                var,
+                iter,
+                cond,
+                span,
+            } => {
+                let new_iter = Box::new(Self::replace_placeholders(*iter, replacement));
+                let (new_expr, new_cond) = if var == "_" {
+                    (expr, cond)
+                } else {
+                    (
+                        Box::new(Self::replace_placeholders(*expr, replacement)),
+                        cond.map(|c| Box::new(Self::replace_placeholders(*c, replacement))),
+                    )
+                };
+                Expr::ListComp {
+                    expr: new_expr,
+                    var,
+                    iter: new_iter,
+                    cond: new_cond,
+                    span,
+                }
+            }
             Expr::GetAttr { object, name, span } => Expr::GetAttr {
                 object: Box::new(Self::replace_placeholders(*object, replacement)),
                 name,
@@ -855,6 +1417,83 @@ impl Parser {
             Expr::OptGetAttr { object, name, span } => Expr::OptGetAttr {
                 object: Box::new(Self::replace_placeholders(*object, replacement)),
                 name,
+                span,
+            },
+            Expr::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+                span,
+            } => Expr::TryCatch {
+                try_body: Box::new(Self::replace_placeholders(*try_body, replacement)),
+                catch_body: if catch_var.as_deref() == Some("_") {
+                    catch_body
+                } else {
+                    Box::new(Self::replace_placeholders(*catch_body, replacement))
+                },
+                catch_var,
+                span,
+            },
+            Expr::SafePipe(mut p) => {
+                p.left = Box::new(Self::replace_placeholders(*p.left, replacement));
+                if p.param != "_" {
+                    p.apply = Box::new(Self::replace_placeholders(*p.apply, replacement));
+                }
+                Expr::SafePipe(p)
+            }
+            Expr::MapPipe { left, mapper, span } => Expr::MapPipe {
+                left: Box::new(Self::replace_placeholders(*left, replacement)),
+                mapper: Box::new(Self::replace_placeholders(*mapper, replacement)),
+                span,
+            },
+            Expr::PipeAssign(mut p) => {
+                p.target = Box::new(match *p.target {
+                    AssignTarget::Var(v) => AssignTarget::Var(v),
+                    AssignTarget::Index { object, index } => AssignTarget::Index {
+                        object: Box::new(Self::replace_placeholders(*object, replacement)),
+                        index: Box::new(Self::replace_placeholders(*index, replacement)),
+                    },
+                    AssignTarget::Attr { object, name } => AssignTarget::Attr {
+                        object: Box::new(Self::replace_placeholders(*object, replacement)),
+                        name,
+                    },
+                });
+                if p.param != "_" {
+                    p.stages = p
+                        .stages
+                        .into_iter()
+                        .map(|s| Self::replace_placeholders(s, replacement))
+                        .collect();
+                }
+                Expr::PipeAssign(p)
+            }
+            Expr::TaggedTemplate(mut t) => {
+                t.exprs = t
+                    .exprs
+                    .into_iter()
+                    .map(|e| Self::replace_placeholders(e, replacement))
+                    .collect();
+                Expr::TaggedTemplate(t)
+            }
+            Expr::With(mut w) => {
+                w.resource = Self::replace_placeholders(w.resource, replacement);
+                if w.alias.as_deref() != Some("_") {
+                    w.body = Self::replace_placeholders(w.body, replacement);
+                }
+                Expr::With(w)
+            }
+            Expr::Sandbox(mut s) => {
+                s.policy = s
+                    .policy
+                    .into_iter()
+                    .map(|(k, v)| (k, Self::replace_placeholders(v, replacement)))
+                    .collect();
+                s.body = Self::replace_placeholders(s.body, replacement);
+                Expr::Sandbox(s)
+            }
+            Expr::After { delay, body, span } => Expr::After {
+                delay: Box::new(Self::replace_placeholders(*delay, replacement)),
+                body: Box::new(Self::replace_placeholders(*body, replacement)),
                 span,
             },
             other => other,
@@ -2206,5 +2845,8 @@ fn is_block_expr(expr: &Expr) -> bool {
             | Expr::TryCatch { .. }
             | Expr::Match { .. }
             | Expr::Fn { .. }
+            | Expr::With(_)
+            | Expr::Sandbox(_)
+            | Expr::After { .. }
     )
 }

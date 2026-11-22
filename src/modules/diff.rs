@@ -18,13 +18,20 @@ pub fn module() -> Value {
     )
 }
 
-fn lcs_line_diff<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
+fn lcs_line_diff<'a>(
+    vm: &mut VM,
+    a: &[&'a str],
+    b: &[&'a str],
+) -> Result<Vec<(char, &'a str)>, String> {
     let n = a.len().min(2000);
     let m = b.len().min(2000);
     let a = &a[..n];
     let b = &b[..m];
+    let dp_bytes = (n + 1).saturating_mul(m + 1).saturating_mul(4);
+    vm.charge_alloc(dp_bytes)?;
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
     for i in (0..n).rev() {
+        vm.charge_work(((m / 32) as u64).max(1))?;
         for j in (0..m).rev() {
             dp[i][j] = if a[i] == b[j] {
                 dp[i + 1][j + 1] + 1
@@ -56,7 +63,7 @@ fn lcs_line_diff<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
         out.push(('+', b[j]));
         j += 1;
     }
-    out
+    Ok(out)
 }
 
 fn diff_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -67,12 +74,20 @@ fn diff_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let b = args[1].to_string();
     let al: Vec<&str> = a.lines().collect();
     let bl: Vec<&str> = b.lines().collect();
-    let ops = lcs_line_diff(&al, &bl);
+    let ops = lcs_line_diff(vm, &al, &bl)?;
+    let total_bytes: usize = ops
+        .iter()
+        .map(|(_, line)| {
+            line.len()
+                .saturating_add(2)
+                .saturating_add(std::mem::size_of::<Value>())
+        })
+        .sum();
+    vm.charge_alloc(total_bytes)?;
     let out: Vec<Value> = ops
         .into_iter()
         .map(|(tag, line)| Value::Str(format!("{} {}", tag, line)))
         .collect();
-    vm.charge_alloc(out.len().saturating_mul(48))?;
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
 
@@ -84,8 +99,16 @@ fn diff_format(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let b = args[1].to_string();
     let al: Vec<&str> = a.lines().collect();
     let bl: Vec<&str> = b.lines().collect();
-    let ops = lcs_line_diff(&al, &bl);
-    let mut out = String::new();
+    let ops = lcs_line_diff(vm, &al, &bl)?;
+    let total_bytes: usize = ops
+        .iter()
+        .map(|(_, line)| line.len().saturating_add(3))
+        .sum();
+    if total_bytes > 32 * 1024 * 1024 {
+        return Err("diff.format() output exceeds 32 MiB limit".to_string());
+    }
+    vm.charge_alloc(total_bytes)?;
+    let mut out = String::with_capacity(total_bytes);
     for (i, (tag, line)) in ops.into_iter().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -94,7 +117,6 @@ fn diff_format(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         out.push(' ');
         out.push_str(line);
     }
-    vm.charge_alloc(out.len())?;
     Ok(Value::Str(out))
 }
 
@@ -108,32 +130,47 @@ fn record_entry(out: &mut Vec<Value>, path: &str, kind: &str, left: Value, right
 }
 
 fn collect_val_diffs(
+    vm: &mut VM,
     path: &str,
     left: &Value,
     right: &Value,
     out: &mut Vec<Value>,
     depth: usize,
     seen: &mut HashSet<(usize, usize)>,
-) {
-    if depth > 64 || out.len() > 2000 {
-        return;
+    steps: &mut usize,
+) -> Result<(), String> {
+    if depth > 64 || out.len() >= 2000 || *steps >= 200_000 {
+        return Ok(());
+    }
+    *steps += 1;
+    if (*steps & 1023) == 0 {
+        vm.check_timeout()?;
     }
     match (left, right) {
         (Value::List(a), Value::List(b)) => {
             if Rc::ptr_eq(a, b) {
-                return;
+                return Ok(());
             }
             let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
             if !seen.insert(key) {
-                return;
+                return Ok(());
             }
             let av = a.borrow();
             let bv = b.borrow();
             let max_len = av.len().max(bv.len());
             for idx in 0..max_len {
+                if out.len() >= 2000 || *steps >= 200_000 {
+                    break;
+                }
+                *steps += 1;
+                if (*steps & 1023) == 0 {
+                    vm.check_timeout()?;
+                }
                 let sub = format!("{}[{}]", path, idx);
                 match (av.get(idx), bv.get(idx)) {
-                    (Some(x), Some(y)) => collect_val_diffs(&sub, x, y, out, depth + 1, seen),
+                    (Some(x), Some(y)) => {
+                        collect_val_diffs(vm, &sub, x, y, out, depth + 1, seen, steps)?;
+                    }
                     (Some(x), None) => record_entry(out, &sub, "removed", x.clone(), Value::Unit),
                     (None, Some(y)) => record_entry(out, &sub, "added", Value::Unit, y.clone()),
                     (None, None) => {}
@@ -142,11 +179,11 @@ fn collect_val_diffs(
         }
         (Value::Dict(a), Value::Dict(b)) => {
             if Rc::ptr_eq(a, b) {
-                return;
+                return Ok(());
             }
             let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
             if !seen.insert(key) {
-                return;
+                return Ok(());
             }
             let am = a.borrow();
             let bm = b.borrow();
@@ -154,13 +191,22 @@ fn collect_val_diffs(
             keys.sort();
             keys.dedup();
             for k in keys {
+                if out.len() >= 2000 || *steps >= 200_000 {
+                    break;
+                }
+                *steps += 1;
+                if (*steps & 1023) == 0 {
+                    vm.check_timeout()?;
+                }
                 let sub = if path.is_empty() {
                     k.clone()
                 } else {
                     format!("{}.{}", path, k)
                 };
                 match (am.get(k), bm.get(k)) {
-                    (Some(x), Some(y)) => collect_val_diffs(&sub, x, y, out, depth + 1, seen),
+                    (Some(x), Some(y)) => {
+                        collect_val_diffs(vm, &sub, x, y, out, depth + 1, seen, steps)?;
+                    }
                     (Some(x), None) => record_entry(out, &sub, "removed", x.clone(), Value::Unit),
                     (None, Some(y)) => record_entry(out, &sub, "added", Value::Unit, y.clone()),
                     (None, None) => {}
@@ -168,12 +214,13 @@ fn collect_val_diffs(
             }
         }
         _ => {
-            if !left.equals(right) {
+            if !left.equals_vm(right, vm)? {
                 let p = if path.is_empty() { "$" } else { path };
                 record_entry(out, p, "changed", left.clone(), right.clone());
             }
         }
     }
+    Ok(())
 }
 
 fn diff_values(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -182,7 +229,10 @@ fn diff_values(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    collect_val_diffs("", &args[0], &args[1], &mut out, 0, &mut seen);
-    vm.charge_alloc(out.len().saturating_mul(128))?;
+    let mut steps = 0usize;
+    collect_val_diffs(
+        vm, "", &args[0], &args[1], &mut out, 0, &mut seen, &mut steps,
+    )?;
+    vm.charge_alloc(out.len().saturating_mul(160))?;
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }

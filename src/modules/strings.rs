@@ -42,43 +42,64 @@ fn expect_str<'a>(v: &'a Value, fn_name: &str) -> Result<&'a str, String> {
     }
 }
 
-pub(crate) fn str_split(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_split(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("strings.split() expects 2 arguments (text, sep)".to_string());
     }
     let text = expect_str(&args[0], "split")?;
     let sep = expect_str(&args[1], "split")?;
+    vm.charge_work((text.len() as u64) / 32 + 1)?;
     let parts: Vec<Value> = if sep.is_empty() {
+        let count = text.chars().count();
+        vm.charge_alloc(
+            count
+                .saturating_mul(std::mem::size_of::<Value>() + 4)
+                .saturating_add(text.len()),
+        )?;
         text.chars().map(|c| Value::Str(c.to_string())).collect()
     } else {
+        let count = text.split(sep).count();
+        vm.charge_alloc(
+            count
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(text.len()),
+        )?;
         text.split(sep).map(|p| Value::Str(p.to_string())).collect()
     };
     Ok(Value::List(Rc::new(RefCell::new(parts))))
 }
 
-pub(crate) fn str_trim(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_trim(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("strings.trim() expects 1 argument (text)".to_string());
     }
-    Ok(Value::Str(expect_str(&args[0], "trim")?.trim().to_string()))
+    let text = expect_str(&args[0], "trim")?;
+    let trimmed = text.trim();
+    vm.charge_alloc(trimmed.len())?;
+    vm.charge_work((text.len() as u64) / 64 + 1)?;
+    Ok(Value::Str(trimmed.to_string()))
 }
 
-pub(crate) fn str_trim_start(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_trim_start(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("strings.trim_start() expects 1 argument (text)".to_string());
     }
-    Ok(Value::Str(
-        expect_str(&args[0], "trim_start")?.trim_start().to_string(),
-    ))
+    let text = expect_str(&args[0], "trim_start")?;
+    let trimmed = text.trim_start();
+    vm.charge_alloc(trimmed.len())?;
+    vm.charge_work((text.len() as u64) / 64 + 1)?;
+    Ok(Value::Str(trimmed.to_string()))
 }
 
-pub(crate) fn str_trim_end(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_trim_end(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("strings.trim_end() expects 1 argument (text)".to_string());
     }
-    Ok(Value::Str(
-        expect_str(&args[0], "trim_end")?.trim_end().to_string(),
-    ))
+    let text = expect_str(&args[0], "trim_end")?;
+    let trimmed = text.trim_end();
+    vm.charge_alloc(trimmed.len())?;
+    vm.charge_work((text.len() as u64) / 64 + 1)?;
+    Ok(Value::Str(trimmed.to_string()))
 }
 
 pub(crate) fn str_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -146,18 +167,32 @@ pub(crate) fn str_ends_with(_vm: &mut VM, args: &[Value]) -> Result<Value, Strin
     Ok(Value::Bool(text.ends_with(suffix)))
 }
 
-pub(crate) fn str_upper(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_upper(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("strings.upper() expects 1 argument (text)".to_string());
     }
-    Ok(Value::Str(expect_str(&args[0], "upper")?.to_uppercase()))
+    let s = expect_str(&args[0], "upper")?;
+    vm.charge_work((s.len() as u64) / 32 + 1)?;
+    vm.charge_alloc(s.len())?;
+    let out = s.to_uppercase();
+    if out.len() > s.len() {
+        vm.charge_alloc(out.len() - s.len())?;
+    }
+    Ok(Value::Str(out))
 }
 
-pub(crate) fn str_lower(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_lower(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("strings.lower() expects 1 argument (text)".to_string());
     }
-    Ok(Value::Str(expect_str(&args[0], "lower")?.to_lowercase()))
+    let s = expect_str(&args[0], "lower")?;
+    vm.charge_work((s.len() as u64) / 32 + 1)?;
+    vm.charge_alloc(s.len())?;
+    let out = s.to_lowercase();
+    if out.len() > s.len() {
+        vm.charge_alloc(out.len() - s.len())?;
+    }
+    Ok(Value::Str(out))
 }
 
 pub(crate) fn str_find(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -190,25 +225,45 @@ pub(crate) fn str_repeat(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Str(text.repeat(count)))
 }
 
-pub(crate) fn str_lines(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("strings.lines() expects 1 argument (text)".to_string());
     }
     let text = expect_str(&args[0], "lines")?;
+    vm.charge_work((text.len() as u64) / 32 + 1)?;
+    let count = text.lines().count();
+    vm.charge_alloc(
+        count
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(text.len()),
+    )?;
     let lines: Vec<Value> = text.lines().map(|l| Value::Str(l.to_string())).collect();
     Ok(Value::List(Rc::new(RefCell::new(lines))))
 }
 
-fn pad_impl(text: &str, width: usize, fill: &str, start: bool) -> Result<String, String> {
+fn pad_impl(
+    vm: &mut VM,
+    text: &str,
+    width: usize,
+    fill: &str,
+    start: bool,
+) -> Result<String, String> {
     if width > 1_000_000 {
         return Err("strings.pad() width exceeds limit".to_string());
     }
     let current = text.chars().count();
     if current >= width {
+        vm.charge_alloc(text.len())?;
         return Ok(text.to_string());
     }
     let pad_ch = fill.chars().next().unwrap_or(' ');
-    let padding: String = std::iter::repeat_n(pad_ch, width - current).collect();
+    let needed = width - current;
+    let out_bytes = text
+        .len()
+        .saturating_add(needed.saturating_mul(pad_ch.len_utf8()));
+    vm.charge_alloc(out_bytes)?;
+    vm.charge_work((out_bytes as u64) / 32 + 1)?;
+    let padding: String = std::iter::repeat_n(pad_ch, needed).collect();
     if start {
         Ok(format!("{}{}", padding, text))
     } else {
@@ -216,7 +271,7 @@ fn pad_impl(text: &str, width: usize, fill: &str, start: bool) -> Result<String,
     }
 }
 
-pub(crate) fn str_pad_start(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_pad_start(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err("strings.pad_start() expects (text, width, [fill])".to_string());
     }
@@ -230,10 +285,10 @@ pub(crate) fn str_pad_start(_vm: &mut VM, args: &[Value]) -> Result<Value, Strin
     } else {
         " "
     };
-    Ok(Value::Str(pad_impl(text, width, fill, true)?))
+    Ok(Value::Str(pad_impl(vm, text, width, fill, true)?))
 }
 
-pub(crate) fn str_pad_end(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_pad_end(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err("strings.pad_end() expects (text, width, [fill])".to_string());
     }
@@ -247,16 +302,17 @@ pub(crate) fn str_pad_end(_vm: &mut VM, args: &[Value]) -> Result<Value, String>
     } else {
         " "
     };
-    Ok(Value::Str(pad_impl(text, width, fill, false)?))
+    Ok(Value::Str(pad_impl(vm, text, width, fill, false)?))
 }
 
-pub(crate) fn str_slice(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+pub(crate) fn str_slice(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err("strings.slice() expects (text, start, [end])".to_string());
     }
     let text = expect_str(&args[0], "slice")?;
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len() as i64;
+    vm.charge_work((text.len() as u64) / 64 + 1)?;
+    let char_len = text.chars().count();
+    let len = char_len as i64;
     let start_raw = match &args[1] {
         Value::Int(n) => *n,
         _ => return Err("strings.slice() start must be an integer".to_string()),
@@ -276,10 +332,22 @@ pub(crate) fn str_slice(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let s = norm(start_raw);
     let e = norm(end_raw);
     if s >= e {
-        Ok(Value::Str(String::new()))
-    } else {
-        Ok(Value::Str(chars[s..e].iter().collect()))
+        return Ok(Value::Str(String::new()));
     }
+    let mut start_byte = text.len();
+    let mut end_byte = text.len();
+    for (ci, (bi, _)) in text.char_indices().enumerate() {
+        if ci == s {
+            start_byte = bi;
+        }
+        if ci == e {
+            end_byte = bi;
+            break;
+        }
+    }
+    let sliced = &text[start_byte..end_byte];
+    vm.charge_alloc(sliced.len())?;
+    Ok(Value::Str(sliced.to_string()))
 }
 
 pub(crate) fn str_join(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

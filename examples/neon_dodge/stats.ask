@@ -1,0 +1,95 @@
+import fs;
+import json;
+
+pub fn compute_rank(score, near_misses) {
+    let rating = score + near_misses * 40;
+    if rating >= 2500 {
+        return "S+";
+    }
+    if rating >= 1400 {
+        return "S";
+    }
+    if rating >= 750 {
+        return "A";
+    }
+    if rating >= 300 {
+        return "B";
+    }
+    "C"
+}
+
+pub fn default_stats() {
+    #{
+        games_played: 0,
+        best_score: 0,
+        best_time_sec: 0,
+        best_combo: 1,
+        total_orbs: 0,
+        total_near_misses: 0,
+        history: [],
+    }
+}
+
+pub fn load_stats(path) {
+    let raw = {
+        if fs.exists(path) {
+            json.parse(fs.read(path))
+        } else {
+            default_stats()
+        }
+    } recover => default_stats();
+    if !has(raw, "games_played") || !has(raw, "history") {
+        return default_stats();
+    }
+    raw
+}
+
+pub fn save_stats(path, st) {
+    {
+        fs.write(path, json.stringify(st));
+        true
+    } recover => false
+}
+
+pub fn record_run(path, st, score, time_sec, orbs, near_misses, max_combo, diff) {
+    let rank = compute_rank(score, near_misses);
+    let run = #{
+        score: score,
+        time_sec: time_sec,
+        orbs: orbs,
+        near_misses: near_misses,
+        max_combo: max_combo,
+        diff: diff,
+        rank: rank,
+    };
+
+    st["games_played"] = st["games_played"] + 1;
+    st["total_orbs"] = st["total_orbs"] + orbs;
+    st["total_near_misses"] = st["total_near_misses"] + near_misses;
+    let is_new_best = score > st["best_score"];
+    if is_new_best {
+        st["best_score"] = score;
+    }
+    if time_sec > st["best_time_sec"] {
+        st["best_time_sec"] = time_sec;
+    }
+    if max_combo > st["best_combo"] {
+        st["best_combo"] = max_combo;
+    }
+
+    let next_hist = [run];
+    for item in st["history"] {
+        if len(next_hist) < 5 {
+            push(next_hist, item);
+        }
+    }
+    st["history"] = next_hist;
+    save_stats(path, st);
+    #{ run: run, is_new_best: is_new_best }
+}
+
+pub fn reset_stats(path) {
+    let fresh = default_stats();
+    save_stats(path, fresh);
+    fresh
+}

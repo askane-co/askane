@@ -43,7 +43,11 @@ fn expect_str<'a>(v: &'a Value, fn_name: &str) -> Result<&'a str, String> {
 
 const MAX_FS_BYTES: usize = 32 * 1024 * 1024;
 
-fn check_safe_write_target(vm: &VM, path_buf: &std::path::Path, raw: &str) -> Result<(), String> {
+pub(crate) fn check_safe_write_target(
+    vm: &VM,
+    path_buf: &std::path::Path,
+    raw: &str,
+) -> Result<(), String> {
     if vm.is_sandboxed() {
         if let Ok(meta) = fs::symlink_metadata(path_buf) {
             if meta.file_type().is_symlink() {
@@ -170,9 +174,18 @@ fn fs_list_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let path_buf = vm.resolve_read_path(path)?;
     let entries = fs::read_dir(&path_buf).map_err(|e| format!("fs.list_dir('{}'): {}", path, e))?;
     let mut names = Vec::new();
-    for entry in entries {
+    for (i, entry) in entries.enumerate() {
+        if (i & 255) == 0 {
+            vm.check_timeout()?;
+            vm.charge_work(1)?;
+        }
+        if names.len() >= 100_000 {
+            return Err("fs.list_dir() directory entry limit (100000) exceeded".to_string());
+        }
         let entry = entry.map_err(|e| format!("fs.list_dir('{}'): {}", path, e))?;
-        names.push(Value::Str(entry.file_name().to_string_lossy().to_string()));
+        let s = entry.file_name().to_string_lossy().to_string();
+        vm.charge_alloc(s.len().saturating_add(std::mem::size_of::<Value>()))?;
+        names.push(Value::Str(s));
     }
     Ok(Value::List(Rc::new(RefCell::new(names))))
 }
@@ -316,7 +329,7 @@ fn strip_verbatim(path: &std::path::Path) -> std::borrow::Cow<'_, str> {
 }
 
 fn collect_glob(
-    vm: &VM,
+    vm: &mut VM,
     dir: &std::path::Path,
     base: &std::path::Path,
     pattern: &str,
@@ -326,11 +339,17 @@ fn collect_glob(
     if depth > 16 || out.len() >= 5000 {
         return Ok(());
     }
+    vm.check_timeout()?;
+    vm.charge_work(1)?;
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
     };
-    for entry in entries.flatten() {
+    for (idx, entry) in entries.flatten().enumerate() {
+        if (idx & 255) == 0 {
+            vm.check_timeout()?;
+            vm.charge_work(1)?;
+        }
         if out.len() >= 5000 {
             break;
         }
@@ -345,6 +364,7 @@ fn collect_glob(
             if crate::modules::glob::glob_matches(pattern, &rel_str)
                 && vm.resolve_read_path(&check_target).is_ok()
             {
+                vm.charge_alloc(rel_str.len().saturating_add(std::mem::size_of::<Value>()))?;
                 out.push(Value::Str(rel_str));
             }
             if meta.is_dir() {

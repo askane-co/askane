@@ -1,5 +1,12 @@
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_IC_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_ic_id() -> u64 {
+    NEXT_IC_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpvalueDesc {
@@ -39,6 +46,7 @@ impl fmt::Display for Constant {
 
 #[derive(Debug, Clone)]
 pub struct FunctionProto {
+    pub ic_id: u64,
     pub name: String,
     pub arity: u8,
     pub min_arity: u8,
@@ -282,9 +290,32 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
         ));
     }
     let code_len = chunk.code.len();
+    if depth == 0 && proto.upvalue_count != 0 {
+        return Err(format!(
+            "Bytecode verification failed in '{}': root function cannot declare upvalues",
+            proto.name
+        ));
+    }
+    if proto.is_variadic && proto.arity == 0 {
+        return Err(format!(
+            "Bytecode verification failed in '{}': variadic function must have arity >= 1",
+            proto.name
+        ));
+    }
     if proto.min_arity > proto.arity {
         return Err(format!(
             "Bytecode verification failed in '{}': min_arity exceeds arity",
+            proto.name
+        ));
+    }
+    let fixed_arity = if proto.is_variadic {
+        proto.arity as usize - 1
+    } else {
+        proto.arity as usize
+    };
+    if proto.param_names.len() < fixed_arity {
+        return Err(format!(
+            "Bytecode verification failed in '{}': param_names shorter than fixed arity",
             proto.name
         ));
     }

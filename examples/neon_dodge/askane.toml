@@ -1,0 +1,9 @@
+entry = "main.ask"
+
+[package]
+name = "neon-dodge-2d"
+version = "0.1.0"
+
+[limits]
+max_steps = 500_000_000
+timeout_ms = 600_000

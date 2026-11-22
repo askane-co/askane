@@ -297,7 +297,11 @@ fn rx_is_match(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("regex.is_match() expects 2 strings (pattern, text)".to_string());
     }
     let comp = compile_pattern(expect_str(&args[0], "is_match")?)?;
-    let chars: Vec<char> = expect_str(&args[1], "is_match")?.chars().collect();
+    let text = expect_str(&args[1], "is_match")?;
+    let char_count = text.chars().count();
+    vm.charge_alloc(char_count.saturating_mul(std::mem::size_of::<char>()))?;
+    vm.charge_work((char_count as u64) / 16 + 1)?;
+    let chars: Vec<char> = text.chars().collect();
     Ok(Value::Bool(
         find_first_char_range(vm, &comp, &chars, 0)?.is_some(),
     ))
@@ -308,9 +312,17 @@ fn rx_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("regex.find() expects 2 strings (pattern, text)".to_string());
     }
     let comp = compile_pattern(expect_str(&args[0], "find")?)?;
-    let chars: Vec<char> = expect_str(&args[1], "find")?.chars().collect();
+    let text = expect_str(&args[1], "find")?;
+    let char_count = text.chars().count();
+    vm.charge_alloc(char_count.saturating_mul(std::mem::size_of::<char>()))?;
+    vm.charge_work((char_count as u64) / 16 + 1)?;
+    let chars: Vec<char> = text.chars().collect();
     match find_first_char_range(vm, &comp, &chars, 0)? {
-        Some((s, e)) => Ok(Value::Str(chars[s..e].iter().collect())),
+        Some((s, e)) => {
+            let matched: String = chars[s..e].iter().collect();
+            vm.charge_alloc(matched.len())?;
+            Ok(Value::Str(matched))
+        }
         None => Ok(Value::Unit),
     }
 }
@@ -320,14 +332,27 @@ fn rx_find_all(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("regex.find_all() expects 2 strings (pattern, text)".to_string());
     }
     let comp = compile_pattern(expect_str(&args[0], "find_all")?)?;
-    let chars: Vec<char> = expect_str(&args[1], "find_all")?.chars().collect();
+    let text = expect_str(&args[1], "find_all")?;
+    let char_count = text.chars().count();
+    vm.charge_alloc(char_count.saturating_mul(std::mem::size_of::<char>()))?;
+    vm.charge_work((char_count as u64) / 16 + 1)?;
+    let chars: Vec<char> = text.chars().collect();
+    const MAX_OUT: usize = 64 * 1024 * 1024;
     let mut out = Vec::new();
+    let mut total_bytes = 0usize;
     let mut pos = 0;
     while pos <= chars.len() && out.len() < 10_000 {
         vm.check_timeout()?;
         match find_first_char_range(vm, &comp, &chars, pos)? {
             Some((s, e)) => {
-                out.push(Value::Str(chars[s..e].iter().collect()));
+                let matched: String = chars[s..e].iter().collect();
+                let cost = matched.len().saturating_add(std::mem::size_of::<Value>());
+                total_bytes = total_bytes.saturating_add(cost);
+                if total_bytes > MAX_OUT {
+                    return Err("regex.find_all() output exceeds 64 MiB limit".to_string());
+                }
+                vm.charge_alloc(cost)?;
+                out.push(Value::Str(matched));
                 pos = if e > s { e } else { s + 1 };
             }
             None => break,
@@ -341,8 +366,12 @@ fn rx_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("regex.replace() expects 3 strings (pattern, text, replacement)".to_string());
     }
     let comp = compile_pattern(expect_str(&args[0], "replace")?)?;
-    let chars: Vec<char> = expect_str(&args[1], "replace")?.chars().collect();
+    let text = expect_str(&args[1], "replace")?;
     let repl = expect_str(&args[2], "replace")?;
+    let char_count = text.chars().count();
+    vm.charge_alloc(char_count.saturating_mul(std::mem::size_of::<char>()))?;
+    vm.charge_work((char_count as u64) / 16 + 1)?;
+    let chars: Vec<char> = text.chars().collect();
     const MAX_OUT: usize = 64 * 1024 * 1024;
     let mut out = String::new();
     let mut pos = 0;
@@ -354,16 +383,24 @@ fn rx_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 if count >= 10_000 {
                     return Err("regex.replace(): match limit (10000) exceeded".to_string());
                 }
+                let seg_bytes: usize = chars[pos..s].iter().map(|c| c.len_utf8()).sum();
+                let add_bytes = seg_bytes.saturating_add(repl.len());
+                if out.len().saturating_add(add_bytes) > MAX_OUT {
+                    return Err("regex.replace() output exceeds 64 MiB limit".to_string());
+                }
+                vm.charge_alloc(add_bytes)?;
                 for &c in &chars[pos..s] {
                     out.push(c);
-                }
-                if out.len().saturating_add(repl.len()) > MAX_OUT {
-                    return Err("regex.replace() output exceeds 64 MiB limit".to_string());
                 }
                 out.push_str(repl);
                 if e == s {
                     if s < chars.len() {
-                        out.push(chars[s]);
+                        let c = chars[s];
+                        if out.len().saturating_add(c.len_utf8()) > MAX_OUT {
+                            return Err("regex.replace() output exceeds 64 MiB limit".to_string());
+                        }
+                        vm.charge_alloc(c.len_utf8())?;
+                        out.push(c);
                     }
                     pos = s + 1;
                 } else {
@@ -375,11 +412,13 @@ fn rx_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     }
     if pos < chars.len() {
+        let tail_bytes: usize = chars[pos..].iter().map(|c| c.len_utf8()).sum();
+        if out.len().saturating_add(tail_bytes) > MAX_OUT {
+            return Err("regex.replace() output exceeds 64 MiB limit".to_string());
+        }
+        vm.charge_alloc(tail_bytes)?;
         for &c in &chars[pos..] {
             out.push(c);
-        }
-        if out.len() > MAX_OUT {
-            return Err("regex.replace() output exceeds 64 MiB limit".to_string());
         }
     }
     Ok(Value::Str(out))

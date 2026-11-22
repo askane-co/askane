@@ -25,7 +25,10 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         let Value::List(list_rc) = &args[0] else {
             return Err("cli.parse() expects a list of strings".to_string());
         };
-        list_rc.borrow().iter().map(|v| v.to_string()).collect()
+        let list = list_rc.borrow();
+        vm.charge_alloc(list.len().saturating_mul(std::mem::size_of::<String>()))?;
+        vm.charge_work((list.len() as u64) / 8 + 1)?;
+        list.iter().map(|v| v.to_string()).collect()
     };
 
     let mut flags: HashMap<String, Value> = HashMap::new();
@@ -35,6 +38,9 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let mut i = 0usize;
 
     while i < raw_args.len() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
         let arg = &raw_args[i];
         if rest_positional {
             positional.push(Value::Str(arg.clone()));
@@ -61,7 +67,12 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             continue;
         }
         if let Some(short) = arg.strip_prefix('-') {
-            if !short.is_empty() && !short.chars().all(|c| c.is_ascii_digit()) {
+            let is_neg_num = short
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_digit() || b == b'.')
+                && short.parse::<f64>().is_ok();
+            if !short.is_empty() && !is_neg_num {
                 for ch in short.chars() {
                     flags.insert(ch.to_string(), Value::Bool(true));
                 }
@@ -73,6 +84,12 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         i += 1;
     }
 
+    let approx_alloc = flags
+        .len()
+        .saturating_add(options.len())
+        .saturating_add(positional.len())
+        .saturating_mul(64)
+        .saturating_add(raw_args.iter().map(|s| s.len()).sum());
     let command = positional.first().cloned().unwrap_or(Value::Unit);
     let mut out = HashMap::new();
     out.insert("command".to_string(), command);
@@ -88,7 +105,7 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         "positional".to_string(),
         Value::List(Rc::new(RefCell::new(positional))),
     );
-    vm.charge_alloc(out.len().saturating_mul(64))?;
+    vm.charge_alloc(approx_alloc.max(256))?;
     Ok(Value::Dict(Rc::new(RefCell::new(out))))
 }
 

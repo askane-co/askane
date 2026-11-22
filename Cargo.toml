@@ -1,6 +1,6 @@
 [package]
 name = "askane"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2024"
 description = "Askane: an experimental bytecode-compiled scripting language with expression-oriented blocks, pipelines, and pattern matching."
 license = "MIT"
