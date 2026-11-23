@@ -7,10 +7,11 @@ mod cli;
 mod clipboard;
 mod collections;
 pub(crate) mod compress;
+mod crypto;
 mod csv;
 mod datetime;
 mod dialog;
-mod diff;
+pub(crate) mod diff;
 mod fs;
 pub(crate) mod gfx;
 mod glob;
@@ -21,17 +22,21 @@ mod http;
 mod ini;
 mod input;
 mod json;
+mod kv;
 pub(crate) mod log;
 mod math;
 mod mem;
+mod net;
 mod os;
 mod path;
 mod pprint;
 mod process;
-mod random;
+pub(crate) mod random;
 mod regex;
+mod signal;
 pub(crate) mod strings;
 mod sys;
+mod task;
 mod term;
 mod test;
 mod time;
@@ -39,6 +44,7 @@ mod toml;
 mod ui;
 mod url;
 mod uuid;
+mod ws;
 mod xml;
 
 use std::cell::RefCell;
@@ -79,6 +85,9 @@ pub fn reset_runtime_state() {
     gfx::reset_state();
     input::reset_state();
     ui::reset_state();
+    kv::reset_state();
+    net::reset_state();
+    ws::reset_state();
 }
 
 pub fn get_builtin_module(name: &str) -> Option<Value> {
@@ -125,6 +134,13 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "xml" => Some(xml::module()),
         "input" => Some(input::module()),
         "ui" => Some(ui::module()),
+        "crypto" => Some(crypto::module()),
+        "kv" => Some(kv::module()),
+        "net" => Some(net::module()),
+        "ws" => Some(ws::module()),
+        "signal" => Some(signal::module()),
+        "task" => Some(task::task_module()),
+        "channel" => Some(task::channel_module()),
         _ => None,
     }
 }

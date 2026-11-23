@@ -1,10 +1,10 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bytecode::{Constant, FunctionProto, Op, verify_proto};
 use crate::compiler::Compiler;
@@ -82,7 +82,88 @@ struct CleanupEntry {
     kind: CleanupKind,
 }
 
+#[derive(Clone)]
+pub(crate) enum YieldRequest {
+    Yield,
+    Sleep(u64),
+    Join(u64),
+    ChanSend { ch_id: u64, val: Value },
+    ChanRecv { ch_id: u64 },
+    SelectRecv { ch_ids: Vec<u64> },
+}
+
+#[derive(Clone)]
+enum TaskWait {
+    Ready,
+    Sleeping(u64),
+    Join(u64),
+    ChanSend(u64),
+    ChanRecv(u64),
+    SelectRecv(Vec<u64>),
+    Done,
+}
+
+struct GreenTask {
+    stack: Vec<Value>,
+    frames: Vec<CallFrame>,
+    try_handlers: Vec<TryHandler>,
+    cleanup_stack: Vec<CleanupEntry>,
+    open_upvalues: Vec<Rc<RefCell<UpvalueState>>>,
+    permissions: Permissions,
+    sandboxed: bool,
+    wait: TaskWait,
+    wake_value: Option<Result<Value, String>>,
+    result: Option<Result<Value, String>>,
+}
+
+struct ChannelState {
+    capacity: usize,
+    queue: VecDeque<Value>,
+    closed: bool,
+    send_waiters: VecDeque<(u64, Value)>,
+    recv_waiters: VecDeque<u64>,
+}
+
+struct GreenScheduler {
+    next_task_id: u64,
+    next_chan_id: u64,
+    current_task_id: u64,
+    tasks: HashMap<u64, GreenTask>,
+    ready_queue: VecDeque<u64>,
+    join_waiters: HashMap<u64, Vec<u64>>,
+    channels: HashMap<u64, ChannelState>,
+    pending_yield: Option<YieldRequest>,
+}
+
+impl GreenScheduler {
+    fn new() -> Self {
+        Self {
+            next_task_id: 1,
+            next_chan_id: 1,
+            current_task_id: 0,
+            tasks: HashMap::new(),
+            ready_queue: VecDeque::new(),
+            join_waiters: HashMap::new(),
+            channels: HashMap::new(),
+            pending_yield: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.next_task_id = 1;
+        self.next_chan_id = 1;
+        self.current_task_id = 0;
+        self.tasks.clear();
+        self.ready_queue.clear();
+        self.join_waiters.clear();
+        self.channels.clear();
+        self.pending_yield = None;
+    }
+}
+
 const MAX_CALL_DEPTH: usize = 1024;
+const MAX_GREEN_TASKS: usize = 1024;
+const MAX_CHANNELS: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct Permissions {
@@ -179,6 +260,10 @@ pub struct VM {
     fmt_depth: usize,
     profile_enabled: bool,
     profile_stats: HashMap<String, ProfileEntry>,
+    virtual_time_ms: Option<u64>,
+    update_snapshots: bool,
+    execute_depth: usize,
+    scheduler: GreenScheduler,
 }
 
 impl Drop for VM {
@@ -229,6 +314,10 @@ impl VM {
             fmt_depth: 0,
             profile_enabled: false,
             profile_stats: HashMap::new(),
+            virtual_time_ms: None,
+            update_snapshots: false,
+            execute_depth: 0,
+            scheduler: GreenScheduler::new(),
         };
         vm.register_natives();
         vm
@@ -260,6 +349,23 @@ impl VM {
         self.profile_enabled = enabled;
     }
 
+    pub fn set_deterministic(&mut self, enabled: bool) {
+        if enabled {
+            self.virtual_time_ms = Some(0);
+            crate::modules::random::set_deterministic_seed(0x5EED_0170_2026_0001);
+        } else {
+            self.virtual_time_ms = None;
+        }
+    }
+
+    pub fn set_update_snapshots(&mut self, enabled: bool) {
+        self.update_snapshots = enabled;
+    }
+
+    pub fn should_update_snapshots(&self) -> bool {
+        self.update_snapshots
+    }
+
     pub fn profile_report(&self) -> Vec<(String, ProfileEntry)> {
         let mut out: Vec<(String, ProfileEntry)> = self
             .profile_stats
@@ -289,12 +395,35 @@ impl VM {
     }
 
     pub fn elapsed_ms(&self) -> i64 {
-        self.start_time.elapsed().as_millis() as i64
+        if let Some(vt) = self.virtual_time_ms {
+            vt as i64
+        } else {
+            self.start_time.elapsed().as_millis() as i64
+        }
+    }
+
+    pub fn now_unix_ms(&self) -> Result<i64, String> {
+        if let Some(vt) = self.virtual_time_ms {
+            return Ok(1_700_000_000_000i64.saturating_add(vt as i64));
+        }
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as i64;
+        Ok(ms)
+    }
+
+    fn current_clock_ms(&self) -> u64 {
+        if let Some(vt) = self.virtual_time_ms {
+            vt
+        } else {
+            self.run_start.elapsed().as_millis() as u64
+        }
     }
 
     pub fn check_timeout(&self) -> Result<(), String> {
         if let Some(limit_ms) = self.permissions.max_duration_ms {
-            if self.run_start.elapsed().as_millis() as u64 > limit_ms {
+            if self.current_clock_ms() > limit_ms {
                 return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
             }
         }
@@ -360,10 +489,21 @@ impl VM {
             || err.contains("Execution timeout (")
     }
 
-    pub fn sleep_bounded(&self, ms: u64) -> Result<(), String> {
+    pub fn sleep_bounded(&mut self, ms: u64) -> Result<(), String> {
         self.check_timeout()?;
-        if self.is_sandboxed() && ms > 1000 {
+        if self.virtual_time_ms.is_none() && self.is_sandboxed() && ms > 1000 {
             return Err("Sandbox sleep limit is 1000 ms per call".to_string());
+        }
+        if let Some(vt) = self.virtual_time_ms.as_mut() {
+            let next = vt.saturating_add(ms);
+            if let Some(limit_ms) = self.permissions.max_duration_ms {
+                if next > limit_ms {
+                    *vt = limit_ms;
+                    return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+                }
+            }
+            *vt = next;
+            return Ok(());
         }
         if let Some(limit_ms) = self.permissions.max_duration_ms {
             let elapsed = self.run_start.elapsed().as_millis() as u64;
@@ -379,6 +519,48 @@ impl VM {
         Ok(())
     }
 
+    pub fn check_host_port(&self, authority: &str) -> Result<(), String> {
+        if authority.is_empty()
+            || authority.len() > 1024
+            || authority.contains('@')
+            || authority
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '\\' || c == '/')
+        {
+            return Err("Invalid or disallowed network address".to_string());
+        }
+        if self.permissions.allow_all {
+            return Ok(());
+        }
+        let Some(allowed) = &self.permissions.allow_net else {
+            return Err(
+                "Network is disabled in sandbox mode (pass --allow-net or --unsafe)".to_string(),
+            );
+        };
+        if allowed.is_empty() {
+            return Ok(());
+        }
+        let host_only = if authority.starts_with('[') {
+            authority
+                .find(']')
+                .map(|i| &authority[..=i])
+                .unwrap_or(authority)
+        } else {
+            authority.split(':').next().unwrap_or(authority)
+        };
+        if allowed
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(authority) || p.eq_ignore_ascii_case(host_only))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "Network access to '{}' is not allowed (pass --allow-net={})",
+                authority, authority
+            ))
+        }
+    }
+
     pub fn check_net(&self, url: &str) -> Result<(), String> {
         if url.is_empty()
             || url.len() > 8192
@@ -392,40 +574,7 @@ impl VM {
             .strip_prefix("https://")
             .ok_or_else(|| "Only https:// URLs are allowed".to_string())?;
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        if authority.is_empty() || authority.contains('@') {
-            return Err("Invalid or disallowed URL authority".to_string());
-        }
-        if self.permissions.allow_all {
-            return Ok(());
-        }
-        let Some(allowed) = &self.permissions.allow_net else {
-            return Err(
-                "Network is disabled in sandbox mode (pass --allow-net or --unsafe)".to_string(),
-            );
-        };
-        if allowed.is_empty() {
-            return Ok(());
-        }
-        let host_port = authority;
-        let host_only = if host_port.starts_with('[') {
-            host_port
-                .find(']')
-                .map(|i| &host_port[..=i])
-                .unwrap_or(host_port)
-        } else {
-            host_port.split(':').next().unwrap_or(host_port)
-        };
-        if allowed
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(host_port) || p.eq_ignore_ascii_case(host_only))
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "Network access to '{}' is not allowed (pass --allow-net={})",
-                host_port, host_port
-            ))
-        }
+        self.check_host_port(authority)
     }
 
     pub fn check_env(&self, name: &str) -> Result<(), String> {
@@ -481,7 +630,18 @@ impl VM {
         }
     }
 
-    pub fn sleep_checked(&self, ms: u64) -> Result<(), String> {
+    pub fn sleep_checked(&mut self, ms: u64) -> Result<(), String> {
+        if let Some(vt) = self.virtual_time_ms.as_mut() {
+            let next = vt.saturating_add(ms);
+            if let Some(limit_ms) = self.permissions.max_duration_ms {
+                if next > limit_ms {
+                    *vt = limit_ms;
+                    return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+                }
+            }
+            *vt = next;
+            return Ok(());
+        }
         let mut rem = ms;
         while rem > 0 {
             self.check_timeout()?;
@@ -896,10 +1056,14 @@ impl VM {
             self.step_counter = 0;
             self.budget = ResourceBudget::default();
             self.run_start = Instant::now();
+            if self.virtual_time_ms.is_some() {
+                self.virtual_time_ms = Some(0);
+            }
             self.try_handlers.clear();
             self.cleanup_stack.clear();
             self.spec_results.clear();
             self.fmt_depth = 0;
+            self.scheduler.reset();
             self.ic_epoch = self.ic_epoch.wrapping_add(1).max(1);
             if self.profile_enabled {
                 self.profile_stats.clear();
@@ -1316,12 +1480,13 @@ impl VM {
     }
 
     fn execute(&mut self, target_depth: usize) -> Result<Value, String> {
-        loop {
+        self.execute_depth += 1;
+        let res = loop {
             match self.execute_fast(target_depth) {
-                Ok(val) => return Ok(val),
+                Ok(val) => break Ok(val),
                 Err(mut err) => {
                     if Self::is_unrecoverable_error(&err) {
-                        return Err(err);
+                        break Err(err);
                     }
                     if let Some(handler) = self.try_handlers.last().cloned() {
                         if handler.frame_depth > target_depth {
@@ -1331,7 +1496,7 @@ impl VM {
                                     self.unwind_cleanups_to_len(handler.cleanup_len, true)
                                 {
                                     if Self::is_unrecoverable_error(&cleanup_err) {
-                                        return Err(cleanup_err);
+                                        break Err(cleanup_err);
                                     }
                                     err = cleanup_err;
                                 }
@@ -1346,10 +1511,19 @@ impl VM {
                             continue;
                         }
                     }
-                    return Err(err);
+                    if target_depth == 0 && self.scheduler.current_task_id != 0 {
+                        let _ = self.unwind_cleanups_to_len(0, true);
+                        match self.finish_current_green_task(Err(err)) {
+                            Ok(()) => continue,
+                            Err(sched_err) => break Err(sched_err),
+                        }
+                    }
+                    break Err(err);
                 }
             }
-        }
+        };
+        self.execute_depth -= 1;
+        res
     }
 
     #[inline(always)]
@@ -1362,9 +1536,7 @@ impl VM {
             self.instructions_left -= 1;
         }
         if let Some(limit_ms) = self.permissions.max_duration_ms {
-            if (self.step_counter & 4095) == 0
-                && self.run_start.elapsed().as_millis() as u64 > limit_ms
-            {
+            if (self.step_counter & 4095) == 0 && self.current_clock_ms() > limit_ms {
                 return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
             }
         }
@@ -2058,7 +2230,20 @@ impl VM {
                             if self.profile_enabled {
                                 self.record_profile(native.name, enter_step, enter_time);
                             }
-                            self.stack.push(res?);
+                            let val = res?;
+                            if let Some(req) = self.scheduler.pending_yield.take() {
+                                let wake_val = self.suspend_and_switch(req)?;
+                                let caller = self.frames.last().unwrap();
+                                cur_closure = caller.closure.clone();
+                                cur_base = caller.base;
+                                ip = caller.ip;
+                                proto_id = cur_closure.proto.ic_id;
+                                if let Some(v) = wake_val {
+                                    self.stack.push(v);
+                                }
+                                continue;
+                            }
+                            self.stack.push(val);
                         }
                         Value::BoundMethod(_) | Value::StructDef(_) => {
                             let callee =
@@ -2109,6 +2294,18 @@ impl VM {
                                             let res = self
                                                 .call_value(other, &combined)
                                                 .map_err(|e| format!("[line {}] {}", line, e))?;
+                                            if let Some(req) = self.scheduler.pending_yield.take() {
+                                                let wake_val = self.suspend_and_switch(req)?;
+                                                let caller = self.frames.last().unwrap();
+                                                cur_closure = caller.closure.clone();
+                                                cur_base = caller.base;
+                                                ip = caller.ip;
+                                                proto_id = cur_closure.proto.ic_id;
+                                                if let Some(v) = wake_val {
+                                                    self.stack.push(v);
+                                                }
+                                                continue;
+                                            }
                                             self.stack.push(res);
                                         }
                                     }
@@ -3054,6 +3251,15 @@ impl VM {
                     }
                     self.stack.truncate(frame.base);
                     if self.frames.len() == target_depth {
+                        if target_depth == 0 && self.scheduler.current_task_id != 0 {
+                            self.finish_current_green_task(Ok(result))?;
+                            let caller = self.frames.last().unwrap();
+                            cur_closure = caller.closure.clone();
+                            cur_base = caller.base;
+                            ip = caller.ip;
+                            proto_id = cur_closure.proto.ic_id;
+                            continue;
+                        }
                         return Ok(result);
                     }
                     self.stack.push(result);
@@ -3729,6 +3935,605 @@ impl VM {
         };
         self.stack.push(res);
         Ok(())
+    }
+
+    fn ensure_main_task_slot(&mut self) {
+        if !self.scheduler.tasks.contains_key(&0) {
+            self.scheduler.tasks.insert(
+                0,
+                GreenTask {
+                    stack: Vec::new(),
+                    frames: Vec::new(),
+                    try_handlers: Vec::new(),
+                    cleanup_stack: Vec::new(),
+                    open_upvalues: Vec::new(),
+                    permissions: self.permissions.clone(),
+                    sandboxed: self.sandboxed,
+                    wait: TaskWait::Ready,
+                    wake_value: None,
+                    result: None,
+                },
+            );
+        }
+    }
+
+    fn save_current_task_state(&mut self, wait: TaskWait) {
+        self.ensure_main_task_slot();
+        let cur_id = self.scheduler.current_task_id;
+        let stack = std::mem::take(&mut self.stack);
+        let frames = std::mem::take(&mut self.frames);
+        let try_handlers = std::mem::take(&mut self.try_handlers);
+        let cleanup_stack = std::mem::take(&mut self.cleanup_stack);
+        let open_upvalues = std::mem::take(&mut self.open_upvalues);
+        let perms = self.permissions.clone();
+        let sandboxed = self.sandboxed;
+        if let Some(t) = self.scheduler.tasks.get_mut(&cur_id) {
+            t.stack = stack;
+            t.frames = frames;
+            t.try_handlers = try_handlers;
+            t.cleanup_stack = cleanup_stack;
+            t.open_upvalues = open_upvalues;
+            t.permissions = perms;
+            t.sandboxed = sandboxed;
+            t.wait = wait;
+        }
+    }
+
+    fn load_task_state(&mut self, next_id: u64) -> Result<Option<Value>, String> {
+        let t = self
+            .scheduler
+            .tasks
+            .get_mut(&next_id)
+            .ok_or_else(|| "Scheduler error: missing target task".to_string())?;
+        self.stack = std::mem::take(&mut t.stack);
+        self.frames = std::mem::take(&mut t.frames);
+        self.try_handlers = std::mem::take(&mut t.try_handlers);
+        self.cleanup_stack = std::mem::take(&mut t.cleanup_stack);
+        self.open_upvalues = std::mem::take(&mut t.open_upvalues);
+        self.permissions = t.permissions.clone();
+        self.sandboxed = t.sandboxed;
+        t.wait = TaskWait::Ready;
+        self.scheduler.current_task_id = next_id;
+        match t.wake_value.take() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    fn pick_next_ready_or_advance(&mut self) -> Result<u64, String> {
+        loop {
+            self.check_timeout()?;
+            while let Some(id) = self.scheduler.ready_queue.pop_front() {
+                if let Some(t) = self.scheduler.tasks.get(&id) {
+                    if matches!(t.wait, TaskWait::Ready) && !t.frames.is_empty() {
+                        return Ok(id);
+                    }
+                }
+            }
+
+            let mut earliest: Option<u64> = None;
+            for t in self.scheduler.tasks.values() {
+                if let TaskWait::Sleeping(deadline) = t.wait {
+                    earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+                }
+            }
+            let Some(deadline) = earliest else {
+                return Err("Deadlock: all tasks are blocked".to_string());
+            };
+            let now = self.current_clock_ms();
+            if now < deadline {
+                let delta = deadline - now;
+                if let Some(vt) = self.virtual_time_ms.as_mut() {
+                    let next = deadline;
+                    if let Some(limit_ms) = self.permissions.max_duration_ms {
+                        if next > limit_ms {
+                            *vt = limit_ms;
+                            return Err(format!("Execution timeout ({} ms exceeded)", limit_ms));
+                        }
+                    }
+                    *vt = next;
+                } else {
+                    self.sleep_checked(delta.min(25))?;
+                }
+            }
+            let now_after = self.current_clock_ms();
+            let mut woken = Vec::new();
+            for (&id, t) in self.scheduler.tasks.iter_mut() {
+                if let TaskWait::Sleeping(d) = t.wait {
+                    if d <= now_after {
+                        t.wait = TaskWait::Ready;
+                        t.wake_value = Some(Ok(Value::Unit));
+                        woken.push(id);
+                    }
+                }
+            }
+            woken.sort_unstable();
+            for id in woken {
+                self.scheduler.ready_queue.push_back(id);
+            }
+        }
+    }
+
+    fn suspend_and_switch(&mut self, req: YieldRequest) -> Result<Option<Value>, String> {
+        let cur_id = self.scheduler.current_task_id;
+        let wait_kind = match req {
+            YieldRequest::Yield => {
+                self.scheduler.ready_queue.push_back(cur_id);
+                TaskWait::Ready
+            }
+            YieldRequest::Sleep(ms) => {
+                if self.virtual_time_ms.is_none() && self.is_sandboxed() && ms > 1000 {
+                    return Err("Sandbox sleep limit is 1000 ms per call".to_string());
+                }
+                let deadline = self.current_clock_ms().saturating_add(ms);
+                TaskWait::Sleeping(deadline)
+            }
+            YieldRequest::Join(target_id) => {
+                self.scheduler
+                    .join_waiters
+                    .entry(target_id)
+                    .or_default()
+                    .push(cur_id);
+                TaskWait::Join(target_id)
+            }
+            YieldRequest::ChanSend { ch_id, val } => {
+                let ch = self
+                    .scheduler
+                    .channels
+                    .get_mut(&ch_id)
+                    .ok_or_else(|| "channel.send(): invalid channel".to_string())?;
+                ch.send_waiters.push_back((cur_id, val));
+                TaskWait::ChanSend(ch_id)
+            }
+            YieldRequest::ChanRecv { ch_id } => {
+                let ch = self
+                    .scheduler
+                    .channels
+                    .get_mut(&ch_id)
+                    .ok_or_else(|| "channel.recv(): invalid channel".to_string())?;
+                ch.recv_waiters.push_back(cur_id);
+                TaskWait::ChanRecv(ch_id)
+            }
+            YieldRequest::SelectRecv { ch_ids } => {
+                for &cid in &ch_ids {
+                    if let Some(ch) = self.scheduler.channels.get_mut(&cid) {
+                        ch.recv_waiters.push_back(cur_id);
+                    }
+                }
+                TaskWait::SelectRecv(ch_ids)
+            }
+        };
+        let mut wake_on_yield = matches!(wait_kind, TaskWait::Ready);
+        self.save_current_task_state(wait_kind);
+        if wake_on_yield {
+            if let Some(t) = self.scheduler.tasks.get_mut(&cur_id) {
+                t.wake_value = Some(Ok(Value::Unit));
+            }
+            wake_on_yield = false;
+            let _ = wake_on_yield;
+        }
+        let next_id = self.pick_next_ready_or_advance()?;
+        self.load_task_state(next_id)
+    }
+
+    fn finish_current_green_task(&mut self, outcome: Result<Value, String>) -> Result<(), String> {
+        let cur_id = self.scheduler.current_task_id;
+        let waiters = self
+            .scheduler
+            .join_waiters
+            .remove(&cur_id)
+            .unwrap_or_default();
+        self.save_current_task_state(TaskWait::Done);
+        if let Some(t) = self.scheduler.tasks.get_mut(&cur_id) {
+            t.result = Some(outcome.clone());
+            t.stack.clear();
+            t.frames.clear();
+            t.try_handlers.clear();
+            t.cleanup_stack.clear();
+        }
+        for wid in waiters {
+            if let Some(wt) = self.scheduler.tasks.get_mut(&wid) {
+                if matches!(wt.wait, TaskWait::Join(tid) if tid == cur_id) {
+                    wt.wait = TaskWait::Ready;
+                    wt.wake_value = Some(outcome.clone());
+                    self.scheduler.ready_queue.push_back(wid);
+                }
+            }
+        }
+        let next_id = self.pick_next_ready_or_advance()?;
+        if let Some(val) = self.load_task_state(next_id)? {
+            self.stack.push(val);
+        }
+        Ok(())
+    }
+
+    fn select_result_dict(idx: usize, val: Value, closed: bool) -> Value {
+        let mut map = HashMap::new();
+        map.insert("index".to_string(), Value::Int(idx as i64));
+        map.insert("value".to_string(), val);
+        map.insert("closed".to_string(), Value::Bool(closed));
+        Value::Dict(Rc::new(RefCell::new(map)))
+    }
+
+    pub(crate) fn spawn_green_task(
+        &mut self,
+        callee: Value,
+        args: &[Value],
+    ) -> Result<u64, String> {
+        if self.scheduler.tasks.len() >= MAX_GREEN_TASKS {
+            return Err(format!(
+                "task.spawn(): maximum active/completed tasks ({}) exceeded",
+                MAX_GREEN_TASKS
+            ));
+        }
+        let Value::Closure(closure) = callee else {
+            return Err(format!(
+                "task.spawn() expects a function/closure, got '{}'",
+                callee.type_name()
+            ));
+        };
+        let (slots, bits) = self.build_closure_slots(&closure, args, None)?;
+        self.ensure_main_task_slot();
+        let id = self.scheduler.next_task_id;
+        self.scheduler.next_task_id += 1;
+
+        let mut stack = Vec::with_capacity(slots.len() + 1);
+        stack.push(Value::Closure(closure.clone()));
+        stack.extend(slots);
+        let frames = vec![CallFrame {
+            closure,
+            ip: 0,
+            base: 0,
+            arg_bits: bits,
+            enter_step: self.step_counter,
+            enter_time: if self.profile_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            },
+        }];
+        self.scheduler.tasks.insert(
+            id,
+            GreenTask {
+                stack,
+                frames,
+                try_handlers: Vec::new(),
+                cleanup_stack: Vec::new(),
+                open_upvalues: Vec::new(),
+                permissions: self.permissions.clone(),
+                sandboxed: self.sandboxed,
+                wait: TaskWait::Ready,
+                wake_value: None,
+                result: None,
+            },
+        );
+        self.scheduler.ready_queue.push_back(id);
+        Ok(id)
+    }
+
+    pub(crate) fn yield_current_task(&mut self) -> Result<(), String> {
+        if self.execute_depth != 1 {
+            return Err("Cannot yield task from inside nested native callback".to_string());
+        }
+        if !self.scheduler.tasks.is_empty() {
+            self.scheduler.pending_yield = Some(YieldRequest::Yield);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sleep_green_task(&mut self, ms: u64) -> Result<(), String> {
+        if self.execute_depth == 1 && !self.scheduler.tasks.is_empty() {
+            self.scheduler.pending_yield = Some(YieldRequest::Sleep(ms));
+            return Ok(());
+        }
+        self.sleep_bounded(ms)
+    }
+
+    pub(crate) fn join_green_task(&mut self, target_id: u64) -> Result<Value, String> {
+        if target_id == self.scheduler.current_task_id {
+            return Err("task.join(): cannot join current task".to_string());
+        }
+        let task = self
+            .scheduler
+            .tasks
+            .get(&target_id)
+            .ok_or_else(|| "task.join(): unknown task handle".to_string())?;
+        if let Some(res) = &task.result {
+            return res.clone();
+        }
+        if self.execute_depth != 1 {
+            return Err(
+                "Cannot join unfinished task from inside nested native callback".to_string(),
+            );
+        }
+        self.scheduler.pending_yield = Some(YieldRequest::Join(target_id));
+        Ok(Value::Unit)
+    }
+
+    pub(crate) fn is_task_done(&self, target_id: u64) -> bool {
+        self.scheduler
+            .tasks
+            .get(&target_id)
+            .is_some_and(|t| t.result.is_some())
+    }
+
+    pub(crate) fn run_with_timeout(&mut self, ms: u64, callee: Value) -> Result<Value, String> {
+        let prev_limit = self.permissions.max_duration_ms;
+        let now = self.current_clock_ms();
+        let target_limit = now.saturating_add(ms);
+        self.permissions.max_duration_ms =
+            Some(prev_limit.map_or(target_limit, |p| p.min(target_limit)));
+        let res = self.call_value(callee, &[]);
+        self.permissions.max_duration_ms = prev_limit;
+        self.check_timeout()?;
+
+        let mut map = HashMap::new();
+        match res {
+            Ok(v) => {
+                map.insert("ok".to_string(), Value::Bool(true));
+                map.insert("value".to_string(), v);
+            }
+            Err(e) => {
+                if Self::is_unrecoverable_error(&e) && !e.contains("Execution timeout (") {
+                    return Err(e);
+                }
+                map.insert("ok".to_string(), Value::Bool(false));
+                map.insert("error".to_string(), Value::Str(e));
+            }
+        }
+        Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    }
+
+    pub(crate) fn create_channel(&mut self, capacity: usize) -> Result<u64, String> {
+        if self.scheduler.channels.len() >= MAX_CHANNELS {
+            return Err(format!(
+                "channel.bounded(): maximum channels ({}) exceeded",
+                MAX_CHANNELS
+            ));
+        }
+        let id = self.scheduler.next_chan_id;
+        self.scheduler.next_chan_id += 1;
+        self.scheduler.channels.insert(
+            id,
+            ChannelState {
+                capacity,
+                queue: VecDeque::with_capacity(capacity.min(64)),
+                closed: false,
+                send_waiters: VecDeque::new(),
+                recv_waiters: VecDeque::new(),
+            },
+        );
+        Ok(id)
+    }
+
+    fn wake_one_receiver(&mut self, ch_id: u64, val: Value, closed: bool) -> bool {
+        loop {
+            let rx_id = {
+                let Some(ch) = self.scheduler.channels.get_mut(&ch_id) else {
+                    return false;
+                };
+                ch.recv_waiters.pop_front()
+            };
+            let Some(tid) = rx_id else {
+                return false;
+            };
+            if let Some(t) = self.scheduler.tasks.get_mut(&tid) {
+                match &t.wait {
+                    TaskWait::ChanRecv(c) if *c == ch_id => {
+                        t.wait = TaskWait::Ready;
+                        t.wake_value = Some(Ok(val));
+                        self.scheduler.ready_queue.push_back(tid);
+                        return true;
+                    }
+                    TaskWait::SelectRecv(list) => {
+                        if let Some(idx) = list.iter().position(|&c| c == ch_id) {
+                            t.wait = TaskWait::Ready;
+                            t.wake_value = Some(Ok(Self::select_result_dict(idx, val, closed)));
+                            self.scheduler.ready_queue.push_back(tid);
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn promote_one_sender(&mut self, ch_id: u64) {
+        loop {
+            let item = {
+                let Some(ch) = self.scheduler.channels.get_mut(&ch_id) else {
+                    return;
+                };
+                if ch.queue.len() >= ch.capacity {
+                    return;
+                }
+                ch.send_waiters.pop_front()
+            };
+            let Some((tid, val)) = item else {
+                return;
+            };
+            let is_waiting = self
+                .scheduler
+                .tasks
+                .get(&tid)
+                .is_some_and(|t| matches!(t.wait, TaskWait::ChanSend(c) if c == ch_id));
+            if is_waiting {
+                if let Some(ch) = self.scheduler.channels.get_mut(&ch_id) {
+                    ch.queue.push_back(val);
+                }
+                if let Some(t) = self.scheduler.tasks.get_mut(&tid) {
+                    t.wait = TaskWait::Ready;
+                    t.wake_value = Some(Ok(Value::Unit));
+                }
+                self.scheduler.ready_queue.push_back(tid);
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn channel_send(&mut self, ch_id: u64, val: Value) -> Result<(), String> {
+        let closed = self
+            .scheduler
+            .channels
+            .get(&ch_id)
+            .ok_or_else(|| "channel.send(): invalid channel".to_string())?
+            .closed;
+        if closed {
+            return Err("channel.send(): channel is closed".to_string());
+        }
+        if self.wake_one_receiver(ch_id, val.clone(), false) {
+            return Ok(());
+        }
+        let has_room = {
+            let ch = self.scheduler.channels.get_mut(&ch_id).unwrap();
+            if ch.queue.len() < ch.capacity {
+                ch.queue.push_back(val.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if has_room {
+            return Ok(());
+        }
+        if self.execute_depth != 1 {
+            return Err("channel.send(): channel is full inside native callback".to_string());
+        }
+        self.scheduler.pending_yield = Some(YieldRequest::ChanSend { ch_id, val });
+        Ok(())
+    }
+
+    pub(crate) fn channel_try_send(&mut self, ch_id: u64, val: Value) -> Result<bool, String> {
+        let closed = self
+            .scheduler
+            .channels
+            .get(&ch_id)
+            .ok_or_else(|| "channel.try_send(): invalid channel".to_string())?
+            .closed;
+        if closed {
+            return Err("channel.try_send(): channel is closed".to_string());
+        }
+        if self.wake_one_receiver(ch_id, val.clone(), false) {
+            return Ok(true);
+        }
+        let ch = self.scheduler.channels.get_mut(&ch_id).unwrap();
+        if ch.queue.len() < ch.capacity {
+            ch.queue.push_back(val);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub(crate) fn channel_recv(&mut self, ch_id: u64) -> Result<Value, String> {
+        let (popped, closed) = {
+            let ch = self
+                .scheduler
+                .channels
+                .get_mut(&ch_id)
+                .ok_or_else(|| "channel.recv(): invalid channel".to_string())?;
+            (ch.queue.pop_front(), ch.closed)
+        };
+        if let Some(v) = popped {
+            self.promote_one_sender(ch_id);
+            return Ok(v);
+        }
+        if closed {
+            return Ok(Value::Unit);
+        }
+        if self.execute_depth != 1 {
+            return Err("channel.recv(): channel is empty inside native callback".to_string());
+        }
+        self.scheduler.pending_yield = Some(YieldRequest::ChanRecv { ch_id });
+        Ok(Value::Unit)
+    }
+
+    pub(crate) fn channel_try_recv(&mut self, ch_id: u64) -> Result<(bool, Value, bool), String> {
+        let (popped, closed) = {
+            let ch = self
+                .scheduler
+                .channels
+                .get_mut(&ch_id)
+                .ok_or_else(|| "channel.try_recv(): invalid channel".to_string())?;
+            (ch.queue.pop_front(), ch.closed)
+        };
+        if let Some(v) = popped {
+            self.promote_one_sender(ch_id);
+            Ok((true, v, false))
+        } else {
+            Ok((false, Value::Unit, closed))
+        }
+    }
+
+    pub(crate) fn channel_close(&mut self, ch_id: u64) -> Result<(), String> {
+        let ch = self
+            .scheduler
+            .channels
+            .get_mut(&ch_id)
+            .ok_or_else(|| "channel.close(): invalid channel".to_string())?;
+        if ch.closed {
+            return Ok(());
+        }
+        ch.closed = true;
+        let senders: Vec<(u64, Value)> = ch.send_waiters.drain(..).collect();
+        for (sid, _) in senders {
+            if let Some(t) = self.scheduler.tasks.get_mut(&sid) {
+                if matches!(t.wait, TaskWait::ChanSend(c) if c == ch_id) {
+                    t.wait = TaskWait::Ready;
+                    t.wake_value = Some(Err("channel.send(): channel closed".to_string()));
+                    self.scheduler.ready_queue.push_back(sid);
+                }
+            }
+        }
+        while self.wake_one_receiver(ch_id, Value::Unit, true) {}
+        Ok(())
+    }
+
+    pub(crate) fn channel_len(&self, ch_id: u64) -> Result<usize, String> {
+        let ch = self
+            .scheduler
+            .channels
+            .get(&ch_id)
+            .ok_or_else(|| "channel.len(): invalid channel".to_string())?;
+        Ok(ch.queue.len())
+    }
+
+    pub(crate) fn channel_is_closed(&self, ch_id: u64) -> Result<bool, String> {
+        let ch = self
+            .scheduler
+            .channels
+            .get(&ch_id)
+            .ok_or_else(|| "channel.is_closed(): invalid channel".to_string())?;
+        Ok(ch.closed)
+    }
+
+    pub(crate) fn select_channels(&mut self, ch_ids: &[u64]) -> Result<Value, String> {
+        for (idx, &ch_id) in ch_ids.iter().enumerate() {
+            let (popped, closed) = {
+                let ch = self
+                    .scheduler
+                    .channels
+                    .get_mut(&ch_id)
+                    .ok_or_else(|| "task.select(): invalid channel".to_string())?;
+                (ch.queue.pop_front(), ch.closed)
+            };
+            if let Some(v) = popped {
+                self.promote_one_sender(ch_id);
+                return Ok(Self::select_result_dict(idx, v, false));
+            }
+            if closed {
+                return Ok(Self::select_result_dict(idx, Value::Unit, true));
+            }
+        }
+        if self.execute_depth != 1 {
+            return Err("task.select(): cannot block inside nested native callback".to_string());
+        }
+        self.scheduler.pending_yield = Some(YieldRequest::SelectRecv {
+            ch_ids: ch_ids.to_vec(),
+        });
+        Ok(Value::Unit)
     }
 }
 

@@ -18,7 +18,7 @@ pub fn module() -> Value {
     )
 }
 
-fn lcs_line_diff<'a>(
+pub(crate) fn lcs_line_diff<'a>(
     vm: &mut VM,
     a: &[&'a str],
     b: &[&'a str],

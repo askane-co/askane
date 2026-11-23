@@ -19,10 +19,11 @@ pub fn module() -> Value {
     )
 }
 
-const STD_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+pub(crate) const STD_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const URL_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn encode_bytes(input: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
+pub(crate) fn encode_bytes(input: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;

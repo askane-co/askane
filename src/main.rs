@@ -20,7 +20,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.16.2";
+const VERSION: &str = "0.17.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -155,6 +155,29 @@ fn run_file_core(
     permissions: Permissions,
     sandbox_root_override: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    run_file_core_with_test_opts(
+        path,
+        dump_bytecode,
+        profile,
+        include_specs,
+        permissions,
+        sandbox_root_override,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_file_core_with_test_opts(
+    path: &str,
+    dump_bytecode: bool,
+    profile: bool,
+    include_specs: bool,
+    permissions: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+    deterministic: bool,
+    update_snapshots: bool,
+) -> Result<(), String> {
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
     let proto = if include_specs {
@@ -170,6 +193,8 @@ fn run_file_core(
     let mut vm = VM::new_with_sandbox(!permissions.allow_all);
     vm.set_permissions(permissions);
     vm.set_profile(profile);
+    vm.set_deterministic(deterministic);
+    vm.set_update_snapshots(update_snapshots);
     let entry_parent = match std::path::Path::new(path).parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
             Some(fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()))
@@ -608,10 +633,19 @@ fn inspect_permissions_file(
                     "fs" => Some(
                         "fs (sandboxed to script dir; --allow-read / --allow-write for external dirs)",
                     ),
+                    "kv" => Some(
+                        "kv (embedded KV store, sandboxed to script dir; --allow-read / --allow-write for external dirs)",
+                    ),
                     "archive" => Some(
                         "archive (ZIP read/write, sandboxed to script dir; --allow-read / --allow-write)",
                     ),
                     "http" => Some("http (blocked by default; requires --allow-net[=host])"),
+                    "net" => Some(
+                        "net (TCP/UDP sockets, blocked by default; requires --allow-net[=host[:port]])",
+                    ),
+                    "ws" => Some(
+                        "ws (WebSockets, blocked by default; requires --allow-net[=host[:port]])",
+                    ),
                     "sys" => {
                         Some("sys (sys.env requires --allow-env, sys.args requires --allow-args)")
                     }
@@ -753,10 +787,21 @@ fn collect_ask_files_inner(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_tests_cmd(
     path: &str,
     perms: Permissions,
     sandbox_root_override: Option<&std::path::Path>,
+) -> Result<(), String> {
+    run_tests_cmd_with_opts(path, perms, sandbox_root_override, false, false)
+}
+
+fn run_tests_cmd_with_opts(
+    path: &str,
+    perms: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+    deterministic: bool,
+    update_snapshots: bool,
 ) -> Result<(), String> {
     let mut files = Vec::new();
     collect_ask_files(std::path::Path::new(path), &mut files)?;
@@ -767,13 +812,15 @@ fn run_tests_cmd(
     let mut failed = 0usize;
     for file in &files {
         let label = file.display().to_string();
-        match run_file_core(
+        match run_file_core_with_test_opts(
             &label,
             false,
             false,
             true,
             perms.clone(),
             sandbox_root_override,
+            deterministic,
+            update_snapshots,
         ) {
             Ok(()) => {
                 println!("PASS {}", label);
@@ -1363,7 +1410,9 @@ fn print_help() {
     println!(
         "  askane setup [opts]          Add Askane to User PATH & register .ask files (Windows)"
     );
-    println!("  askane test [file_or_dir]    Run .ask test files or project tests");
+    println!("  askane test [opts] [path]    Run .ask test files or project tests");
+    println!("    --deterministic            Enable virtual time & fixed random seed for tests");
+    println!("    --update-snapshots         Overwrite mismatched snapshot files");
     println!("  askane -b <file.ask>         Disassemble compiled bytecode");
     println!("  askane --profile <file.ask>  Print function profiling stats after execution");
     println!("  askane -h | --help           Show help");
@@ -2155,6 +2204,8 @@ enum CliParseOutcome {
     Run {
         dump_bytecode: bool,
         profile: bool,
+        deterministic: bool,
+        update_snapshots: bool,
         eval_code: Option<String>,
         perms: Permissions,
         script_path: Option<String>,
@@ -2165,6 +2216,8 @@ enum CliParseOutcome {
 fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
     let mut dump_bytecode = false;
     let mut profile = false;
+    let mut deterministic = false;
+    let mut update_snapshots = false;
     let mut eval_code: Option<String> = None;
     let mut perms = Permissions::sandboxed();
     let mut explicit_max_steps: Option<u64> = None;
@@ -2187,6 +2240,10 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
             dump_bytecode = true;
         } else if arg == "--profile" {
             profile = true;
+        } else if arg == "--deterministic" {
+            deterministic = true;
+        } else if arg == "--update-snapshots" {
+            update_snapshots = true;
         } else if arg == "-e" || arg == "--eval" {
             i += 1;
             let Some(code) = args.get(i) else {
@@ -2274,6 +2331,8 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
     Ok(CliParseOutcome::Run {
         dump_bytecode,
         profile,
+        deterministic,
+        update_snapshots,
         eval_code,
         perms,
         script_path,
@@ -2447,29 +2506,41 @@ fn main() {
         1
     };
 
-    let (dump_bytecode, profile, eval_code, mut perms, script_path, explicit_limits) =
-        match parse_run_args(&args[slice_start..]) {
-            Ok(CliParseOutcome::ExitZero) => return,
-            Ok(CliParseOutcome::Run {
-                dump_bytecode,
-                profile,
-                eval_code,
-                perms,
-                script_path,
-                explicit_limits,
-            }) => (
-                dump_bytecode,
-                profile,
-                eval_code,
-                perms,
-                script_path,
-                explicit_limits,
-            ),
-            Err(e) => {
-                eprintln!("{}", e);
-                process::exit(1);
-            }
-        };
+    let (
+        dump_bytecode,
+        profile,
+        deterministic,
+        update_snapshots,
+        eval_code,
+        mut perms,
+        script_path,
+        explicit_limits,
+    ) = match parse_run_args(&args[slice_start..]) {
+        Ok(CliParseOutcome::ExitZero) => return,
+        Ok(CliParseOutcome::Run {
+            dump_bytecode,
+            profile,
+            deterministic,
+            update_snapshots,
+            eval_code,
+            perms,
+            script_path,
+            explicit_limits,
+        }) => (
+            dump_bytecode,
+            profile,
+            deterministic,
+            update_snapshots,
+            eval_code,
+            perms,
+            script_path,
+            explicit_limits,
+        ),
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
 
     if let Some(code) = eval_code {
         if let Err(e) = run_eval(&code, profile, perms) {
@@ -2490,19 +2561,27 @@ fn main() {
                             let tests_rel = manifest.tests.as_deref().unwrap_or("tests");
                             resolve_manifest_subpath(&root, tests_rel, "tests").and_then(
                                 |tests_path| {
-                                    run_tests_cmd(
+                                    run_tests_cmd_with_opts(
                                         &tests_path.display().to_string(),
                                         perms,
                                         Some(&root),
+                                        deterministic,
+                                        update_snapshots,
                                     )
                                 },
                             )
                         }
-                        Ok(None) => run_tests_cmd(target, perms, None),
+                        Ok(None) => run_tests_cmd_with_opts(
+                            target,
+                            perms,
+                            None,
+                            deterministic,
+                            update_snapshots,
+                        ),
                         Err(e) => Err(e),
                     }
                 } else {
-                    run_tests_cmd(target, perms, None)
+                    run_tests_cmd_with_opts(target, perms, None, deterministic, update_snapshots)
                 }
             }
             None => match discover_manifest_from_cwd() {
@@ -2510,10 +2589,18 @@ fn main() {
                     apply_manifest_limits(&mut perms, &manifest, explicit_limits);
                     let tests_rel = manifest.tests.as_deref().unwrap_or("tests");
                     resolve_manifest_subpath(&root, tests_rel, "tests").and_then(|tests_path| {
-                        run_tests_cmd(&tests_path.display().to_string(), perms, Some(&root))
+                        run_tests_cmd_with_opts(
+                            &tests_path.display().to_string(),
+                            perms,
+                            Some(&root),
+                            deterministic,
+                            update_snapshots,
+                        )
                     })
                 }
-                Ok(None) => run_tests_cmd(".", perms, None),
+                Ok(None) => {
+                    run_tests_cmd_with_opts(".", perms, None, deterministic, update_snapshots)
+                }
                 Err(e) => Err(e),
             },
         };
@@ -6040,5 +6127,370 @@ archive.extract(z, "out")
         let (p4, removed2) = setup::remove_dir_from_path_list(&p3, "C:\\Missing");
         assert!(!removed2);
         assert_eq!(p4, "C:\\Windows;C:\\Tools");
+    }
+
+    #[test]
+    fn test_v017_gui_helpers_and_setup() {
+        let root = std::env::temp_dir().join(format!("askane_017_gui_tree_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("askane.toml"), "entry = \"main.ask\"\n").unwrap();
+        std::fs::write(root.join("main.ask"), "println(1);\n").unwrap();
+        std::fs::write(root.join("src").join("helper.ask"), "pub fn f() { 2 }\n").unwrap();
+        std::fs::write(root.join(".git").join("ignored.ask"), "x\n").unwrap();
+
+        assert_eq!(
+            gui::find_project_root_for(&root.join("src").join("helper.ask")),
+            root
+        );
+        let items = gui::scan_project_tree(&root, 100);
+        assert!(items.iter().any(|it| it.is_dir && it.display == "[src]"));
+        assert!(
+            items
+                .iter()
+                .any(|it| !it.is_dir && it.display == "askane.toml")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| !it.is_dir && it.display.ends_with("helper.ask"))
+        );
+        assert!(!items.iter().any(|it| it.display.contains("ignored.ask")));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            gui::parse_error_line_col("[12:5] Unexpected token"),
+            Some((12, 5))
+        );
+        assert_eq!(
+            gui::parse_error_line_col("  at helper (line 42)"),
+            Some((42, 1))
+        );
+        assert_eq!(gui::parse_error_line_col("no location here"), None);
+
+        let perms = gui::PermissionFlagsState {
+            unsafe_mode: false,
+            allow_read: true,
+            allow_write: false,
+            allow_net: true,
+            allow_env: false,
+            allow_exec: false,
+            allow_input: true,
+            allow_clipboard: false,
+        };
+        let flags = gui::compose_permission_flags(
+            &perms,
+            Some(std::path::Path::new("C:\\Proj")),
+            "--max-steps=1000",
+        )
+        .unwrap();
+        assert!(flags.contains(&"--allow-read=C:\\Proj".to_string()));
+        assert!(flags.contains(&"--allow-net".to_string()));
+        assert!(flags.contains(&"--allow-input".to_string()));
+        assert!(flags.contains(&"--max-steps=1000".to_string()));
+        assert!(gui::compose_permission_flags(&perms, None, "--bad-flag;rm").is_err());
+    }
+
+    #[test]
+    fn test_v017_crypto_and_kv_store() {
+        let mut vm = VM::new_with_sandbox(false);
+        let crypto_ok = vm
+            .run(
+                compile_source(
+                    r#"
+import crypto;
+import bytes;
+
+let mac = crypto.hmac_sha256_hex("Jefe", "what do ya want for nothing?");
+let mac_eq = mac == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+let key = crypto.random_key();
+let nonce = crypto.random_bytes(12);
+let ct = crypto.seal(key, nonce, b"hello askane 0.17", "hdr");
+let pt = crypto.open(key, nonce, ct, "hdr");
+let ct_match = crypto.constant_time_eq(pt, b"hello askane 0.17");
+let bad_aad = try {
+    crypto.open(key, nonce, ct, "tampered");
+    false
+} catch e {
+    true
+};
+mac_eq && ct_match && bad_aad && len(key) == 32
+"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(crypto_ok.equals(&Value::Bool(true)));
+
+        let kv_dir = std::env::temp_dir().join(format!("askane_017_kv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&kv_dir);
+        std::fs::create_dir_all(&kv_dir).unwrap();
+        let canon = fs::canonicalize(&kv_dir).unwrap();
+
+        let mut kv_vm = VM::new_with_sandbox(true);
+        kv_vm.set_current_dir(canon.clone());
+        kv_vm.set_sandbox_root(canon.clone());
+
+        let kv_res = kv_vm
+            .run(
+                compile_source(
+                    r#"
+import kv;
+with kv.open("app.db") as db {
+    db.set("user:1", #{ name: "Pleco", level: 7 });
+    db.set("user:2", b"rawbytes");
+    db.set("temp", 99);
+    db.delete("temp");
+    db.batch([["user:3", [1, 2, 3]], ["user:4", true]]);
+    db.compact();
+};
+let db2 = kv.open("app.db");
+let pfx = db2.prefix("user:");
+let ok = db2.get("user:1")["name"] == "Pleco"
+    && db2.get("user:2") == b"rawbytes"
+    && !db2.has("temp")
+    && db2.len() == 4
+    && len(pfx) == 4;
+db2.close();
+ok
+"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(kv_res.equals(&Value::Bool(true)));
+
+        assert!(
+            kv_vm
+                .run(compile_source("import kv;\nkv.open(\"../escape.db\")").unwrap())
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&kv_dir);
+    }
+
+    #[test]
+    fn test_v017_net_ws_and_concurrency_features() {
+        // 1. net & ws blocked in default sandbox
+        let mut sbx = VM::new_with_sandbox(true);
+        assert!(
+            sbx.run(compile_source("import net;\nnet.tcp_listen(\"127.0.0.1:0\")").unwrap())
+                .is_err()
+        );
+        assert!(
+            sbx.run(compile_source("import ws;\nws.connect(\"ws://127.0.0.1:8080\")").unwrap())
+                .is_err()
+        );
+
+        // 2. net TCP + UDP + WebSocket loopback with --allow-net=127.0.0.1
+        let mut perms = Permissions::sandboxed();
+        perms.allow_net = Some(vec!["127.0.0.1".to_string()]);
+        let mut net_vm = VM::new_with_sandbox(true);
+        net_vm.set_permissions(perms.clone());
+
+        let net_ok = net_vm
+            .run(
+                compile_source(
+                    r#"
+import net;
+import task;
+
+let listener = net.tcp_listen("127.0.0.1:0");
+let addr = listener.local_addr();
+let srv = task.spawn(|| {
+    let conn = listener.accept(0);
+    while conn == unit {
+        task.yield_now();
+        conn = listener.accept(0);
+    }
+    let msg = conn.recv(64, 2000);
+    conn.send(b"PONG:" + msg);
+    conn.close();
+    true
+});
+let cli = net.tcp_connect(addr, 2000);
+cli.send("HI");
+let srv_done = srv.join();
+let reply = cli.recv(64, 2000);
+cli.close();
+listener.close();
+
+let u1 = net.udp_bind("127.0.0.1:0");
+let u2 = net.udp_bind("127.0.0.1:0");
+u1.send_to(u2.local_addr(), b"UDP_OK");
+let pkt = u2.recv_from(64, 2000);
+u1.close();
+u2.close();
+
+srv_done && reply == b"PONG:HI" && pkt["data"] == b"UDP_OK"
+"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(net_ok.equals(&Value::Bool(true)));
+
+        // 2b. Real WebSocket client VM <-> WebSocket server VM across OS threads
+        let ws_dir = std::env::temp_dir().join(format!("askane_017_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws_dir);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let canon_ws = fs::canonicalize(&ws_dir).unwrap();
+        let ws_srv_dir = canon_ws.clone();
+        let ws_perms = perms.clone();
+        let srv_thread = std::thread::spawn(move || {
+            let mut srv_vm = VM::new_with_sandbox(true);
+            srv_vm.set_permissions(ws_perms);
+            srv_vm.set_current_dir(ws_srv_dir.clone());
+            srv_vm.set_sandbox_root(ws_srv_dir);
+            let res = srv_vm
+                .run(
+                    compile_source(
+                        r#"
+import ws;
+import fs;
+let wsl = ws.listen("127.0.0.1:0");
+fs.write("ws_addr.txt", wsl.local_addr());
+let c = wsl.accept(5000);
+let m1 = c.recv(5000);
+c.send("echo:" + m1);
+let m2 = c.recv(5000);
+c.send_bytes(m2);
+c.close();
+wsl.close();
+true
+"#,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(res.equals(&Value::Bool(true)));
+        });
+
+        let addr_file = canon_ws.join("ws_addr.txt");
+        let mut ws_addr = String::new();
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(&addr_file) {
+                if !s.trim().is_empty() {
+                    ws_addr = s.trim().to_string();
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!ws_addr.is_empty());
+
+        let mut cli_vm = VM::new_with_sandbox(true);
+        cli_vm.set_permissions(perms);
+        let ws_cli_ok = cli_vm
+            .run(
+                compile_source(&format!(
+                    r#"
+import ws;
+let wc = ws.connect("ws://{}", 5000);
+wc.send("askane");
+let r1 = wc.recv(5000);
+wc.send_bytes(b"\x01\x02");
+let r2 = wc.recv(5000);
+wc.close();
+r1 == "echo:askane" && r2 == b"\x01\x02"
+"#,
+                    ws_addr
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(ws_cli_ok.equals(&Value::Bool(true)));
+        srv_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws_dir);
+
+        // 3. Deterministic simulation, channels, select, timeout, signals + on change, snapshots
+        let snap_dir = std::env::temp_dir().join(format!("askane_017_snap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&snap_dir);
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let canon_snap = fs::canonicalize(&snap_dir).unwrap();
+
+        let code = r#"
+import task;
+import channel;
+import signal;
+import time;
+import random;
+import test;
+
+let c1 = channel.bounded(1);
+let c2 = channel.bounded(2);
+
+let t1 = task.spawn(|| {
+    task.sleep(200);
+    c1.send(10);
+    c1.send(20);
+    c1.close();
+});
+let t2 = task.spawn(|| {
+    after 500ms {
+        c2.send(99);
+    };
+    "done"
+});
+
+let sum = 0;
+let first_sel = task.select([c1, c2]);
+sum += first_sel["value"];
+for _ in range(0, 3) {
+    let s = task.select([c1, c2]);
+    if !s["closed"] {
+        sum += s["value"];
+    }
+}
+t1.join();
+let t2_res = t2.join();
+
+let hp = signal.new(100);
+let events = [];
+on change(hp) {
+    push(events, hp.get());
+}
+hp.set(80);
+hp.set(80);
+hp.update(|v| v - 30);
+
+let snap_payload = #{
+    sum: sum,
+    t2: t2_res,
+    events: events,
+    r: random.int(1, 10000),
+    elapsed_ok: time.elapsed_ms() >= 500,
+    to_timed_out: !task.timeout(10, || { task.sleep(50); 1 })["ok"],
+    to_ok: task.timeout(100, || 77)["value"],
+};
+test.assert_snapshot("core_017", snap_payload);
+snap_payload
+"#;
+        let proto = compile_source_with_specs(code).unwrap();
+        let mut vm1 = VM::new_with_sandbox(true);
+        vm1.set_current_dir(canon_snap.clone());
+        vm1.set_sandbox_root(canon_snap.clone());
+        vm1.set_deterministic(true);
+        let out1 = vm1.run(proto.clone()).unwrap();
+
+        let mut vm2 = VM::new_with_sandbox(true);
+        vm2.set_current_dir(canon_snap.clone());
+        vm2.set_sandbox_root(canon_snap.clone());
+        vm2.set_deterministic(true);
+        let out2 = vm2.run(proto).unwrap();
+        assert!(out1.equals(&out2));
+
+        // Mismatch fails snapshot assertion until updated
+        let mismatch_proto =
+            compile_source("import test;\ntest.assert_snapshot(\"core_017\", #{ sum: 999 });\n")
+                .unwrap();
+        let mut vm3 = VM::new_with_sandbox(true);
+        vm3.set_current_dir(canon_snap.clone());
+        vm3.set_sandbox_root(canon_snap);
+        assert!(vm3.run(mismatch_proto.clone()).is_err());
+        vm3.set_update_snapshots(true);
+        assert!(vm3.run(mismatch_proto).is_ok());
+
+        let _ = std::fs::remove_dir_all(&snap_dir);
     }
 }

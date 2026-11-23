@@ -14,9 +14,10 @@ Release roadmap for Askane, separated into completed milestones, immediate fixes
 | `0.14.0 - 0.14.1` | **Done** | Extended syntax (`+=`, `in`, `loop`, slices, list comprehensions, `match` ranges), 9 modules, BMP sprites, `fmt`/`init`, interactive stdin |
 | `0.14.2-fix` | **Done** | Compiler stack-slot offset fix (`compiler.rs`), Job Object isolation for CLI `process.run()`, and sandbox security hardening |
 | `0.14.3` | **Done** | Security, compiler, VM, and stdlib bugfix release (timeout enforcement, module recursion, glob boundaries, DAG limits, GUI/process/fs/fmt fixes) |
-| `0.15.0` | **Next** | First-class `bytes`, unified `ResourceBudget`, working `askane.toml`, multi-file `.ask` projects, AST `fmt`, `struct` & `set` |
-| `0.16.0` | **Exploratory** | 2D Desktop UI (`ui`) module before 3D, signature pipelines (`|?>`, `|*>`, `recover`), `needs`/`sandbox`, `with`/`defer` |
-| `0.17 - 0.22` | **Exploratory** | Storage/networking (`kv`, `ws`, `crypto`), diagnostics/LSP & Studio v2, cross-platform backends, fuzzing, experimental 3D (`0.22`) |
+| `0.15.0` | **Done** | First-class `bytes`, unified `ResourceBudget`, working `askane.toml`, multi-file `.ask` projects, AST `fmt`, `struct` & `set` |
+| `0.16.0 - 0.16.2` | **Done** | 2D Desktop UI (`ui`), signature pipelines (`|?>`, `|*>`, `recover`), `needs`/`sandbox`, `with`/`defer`, security fixes, embedded icon & `askane setup` |
+| `0.17.0` | **Done** | Askane Studio v2 + Setup UI, `crypto`, `kv`, `net`, `ws`, cooperative `task`/`channel`, `--deterministic`, snapshots, reactive `signal` & `on change` |
+| `0.18 - 0.22` | **Exploratory** | Diagnostics/LSP, streaming `fs`, cross-platform `gfx`/`ui`, fuzzing, experimental 3D (`0.22`) |
 
 ---
 

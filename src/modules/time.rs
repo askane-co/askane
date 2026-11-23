@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::modules::build_module;
 use crate::value::Value;
 use crate::vm::VM;
@@ -17,26 +15,18 @@ pub fn module() -> Value {
     )
 }
 
-fn time_now_ms(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn time_now_ms(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("time.now_ms() expects 0 arguments".to_string());
     }
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_millis() as i64;
-    Ok(Value::Int(ms))
+    Ok(Value::Int(vm.now_unix_ms()?))
 }
 
-fn time_now_sec(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn time_now_sec(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("time.now_sec() expects 0 arguments".to_string());
     }
-    let sec = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs() as i64;
-    Ok(Value::Int(sec))
+    Ok(Value::Int(vm.now_unix_ms()? / 1000))
 }
 
 fn time_elapsed_ms(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

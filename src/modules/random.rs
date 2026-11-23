@@ -49,7 +49,7 @@ fn next_u64() -> u64 {
 }
 
 #[cfg(windows)]
-fn os_random_bytes(buf: &mut [u8]) -> Result<(), String> {
+pub(crate) fn os_random_bytes(buf: &mut [u8]) -> Result<(), String> {
     use std::ffi::c_void;
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
     #[link(name = "bcrypt")]
@@ -76,10 +76,14 @@ fn os_random_bytes(buf: &mut [u8]) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn os_random_bytes(buf: &mut [u8]) -> Result<(), String> {
+pub(crate) fn os_random_bytes(buf: &mut [u8]) -> Result<(), String> {
     use std::io::Read;
     let mut f = std::fs::File::open("/dev/urandom").map_err(|e| e.to_string())?;
     f.read_exact(buf).map_err(|e| e.to_string())
+}
+
+pub(crate) fn set_deterministic_seed(seed: u64) {
+    RNG_STATE.with(|c| c.set(seed.max(1)));
 }
 
 fn rand_seed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {

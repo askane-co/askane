@@ -257,6 +257,15 @@ impl Parser {
             TokenKind::Ident(s) if s == "needs" => self.is_needs_stmt(),
             TokenKind::Ident(s) if s == "defer" => self.is_defer_stmt(),
             TokenKind::Ident(s) if s == "every" => self.looks_like_control_block(false),
+            TokenKind::Ident(s) if s == "on" => {
+                matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Ident(c)) if c == "change"
+                ) && matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::LParen)
+                )
+            }
             TokenKind::Ident(s) if s == "spec" => {
                 matches!(self.peek_next_kind(), Some(TokenKind::Str(_)))
                     && matches!(
@@ -488,6 +497,53 @@ impl Parser {
                     body,
                     span,
                 })
+            }
+            TokenKind::Ident(s)
+                if s == "on"
+                    && matches!(
+                        self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Ident(c)) if c == "change"
+                    )
+                    && matches!(
+                        self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                        Some(TokenKind::LParen)
+                    ) =>
+            {
+                self.advance();
+                self.advance();
+                self.expect(&TokenKind::LParen, "Expected '(' after 'on change'")?;
+                let sig_expr = self.parse_expr()?;
+                self.expect(
+                    &TokenKind::RParen,
+                    "Expected ')' after signal in 'on change'",
+                )?;
+                let body = self.parse_block()?;
+                let _ = self.match_kind(&TokenKind::Semicolon);
+                let cb = Expr::Fn {
+                    params: vec![
+                        FnParam {
+                            name: "_val".to_string(),
+                            default: None,
+                            is_variadic: false,
+                        },
+                        FnParam {
+                            name: "_old".to_string(),
+                            default: None,
+                            is_variadic: false,
+                        },
+                    ],
+                    body: Box::new(body),
+                    span,
+                };
+                Ok(Stmt::Expr(Expr::Call {
+                    callee: Box::new(Expr::GetAttr {
+                        object: Box::new(sig_expr),
+                        name: "watch".to_string(),
+                        span,
+                    }),
+                    args: vec![cb],
+                    span,
+                }))
             }
             TokenKind::Ident(s) if s == "spec" => {
                 self.advance();

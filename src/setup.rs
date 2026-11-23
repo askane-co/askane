@@ -1,6 +1,4 @@
 #[cfg(windows)]
-use std::env;
-#[cfg(windows)]
 use std::io::{self, Write};
 
 pub(crate) fn add_dir_to_path_list(existing: &str, dir: &str) -> (String, bool) {
@@ -292,7 +290,23 @@ pub(crate) mod win32_setup {
         pub exe_dir: String,
         pub in_path: bool,
         pub assoc_registered: bool,
+        pub assoc_mode: String,
         pub assoc_command: Option<String>,
+    }
+
+    pub fn current_exe_clean() -> Result<std::path::PathBuf, String> {
+        let raw_exe =
+            std::env::current_exe().map_err(|e| format!("Failed to locate askane.exe: {}", e))?;
+        Ok(std::fs::canonicalize(&raw_exe)
+            .map(|p| {
+                let s = p.to_string_lossy();
+                if let Some(stripped) = s.strip_prefix("\\\\?\\") {
+                    std::path::PathBuf::from(stripped)
+                } else {
+                    p
+                }
+            })
+            .unwrap_or(raw_exe))
     }
 
     pub fn current_status(exe_path: &Path) -> SetupStatus {
@@ -316,11 +330,19 @@ pub(crate) mod win32_setup {
         )
         .map(|(v, _)| v);
         let assoc_registered = dot_ask.as_deref() == Some("Askane.Script") && assoc_cmd.is_some();
+        let assoc_mode = if !assoc_registered {
+            "Not registered".to_string()
+        } else if assoc_cmd.as_deref().is_some_and(|c| c.contains("--gui")) {
+            "Edit in Askane Studio".to_string()
+        } else {
+            "Run with Askane".to_string()
+        };
         SetupStatus {
             exe_path: exe_str,
             exe_dir,
             in_path,
             assoc_registered,
+            assoc_mode,
             assoc_command: assoc_cmd,
         }
     }
@@ -346,7 +368,7 @@ pub(crate) mod win32_setup {
         Ok(changed)
     }
 
-    pub fn install_assoc(exe_path: &Path) -> Result<(), String> {
+    pub fn install_assoc_with_default(exe_path: &Path, studio_default: bool) -> Result<(), String> {
         let exe_str = exe_path.to_string_lossy().to_string();
         let icon_spec = format!("\"{}\",0", exe_str);
         let run_cmd = format!("\"{}\" \"%1\"", exe_str);
@@ -390,30 +412,38 @@ pub(crate) mod win32_setup {
             &icon_spec,
             REG_SZ,
         )?;
+        let (open_lbl, open_cmd, sec_key, sec_lbl, sec_cmd) = if studio_default {
+            (
+                "Edit in Askane Studio",
+                &studio_cmd,
+                "Software\\Classes\\Askane.Script\\shell\\run",
+                "Run with Askane",
+                &run_cmd,
+            )
+        } else {
+            (
+                "Run with Askane",
+                &run_cmd,
+                "Software\\Classes\\Askane.Script\\shell\\edit",
+                "Edit in Askane Studio",
+                &studio_cmd,
+            )
+        };
+        reg_delete_tree("Software\\Classes\\Askane.Script\\shell");
         reg_write_string(
             "Software\\Classes\\Askane.Script\\shell\\open",
             None,
-            "Run with Askane",
+            open_lbl,
             REG_SZ,
         )?;
         reg_write_string(
             "Software\\Classes\\Askane.Script\\shell\\open\\command",
             None,
-            &run_cmd,
+            open_cmd,
             REG_SZ,
         )?;
-        reg_write_string(
-            "Software\\Classes\\Askane.Script\\shell\\edit",
-            None,
-            "Edit in Askane Studio",
-            REG_SZ,
-        )?;
-        reg_write_string(
-            "Software\\Classes\\Askane.Script\\shell\\edit\\command",
-            None,
-            &studio_cmd,
-            REG_SZ,
-        )?;
+        reg_write_string(sec_key, None, sec_lbl, REG_SZ)?;
+        reg_write_string(&format!("{}\\command", sec_key), None, sec_cmd, REG_SZ)?;
 
         reg_write_string(
             "Software\\Classes\\Applications\\askane.exe",
@@ -436,7 +466,7 @@ pub(crate) mod win32_setup {
         reg_write_string(
             "Software\\Classes\\Applications\\askane.exe\\shell\\open\\command",
             None,
-            &run_cmd,
+            open_cmd,
             REG_SZ,
         )?;
 
@@ -446,21 +476,23 @@ pub(crate) mod win32_setup {
         Ok(())
     }
 
-    pub fn uninstall_all(exe_path: &Path) -> Result<(bool, bool), String> {
+    pub fn remove_path(exe_path: &Path) -> Result<bool, String> {
         let exe_dir = exe_path
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string());
-        let mut path_removed = false;
         if let Some((existing, ty)) = reg_read_string("Environment", Some("Path")) {
             let (updated, changed) = remove_dir_from_path_list(&existing, &exe_dir);
             if changed {
                 reg_write_string("Environment", Some("Path"), &updated, ty)?;
                 broadcast_env_change();
-                path_removed = true;
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
 
+    pub fn uninstall_assoc() -> bool {
         let had_assoc = reg_read_string("Software\\Classes\\Askane.Script", None).is_some()
             || reg_read_string("Software\\Classes\\.ask", None).is_some();
         if reg_read_string("Software\\Classes\\.ask", None)
@@ -479,41 +511,42 @@ pub(crate) mod win32_setup {
                 SHChangeNotify(SHCNE_ASSOCCHANGED, 0, null(), null());
             }
         }
+        had_assoc
+    }
+
+    pub fn uninstall_all(exe_path: &Path) -> Result<(bool, bool), String> {
+        let path_removed = remove_path(exe_path)?;
+        let had_assoc = uninstall_assoc();
         Ok((path_removed, had_assoc))
     }
 }
 
 #[cfg(windows)]
 pub fn run_setup_cli(args: &[String]) -> Result<(), String> {
-    let raw_exe = env::current_exe().map_err(|e| format!("Failed to locate askane.exe: {}", e))?;
-    let exe_path = std::fs::canonicalize(&raw_exe)
-        .map(|p| {
-            let s = p.to_string_lossy();
-            if let Some(stripped) = s.strip_prefix("\\\\?\\") {
-                std::path::PathBuf::from(stripped)
-            } else {
-                p
-            }
-        })
-        .unwrap_or(raw_exe);
+    let exe_path = win32_setup::current_exe_clean()?;
 
     let mut do_status = false;
     let mut do_path = false;
     let mut do_assoc = false;
     let mut do_uninstall = false;
+    let mut studio_default = false;
 
     for arg in args {
         match arg.as_str() {
             "--status" => do_status = true,
             "--path" => do_path = true,
             "--assoc" => do_assoc = true,
+            "--default=run" => studio_default = false,
+            "--default=studio" => studio_default = true,
             "--all" | "--install" => {
                 do_path = true;
                 do_assoc = true;
             }
             "--uninstall" | "--remove" => do_uninstall = true,
             "--help" | "-h" => {
-                println!("Usage: askane setup [--status | --all | --path | --assoc | --uninstall]");
+                println!(
+                    "Usage: askane setup [--status | --all | --path | --assoc | --default=run|studio | --uninstall]"
+                );
                 return Ok(());
             }
             other => return Err(format!("Unknown setup option: '{}'", other)),
@@ -532,20 +565,14 @@ pub fn run_setup_cli(args: &[String]) -> Result<(), String> {
                 "Not in PATH"
             }
         );
-        println!(
-            "  .ask Open  : {}",
-            if st.assoc_registered {
-                "Registered"
-            } else {
-                "Not registered"
-            }
-        );
+        println!("  .ask Open  : {}", st.assoc_mode);
         println!();
         println!("Choose an option:");
         println!("  1) Add Askane folder to User PATH");
-        println!("  2) Register .ask file association (Run + Edit in Studio + Open With)");
-        println!("  3) Install both (Recommended)");
-        println!("  4) Remove PATH & .ask integration");
+        println!("  2) Register .ask file association (default: Run + Edit in Studio)");
+        println!("  3) Register .ask file association (default: Edit in Studio)");
+        println!("  4) Install PATH + .ask (Run default) [Recommended]");
+        println!("  5) Remove PATH & .ask integration");
         println!("  0) Cancel");
         print!("> ");
         let _ = io::stdout().flush();
@@ -557,10 +584,14 @@ pub fn run_setup_cli(args: &[String]) -> Result<(), String> {
             "1" => do_path = true,
             "2" => do_assoc = true,
             "3" => {
+                do_assoc = true;
+                studio_default = true;
+            }
+            "4" => {
                 do_path = true;
                 do_assoc = true;
             }
-            "4" => do_uninstall = true,
+            "5" => do_uninstall = true,
             _ => {
                 println!("Cancelled.");
                 return Ok(());
@@ -577,8 +608,9 @@ pub fn run_setup_cli(args: &[String]) -> Result<(), String> {
             if st.in_path { "yes" } else { "no" }
         );
         println!(
-            ".ask registered : {}",
-            if st.assoc_registered { "yes" } else { "no" }
+            ".ask registered : {} ({})",
+            if st.assoc_registered { "yes" } else { "no" },
+            st.assoc_mode
         );
         if let Some(cmd) = st.assoc_command {
             println!(".ask command    : {}", cmd);
@@ -607,8 +639,15 @@ pub fn run_setup_cli(args: &[String]) -> Result<(), String> {
         );
     }
     if do_assoc {
-        win32_setup::install_assoc(&exe_path)?;
-        println!("Registered .ask file association (Askane.Script + Open With -> Askane).");
+        win32_setup::install_assoc_with_default(&exe_path, studio_default)?;
+        println!(
+            "Registered .ask file association (default: {}).",
+            if studio_default {
+                "Edit in Askane Studio"
+            } else {
+                "Run with Askane"
+            }
+        );
     }
     Ok(())
 }

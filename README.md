@@ -3,7 +3,7 @@
 
   <h1>
     <img src="docs/logo.png" alt="Askane Logo" width="38" height="38" align="absmiddle" />
-    &nbsp;Askane (v0.16.2 Open Beta)
+    &nbsp;Askane (v0.17.0 Open Beta)
   </h1>
 
   <p>
@@ -30,7 +30,7 @@
 - **Single standalone binary**: lexer, AST parser, bytecode compiler, register/stack fast VM (`execute_fast`), and a rich standard library in pure Rust with zero Cargo dependencies.
 - **Expression-first syntax**: `{ ... }` blocks, `if`/`else`, `match`, pipelines (`|>`, `|?>`, `|*>`, `|>=`, `_`), inline `recover`, tagged templates (`log"..."`, `sql"..."`), `struct`, `set`, `bytes`, and built-in `spec` tests.
 - **Sandbox & contracts**: default-deny permissions for network, filesystem outside root, env, args, clipboard, global input, and process execution, plus `needs` declarations and `sandbox { ... }` privilege attenuation.
-- **Built-in tooling**: multiline REPL, `askane check`, `askane fmt`, `askane test`, `askane permissions`, `askane init`, benchmark suite (`bench/`), and Windows Askane Studio (`--gui`).
+- **Built-in tooling**: multiline REPL, `askane check`, `askane fmt`, `askane test [--deterministic] [--update-snapshots]`, `askane permissions`, `askane init`, `askane setup`, benchmark suite (`bench/`), and Windows Askane Studio v2 (`--gui`) with project explorer, tabs, search/replace, line numbers, and permissions toggles.
 
 ## How It Works Under the Hood
 
@@ -147,7 +147,13 @@ Built-in standard modules (`import <name>;`):
 - `html`: `parse`, `select`, `text`, `escape`, `unescape`
 - `xml`: `parse`, `select`, `text`, `escape`, `unescape`
 - `log`: `set_level`, `json`, `format`, `debug`, `info`, `warn`, `error` (supports structured dict fields and secret redaction)
-- `test`: `assert`, `assert_eq`, `assert_ne`, `assert_err`
+- `test`: `assert`, `assert_eq`, `assert_ne`, `assert_err`, `assert_snapshot`
+- `crypto`: `hmac_sha256`, `hmac_sha256_hex`, `constant_time_eq`, `random_key`, `random_bytes`, `seal`, `open` (ChaCha20-Poly1305 AEAD)
+- `kv`: `open`, `get`, `set`, `delete`, `has`, `keys`, `prefix`, `batch`, `compact`, `len`, `close` (append-log KV store, sandbox-checked)
+- `net`: `tcp_listen`, `tcp_accept`, `tcp_connect`, `send`, `recv`, `udp_bind`, `udp_send_to`, `udp_recv_from`, `local_addr`, `peer_addr`, `close` (requires `--allow-net`)
+- `ws`: `listen`, `accept`, `connect`, `send`, `send_bytes`, `recv`, `local_addr`, `close` (RFC 6455 WebSocket, requires `--allow-net`)
+- `task` & `channel`: cooperative green tasks (`spawn`, `yield_now`, `sleep`, `join`, `is_done`, `select`, `timeout`) and bounded channels (`bounded`, `send`, `try_send`, `recv`, `try_recv`, `close`, `len`)
+- `signal` (and `on change(sig) { ... }`): reactive state cells (`new`, `get`, `set`, `update`, `watch`, `unwatch`, `unwatch_all`)
 - `hash`: `sha256`, `crc32`, `fnv1a`
 - `ini`: `parse`, `stringify`
 - `datetime`: `utc_now`, `from_timestamp`, `format`, `parse_iso`
@@ -173,13 +179,13 @@ Built-in standard modules (`import <name>;`):
 CLI tools:
 - `askane` — multiline REPL (supports `:help`, `:gui`, `:exit`, `:reset`, `:modules`, `:bc`)
 - `askane -e "<code>"` — evaluate inline Askane code
-- `askane --gui [file.ask]` — Askane Studio GUI editor & runner (Windows, Job Object isolation, F5/Ctrl+S/Ctrl+O/Ctrl+A)
+- `askane --gui [file.ask]` — Askane Studio v2 GUI editor & runner (Windows, project explorer, tabs, line numbers, find/replace, Fmt/Test, permission toggles, Setup modal, Job Object isolation)
 - `askane check [--json] <file_or_dir>` — syntax/compile check without execution
 - `askane fmt [--check] <file.ask>` — format Askane source code
 - `askane permissions <file.ask>` — inspect capabilities imported by a script
 - `askane init [dir]`: create a starter Askane project (`askane.toml`, `main.ask`, `tests/basic_test.ask`)
-- `askane setup [--status|--all|--uninstall]`: add Askane to User PATH and register `.ask` file associations (Windows)
-- `askane test <file_or_dir>`: run `.ask` test files in isolated VMs
+- `askane setup [--status|--all|--default=run|studio|--uninstall]`: add Askane to User PATH and register `.ask` file associations (Windows)
+- `askane test [--deterministic] [--update-snapshots] <file_or_dir>`: run `.ask` test files in isolated VMs
 
 ## Security model
 
