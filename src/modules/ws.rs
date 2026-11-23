@@ -659,13 +659,15 @@ fn ws_local_addr(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-fn ws_close(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn ws_close(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("ws.close() expects 1 argument (handle)".to_string());
     }
     let id = extract_ws_id(&args[0], None, "ws.close()")?;
-    WS_HANDLES.with(|reg| {
-        reg.borrow_mut().handles.remove(&id);
-    });
+    let removed = WS_HANDLES.with(|reg| reg.borrow_mut().handles.remove(&id));
+    if let Some(WsHandle::Conn(mut conn)) = removed {
+        let _ = send_ws_frame(&mut conn, 0x8, &[], vm);
+        let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+    }
     Ok(Value::Unit)
 }

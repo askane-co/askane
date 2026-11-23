@@ -20,7 +20,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.17.0";
+const VERSION: &str = "0.17.1";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -1352,7 +1352,9 @@ fn run_repl() {
                 }
                 ":modules" => {
                     println!(
-                        "Built-in modules: math, fs, sys, json, strings, path, time, random, base64, bytes, csv, log, test, hash, ini, datetime, clipboard, audio, url, hex, uuid, term, glob, regex, dialog, process, http, gfx, mem"
+                        "Built-in modules ({}): {}",
+                        modules::BUILTIN_MODULE_NAMES.len(),
+                        modules::BUILTIN_MODULE_NAMES.join(", ")
                     );
                     continue;
                 }
@@ -6492,5 +6494,209 @@ snap_payload
         assert!(vm3.run(mismatch_proto).is_ok());
 
         let _ = std::fs::remove_dir_all(&snap_dir);
+    }
+
+    #[test]
+    fn test_v0171_scheduler_spec_tailcall_ws_and_repl() {
+        // 1. Op::TailCall on BoundMethod/NativeFn inside green task (Bug #1)
+        let deadlock_src = r#"
+import task;
+import channel;
+let c = channel.bounded(1);
+let t = task.spawn(|| c.recv());
+t.join();
+"#;
+        let dl_err = VM::new()
+            .run(compile_source(deadlock_src).unwrap())
+            .expect_err("tail-call blocked recv must trigger deadlock, not exit 0");
+        assert!(
+            dl_err.contains("Deadlock: all tasks are blocked"),
+            "got: {}",
+            dl_err
+        );
+
+        let tail_wake_src = r#"
+import task;
+import channel;
+let c = channel.bounded(2);
+fn wait_val(ch) {
+    ch.recv()
+}
+let t1 = task.spawn(|| c.recv());
+let t2 = task.spawn(|| wait_val(c));
+let t3 = task.spawn(|| task.sleep(5));
+task.yield_now();
+c.send(111);
+c.send(222);
+[t1.join(), t2.join(), t3.join()]
+"#;
+        let tail_wake = VM::new()
+            .run(compile_source(tail_wake_src).unwrap())
+            .unwrap();
+        assert!(
+            tail_wake.equals(&Value::List(std::rc::Rc::new(std::cell::RefCell::new(
+                vec![Value::Int(111), Value::Int(222), Value::Unit,]
+            ))))
+        );
+
+        // 2. Blocking task & channel inside spec "..." { ... } (Bug #2)
+        let spec_src = r#"
+import task;
+import channel;
+import test;
+
+spec "async spec pass" {
+    let ch = channel.bounded(1);
+    let w = task.spawn(|| {
+        task.sleep(15);
+        ch.send(77);
+        99
+    });
+    test.assert_eq(w.join(), 99);
+    test.assert_eq(ch.recv(), 77);
+}
+
+spec "async spec fail stays isolated" {
+    let w = task.spawn(|| {
+        task.yield_now();
+        123
+    });
+    test.assert_eq(w.join(), 456);
+}
+"#;
+        let spec_proto = compile_source_with_specs(spec_src).unwrap();
+        let mut spec_vm = VM::new_with_sandbox(true);
+        spec_vm.set_deterministic(true);
+        spec_vm.run(spec_proto).unwrap();
+        let specs = spec_vm.spec_results();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].0, "async spec pass");
+        assert!(specs[0].1.is_ok(), "unexpected error: {:?}", specs[0].1);
+        assert_eq!(specs[1].0, "async spec fail stays isolated");
+        assert!(specs[1].1.is_err());
+
+        // 3. try / catch around task.join() propagates child task exception (Bug #3)
+        let try_join_src = r#"
+import task;
+let t = task.spawn(|| {
+    throw "boom";
+});
+let caught = try {
+    t.join();
+    "missed"
+} catch err {
+    err
+};
+caught
+"#;
+        let caught = VM::new()
+            .run(compile_source(try_join_src).unwrap())
+            .unwrap();
+        let Value::Str(msg) = caught else {
+            panic!("expected string error, got {:?}", caught);
+        };
+        assert!(msg.contains("boom"), "expected 'boom', got '{}'", msg);
+
+        // Nested join propagation: main try/catch catches error through t1 -> t2
+        let nested_try_src = r#"
+import task;
+let inner = task.spawn(|| { throw "deep_boom"; });
+let outer = task.spawn(|| inner.join());
+try {
+    outer.join();
+    "missed"
+} catch err {
+    err
+}
+"#;
+        let nested_caught = VM::new()
+            .run(compile_source(nested_try_src).unwrap())
+            .unwrap();
+        let Value::Str(nmsg) = nested_caught else {
+            panic!("expected string error, got {:?}", nested_caught);
+        };
+        assert!(nmsg.contains("deep_boom"), "got '{}'", nmsg);
+
+        // 4. TCO without `else`, BUILTIN_MODULE_NAMES completeness, and ws.close() Close frame
+        let tco_src = r#"
+fn sum_tail(n, acc) {
+    if n == 0 {
+        return acc;
+    }
+    sum_tail(n - 1, acc + 1)
+}
+sum_tail(5000, 0)
+"#;
+        let tco_res = VM::new().run(compile_source(tco_src).unwrap()).unwrap();
+        assert!(tco_res.equals(&Value::Int(5000)));
+
+        assert_eq!(modules::BUILTIN_MODULE_NAMES.len(), 49);
+        for &m in modules::BUILTIN_MODULE_NAMES {
+            assert!(
+                modules::get_builtin_module(m).is_some(),
+                "missing builtin module '{}'",
+                m
+            );
+        }
+
+        // ws.close() sends RFC 6455 Close frame (0x08) so peer ws.recv() returns unit cleanly
+        let ws_dir = std::env::temp_dir().join(format!("askane_0171_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws_dir);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let canon_ws = fs::canonicalize(&ws_dir).unwrap();
+        let ws_srv_dir = canon_ws.clone();
+        let mut perms = Permissions::sandboxed();
+        perms.allow_net = Some(vec!["127.0.0.1".to_string()]);
+        let srv_perms = perms.clone();
+        let srv_thread = std::thread::spawn(move || {
+            let mut srv_vm = VM::new_with_sandbox(true);
+            srv_vm.set_permissions(srv_perms);
+            srv_vm.set_current_dir(ws_srv_dir.clone());
+            srv_vm.set_sandbox_root(ws_srv_dir);
+            let res = srv_vm
+                .run(
+                    compile_source(
+                        r#"
+import ws;
+import fs;
+let l = ws.listen("127.0.0.1:0");
+fs.write("addr.txt", l.local_addr());
+let c = l.accept(5000);
+let closed_val = c.recv(5000);
+c.close();
+l.close();
+closed_val == unit
+"#,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(res.equals(&Value::Bool(true)));
+        });
+        let addr_file = canon_ws.join("addr.txt");
+        let mut ws_addr = String::new();
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(&addr_file) {
+                if !s.trim().is_empty() {
+                    ws_addr = s.trim().to_string();
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!ws_addr.is_empty());
+        let mut cli_vm = VM::new_with_sandbox(true);
+        cli_vm.set_permissions(perms);
+        cli_vm
+            .run(
+                compile_source(&format!(
+                    "import ws;\nlet c = ws.connect(\"ws://{}\", 5000);\nc.close();\n",
+                    ws_addr
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        srv_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws_dir);
     }
 }

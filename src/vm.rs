@@ -1015,6 +1015,7 @@ impl VM {
             ("__close_resource", native_close_resource),
             ("__sleep_checked", native_sleep_checked),
             ("__run_spec", native_run_spec),
+            ("__record_spec", native_record_spec),
             ("unique", native_unique),
             ("flatten", native_flatten),
             ("chunk", native_chunk),
@@ -1481,12 +1482,14 @@ impl VM {
 
     fn execute(&mut self, target_depth: usize) -> Result<Value, String> {
         self.execute_depth += 1;
-        let res = loop {
+        let res = 'exec: loop {
             match self.execute_fast(target_depth) {
-                Ok(val) => break Ok(val),
-                Err(mut err) => {
-                    if Self::is_unrecoverable_error(&err) {
-                        break Err(err);
+                Ok(val) => break 'exec Ok(val),
+                Err(mut err) => 'dispatch_err: loop {
+                    if Self::is_unrecoverable_error(&err)
+                        || err == "Deadlock: all tasks are blocked"
+                    {
+                        break 'exec Err(err);
                     }
                     if let Some(handler) = self.try_handlers.last().cloned() {
                         if handler.frame_depth > target_depth {
@@ -1496,7 +1499,7 @@ impl VM {
                                     self.unwind_cleanups_to_len(handler.cleanup_len, true)
                                 {
                                     if Self::is_unrecoverable_error(&cleanup_err) {
-                                        break Err(cleanup_err);
+                                        break 'exec Err(cleanup_err);
                                     }
                                     err = cleanup_err;
                                 }
@@ -1508,18 +1511,21 @@ impl VM {
                             self.stack.truncate(handler.stack_len);
                             self.stack.push(Value::Str(err));
                             self.frames.last_mut().unwrap().ip = handler.catch_ip;
-                            continue;
+                            break 'dispatch_err;
                         }
                     }
                     if target_depth == 0 && self.scheduler.current_task_id != 0 {
                         let _ = self.unwind_cleanups_to_len(0, true);
                         match self.finish_current_green_task(Err(err)) {
-                            Ok(()) => continue,
-                            Err(sched_err) => break Err(sched_err),
+                            Ok(()) => break 'dispatch_err,
+                            Err(sched_err) => {
+                                err = sched_err;
+                                continue 'dispatch_err;
+                            }
                         }
                     }
-                    break Err(err);
-                }
+                    break 'exec Err(err);
+                },
             }
         };
         self.execute_depth -= 1;
@@ -2232,15 +2238,12 @@ impl VM {
                             }
                             let val = res?;
                             if let Some(req) = self.scheduler.pending_yield.take() {
-                                let wake_val = self.suspend_and_switch(req)?;
+                                self.resume_after_suspend(req, target_depth)?;
                                 let caller = self.frames.last().unwrap();
                                 cur_closure = caller.closure.clone();
                                 cur_base = caller.base;
                                 ip = caller.ip;
                                 proto_id = cur_closure.proto.ic_id;
-                                if let Some(v) = wake_val {
-                                    self.stack.push(v);
-                                }
                                 continue;
                             }
                             self.stack.push(val);
@@ -2295,15 +2298,12 @@ impl VM {
                                                 .call_value(other, &combined)
                                                 .map_err(|e| format!("[line {}] {}", line, e))?;
                                             if let Some(req) = self.scheduler.pending_yield.take() {
-                                                let wake_val = self.suspend_and_switch(req)?;
+                                                self.resume_after_suspend(req, target_depth)?;
                                                 let caller = self.frames.last().unwrap();
                                                 cur_closure = caller.closure.clone();
                                                 cur_base = caller.base;
                                                 ip = caller.ip;
                                                 proto_id = cur_closure.proto.ic_id;
-                                                if let Some(v) = wake_val {
-                                                    self.stack.push(v);
-                                                }
                                                 continue;
                                             }
                                             self.stack.push(res);
@@ -2458,7 +2458,25 @@ impl VM {
                             self.close_upvalues_from(frame.base);
                         }
                         self.stack.truncate(frame.base);
+                        if let Some(req) = self.scheduler.pending_yield.take() {
+                            self.resume_after_suspend(req, target_depth)?;
+                            let caller = self.frames.last().unwrap();
+                            cur_closure = caller.closure.clone();
+                            cur_base = caller.base;
+                            ip = caller.ip;
+                            proto_id = cur_closure.proto.ic_id;
+                            continue;
+                        }
                         if self.frames.len() == target_depth {
+                            if target_depth == 0 && self.scheduler.current_task_id != 0 {
+                                self.finish_current_green_task(Ok(res))?;
+                                let caller = self.frames.last().unwrap();
+                                cur_closure = caller.closure.clone();
+                                cur_base = caller.base;
+                                ip = caller.ip;
+                                proto_id = cur_closure.proto.ic_id;
+                                continue;
+                            }
                             return Ok(res);
                         }
                         self.stack.push(res);
@@ -3959,6 +3977,9 @@ impl VM {
 
     fn save_current_task_state(&mut self, wait: TaskWait) {
         self.ensure_main_task_slot();
+        if !self.open_upvalues.is_empty() {
+            self.close_upvalues_from(0);
+        }
         let cur_id = self.scheduler.current_task_id;
         let stack = std::mem::take(&mut self.stack);
         let frames = std::mem::take(&mut self.frames);
@@ -4006,7 +4027,9 @@ impl VM {
             self.check_timeout()?;
             while let Some(id) = self.scheduler.ready_queue.pop_front() {
                 if let Some(t) = self.scheduler.tasks.get(&id) {
-                    if matches!(t.wait, TaskWait::Ready) && !t.frames.is_empty() {
+                    if matches!(t.wait, TaskWait::Ready)
+                        && (!t.frames.is_empty() || t.result.is_none())
+                    {
                         return Ok(id);
                     }
                 }
@@ -4117,35 +4140,85 @@ impl VM {
         self.load_task_state(next_id)
     }
 
-    fn finish_current_green_task(&mut self, outcome: Result<Value, String>) -> Result<(), String> {
-        let cur_id = self.scheduler.current_task_id;
-        let waiters = self
-            .scheduler
-            .join_waiters
-            .remove(&cur_id)
-            .unwrap_or_default();
-        self.save_current_task_state(TaskWait::Done);
-        if let Some(t) = self.scheduler.tasks.get_mut(&cur_id) {
-            t.result = Some(outcome.clone());
-            t.stack.clear();
-            t.frames.clear();
-            t.try_handlers.clear();
-            t.cleanup_stack.clear();
+    fn resume_after_suspend(
+        &mut self,
+        req: YieldRequest,
+        target_depth: usize,
+    ) -> Result<(), String> {
+        match self.suspend_and_switch(req) {
+            Ok(wake_val) => {
+                if self.frames.len() == target_depth
+                    && target_depth == 0
+                    && self.scheduler.current_task_id != 0
+                {
+                    return self.finish_current_green_task(Ok(wake_val.unwrap_or(Value::Unit)));
+                }
+                if let Some(v) = wake_val {
+                    self.stack.push(v);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if self.frames.len() == target_depth
+                    && target_depth == 0
+                    && self.scheduler.current_task_id != 0
+                {
+                    return self.finish_current_green_task(Err(err));
+                }
+                Err(err)
+            }
         }
-        for wid in waiters {
-            if let Some(wt) = self.scheduler.tasks.get_mut(&wid) {
-                if matches!(wt.wait, TaskWait::Join(tid) if tid == cur_id) {
-                    wt.wait = TaskWait::Ready;
-                    wt.wake_value = Some(outcome.clone());
-                    self.scheduler.ready_queue.push_back(wid);
+    }
+
+    fn finish_current_green_task(
+        &mut self,
+        mut outcome: Result<Value, String>,
+    ) -> Result<(), String> {
+        loop {
+            let cur_id = self.scheduler.current_task_id;
+            let waiters = self
+                .scheduler
+                .join_waiters
+                .remove(&cur_id)
+                .unwrap_or_default();
+            self.save_current_task_state(TaskWait::Done);
+            if let Some(t) = self.scheduler.tasks.get_mut(&cur_id) {
+                t.result = Some(outcome.clone());
+                t.stack.clear();
+                t.frames.clear();
+                t.try_handlers.clear();
+                t.cleanup_stack.clear();
+            }
+            for wid in waiters {
+                if let Some(wt) = self.scheduler.tasks.get_mut(&wid) {
+                    if matches!(wt.wait, TaskWait::Join(tid) if tid == cur_id) {
+                        wt.wait = TaskWait::Ready;
+                        wt.wake_value = Some(outcome.clone());
+                        self.scheduler.ready_queue.push_back(wid);
+                    }
+                }
+            }
+            let next_id = self.pick_next_ready_or_advance()?;
+            match self.load_task_state(next_id) {
+                Ok(wake) => {
+                    if self.frames.is_empty() && self.scheduler.current_task_id != 0 {
+                        outcome = Ok(wake.unwrap_or(Value::Unit));
+                        continue;
+                    }
+                    if let Some(val) = wake {
+                        self.stack.push(val);
+                    }
+                    return Ok(());
+                }
+                Err(err) => {
+                    if self.frames.is_empty() && self.scheduler.current_task_id != 0 {
+                        outcome = Err(err);
+                        continue;
+                    }
+                    return Err(err);
                 }
             }
         }
-        let next_id = self.pick_next_ready_or_advance()?;
-        if let Some(val) = self.load_task_state(next_id)? {
-            self.stack.push(val);
-        }
-        Ok(())
     }
 
     fn select_result_dict(idx: usize, val: Value, closed: bool) -> Value {
@@ -5496,6 +5569,23 @@ fn native_sleep_checked(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
     vm.sleep_checked(ms)?;
     Ok(Value::Unit)
+}
+
+fn native_record_spec(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("__record_spec expects 3 arguments (name, ok, err)".to_string());
+    }
+    let Value::Str(name) = &args[0] else {
+        return Err("__record_spec name must be string".to_string());
+    };
+    let ok = matches!(args[1], Value::Bool(true));
+    if ok {
+        vm.spec_results.push((name.clone(), Ok(())));
+    } else {
+        vm.spec_results
+            .push((name.clone(), Err(args[2].to_string())));
+    }
+    Ok(Value::Bool(ok))
 }
 
 fn native_run_spec(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

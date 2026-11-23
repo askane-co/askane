@@ -898,16 +898,38 @@ impl Compiler {
                 if !self.include_specs {
                     return Ok(());
                 }
-                let run_idx = self.current().chunk.add_string_constant("__run_spec");
-                self.emit(Op::GetGlobal(run_idx), span.line);
-                self.push_temps(1);
+                let setup_jump = self.emit(Op::SetupTry(0), span.line);
+                self.current().try_depth += 1;
+                self.compile_function(format!("<spec {}>", name), &[], body, *span)?;
+                self.emit(Op::Call(0), span.line);
+                self.emit(Op::Pop, span.line);
+                self.current().try_depth -= 1;
+                self.emit(Op::PopTry, span.line);
+
+                let rec_idx = self.current().chunk.add_string_constant("__record_spec");
+                self.emit(Op::GetGlobal(rec_idx), span.line);
                 let name_idx = self.current().chunk.add_string_constant(name);
                 self.emit(Op::Constant(name_idx), span.line);
-                self.push_temps(1);
-                self.compile_function(format!("<spec {}>", name), &[], body, *span)?;
-                self.pop_temps(2);
-                self.emit(Op::Call(2), span.line);
+                self.emit(Op::True, span.line);
+                self.emit(Op::Unit, span.line);
+                self.emit(Op::Call(3), span.line);
                 self.emit(Op::Pop, span.line);
+                let end_jump = self.emit(Op::Jump(0), span.line);
+
+                self.patch_jump(setup_jump);
+                self.begin_scope();
+                let err_slot = self.add_local("$spec_err".to_string());
+                let rec_idx2 = self.current().chunk.add_string_constant("__record_spec");
+                self.emit(Op::GetGlobal(rec_idx2), span.line);
+                let name_idx2 = self.current().chunk.add_string_constant(name);
+                self.emit(Op::Constant(name_idx2), span.line);
+                self.emit(Op::False, span.line);
+                self.emit(Op::GetLocal(err_slot), span.line);
+                self.emit(Op::Call(3), span.line);
+                self.emit(Op::Pop, span.line);
+                self.end_scope(span.line);
+
+                self.patch_jump(end_jump);
                 Ok(())
             }
             Stmt::Expr(expr) => {
@@ -1221,7 +1243,10 @@ impl Compiler {
                     for stmt in stmts {
                         self.compile_stmt(stmt)?;
                     }
-                    self.compile_expr(tail_expr)?;
+                    let tail_in_tail = in_tail
+                        && self.current().try_depth == 0
+                        && self.current().cleanup_scopes.is_empty();
+                    self.compile_expr_inner(tail_expr, tail_in_tail)?;
                     self.emit(Op::SetLocal(res_slot), tail_expr.span().line);
                     self.emit(Op::Pop, tail_expr.span().line);
                     self.end_scope(span.line);
