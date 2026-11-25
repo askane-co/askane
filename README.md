@@ -11,6 +11,10 @@
   </p>
 
   <p>
+    <a href="https://github.com/askane-co/askane/releases/latest">
+      <img src="https://img.shields.io/github/v/release/askane-co/askane?label=Release&color=26b8ec" alt="Release" />
+    </a>
+    &nbsp;&middot;&nbsp;
     <a href="https://github.com/askane-co/askane/actions/workflows/ci.yml">
       <img src="https://github.com/askane-co/askane/actions/workflows/ci.yml/badge.svg" alt="CI" />
     </a>
@@ -23,7 +27,7 @@
   </p>
 </div>
 
-> **Transparency note**: This language and its runtime were designed and built in collaboration with **Gemini** (AI-assisted development). Published as an open beta so anyone can inspect the VM, run benchmarks, test the sandbox, and suggest improvements.
+> **Transparency note**: This language and its runtime were designed and built in collaboration with **Gemini** and **ChatGPT** (AI-assisted development). Published as an open beta so anyone can inspect the VM, run benchmarks, test the sandbox, and suggest improvements.
 
 ## Highlights
 
