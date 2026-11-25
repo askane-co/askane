@@ -142,6 +142,205 @@ pub const BUILTIN_MODULE_NAMES: &[&str] = &[
     "channel",
 ];
 
+pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
+    match name {
+        "math" => (
+            "stdlib",
+            "all",
+            "Floating-point & scalar math helpers (sqrt, pow, sin, cos, clamp, lerp, atan2)",
+        ),
+        "fs" => (
+            "io",
+            "all",
+            "Sandboxed filesystem I/O (read, write, read_bytes, write_bytes, copy, move, glob)",
+        ),
+        "sys" => (
+            "runtime",
+            "all",
+            "CLI args, env vars, process exit, budget & sleep (gated by --allow-env/args)",
+        ),
+        "mem" => (
+            "system",
+            "windows",
+            "Process memory inspection (--unsafe + ASKANE_ENABLE_UNSAFE_MEM=1)",
+        ),
+        "json" => (
+            "data",
+            "all",
+            "Strict JSON parser and serializer with depth and control-char guards",
+        ),
+        "http" => (
+            "net",
+            "windows",
+            "WinHTTP TLS HTTPS client (get, post; requires --allow-net)",
+        ),
+        "gfx" => (
+            "gui",
+            "windows",
+            "Win32 2D framebuffer window with RGBA sprites, alpha shapes, input & text",
+        ),
+        "strings" => (
+            "stdlib",
+            "all",
+            "UTF-8 string utilities (split, trim, replace, slice, byte_len, truncate_utf8)",
+        ),
+        "path" => (
+            "stdlib",
+            "all",
+            "Path manipulation (join, parent, name, stem, extension, normalize)",
+        ),
+        "time" => (
+            "runtime",
+            "all",
+            "Monotonic & wall clock helpers (now_ms, now_sec, elapsed_ms, sleep_ms)",
+        ),
+        "random" => (
+            "stdlib",
+            "all",
+            "Deterministic PRNG and OS CSPRNG (crypto_int, crypto_bytes)",
+        ),
+        "base64" => (
+            "data",
+            "all",
+            "Standard and URL-safe Base64 encoding and decoding",
+        ),
+        "bytes" => (
+            "data",
+            "all",
+            "Byte buffer conversions and zero-allocation helpers",
+        ),
+        "csv" => (
+            "data",
+            "all",
+            "RFC-compatible CSV parsing, dict rows, and serialization",
+        ),
+        "log" => (
+            "runtime",
+            "all",
+            "Structured leveled logger with automatic secret redaction",
+        ),
+        "test" => (
+            "testing",
+            "all",
+            "Assertions (assert, assert_eq, assert_ne, assert_err, assert_snapshot)",
+        ),
+        "hash" => ("data", "all", "Non-keyed hashes: SHA-256, CRC32, FNV-1a"),
+        "ini" => ("data", "all", "INI configuration parser and writer"),
+        "datetime" => (
+            "data",
+            "all",
+            "UTC timestamps, ISO-8601 parsing and formatting",
+        ),
+        "clipboard" => (
+            "gui",
+            "windows",
+            "Windows clipboard text read/write (requires --allow-clipboard)",
+        ),
+        "audio" => ("media", "windows", "Sandboxed WAV playback via WinMM"),
+        "url" => (
+            "data",
+            "all",
+            "URL parsing, percent-encoding/decoding and query helpers",
+        ),
+        "hex" => ("data", "all", "Hexadecimal byte encoding and decoding"),
+        "uuid" => ("stdlib", "all", "Random UUID v4 generation"),
+        "term" => ("stdlib", "all", "ANSI terminal styling helpers"),
+        "glob" => ("stdlib", "all", "Linear/DP-bounded glob pattern matching"),
+        "regex" => ("stdlib", "all", "Step-bounded regular expression engine"),
+        "dialog" => (
+            "gui",
+            "windows",
+            "Native Win32 alert, confirm and open/save dialogs",
+        ),
+        "process" => (
+            "system",
+            "all",
+            "Subprocess execution in Job Object (requires --allow-exec)",
+        ),
+        "toml" => ("data", "all", "Bounded TOML parser and serializer"),
+        "binary" => (
+            "data",
+            "all",
+            "Binary struct pack/unpack and typed integer/float codecs",
+        ),
+        "collections" => (
+            "stdlib",
+            "all",
+            "deque, counter, priority_queue, groupby, window & sequence helpers",
+        ),
+        "compress" => (
+            "data",
+            "all",
+            "Pure-Rust DEFLATE, Zlib, Gzip compression, CRC32 and Adler32",
+        ),
+        "archive" => (
+            "io",
+            "all",
+            "Sandboxed ZIP pack/create/list/read_entry/extract",
+        ),
+        "os" => (
+            "system",
+            "all",
+            "Host OS metadata, cwd, home/temp dirs, env & args",
+        ),
+        "cli" => (
+            "stdlib",
+            "all",
+            "Command-line flags & positional arguments parser",
+        ),
+        "diff" => ("testing", "all", "LCS line and value diff formatter"),
+        "pprint" => ("stdlib", "all", "Pretty formatter for nested structures"),
+        "html" => (
+            "data",
+            "all",
+            "HTML parser, selector, text extraction & escaping",
+        ),
+        "xml" => ("data", "all", "XML tree parser, selector & escaping"),
+        "input" => (
+            "gui",
+            "windows",
+            "Global key/mouse polling and hotkeys (requires --allow-input)",
+        ),
+        "ui" => (
+            "gui",
+            "windows",
+            "Declarative 2D UI layout and interactive widgets",
+        ),
+        "crypto" => (
+            "crypto",
+            "all",
+            "HMAC-SHA256, constant_time_eq, random_key, ChaCha20-Poly1305 AEAD",
+        ),
+        "kv" => (
+            "io",
+            "all",
+            "Embedded append-only CRC32 KV store (sandbox-checked)",
+        ),
+        "net" => (
+            "net",
+            "all",
+            "Sandboxed TCP & UDP sockets (requires --allow-net)",
+        ),
+        "ws" => (
+            "net",
+            "all",
+            "RFC 6455 WebSocket server & client (requires --allow-net)",
+        ),
+        "signal" => (
+            "runtime",
+            "all",
+            "Reactive signal state cells with on change observers",
+        ),
+        "task" => (
+            "runtime",
+            "all",
+            "Cooperative green tasks (spawn, yield_now, sleep, join, select, timeout)",
+        ),
+        "channel" => ("runtime", "all", "Bounded channels with deadlock detection"),
+        _ => ("other", "all", ""),
+    }
+}
+
 pub fn get_builtin_module(name: &str) -> Option<Value> {
     match name {
         "math" => Some(math::module()),

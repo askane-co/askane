@@ -15,12 +15,16 @@ pub fn module() -> Value {
             ("is_open", gfx_is_open),
             ("clear", gfx_clear),
             ("rect", gfx_rect),
+            ("rect_alpha", gfx_rect_alpha),
             ("circle", gfx_circle),
+            ("circle_alpha", gfx_circle_alpha),
             ("line", gfx_line),
             ("pixel", gfx_pixel),
             ("text", gfx_text),
             ("rect_outline", gfx_rect_outline),
             ("circle_outline", gfx_circle_outline),
+            ("width", gfx_width),
+            ("height", gfx_height),
             ("load_image", gfx_load_image),
             ("draw_image", gfx_draw_image),
             ("draw_image_keyed", gfx_draw_image_keyed),
@@ -30,6 +34,7 @@ pub fn module() -> Value {
             ("delta", gfx_delta),
             ("present", gfx_present),
             ("key_down", gfx_key_down),
+            ("key_pressed", gfx_key_pressed),
             ("mouse_x", gfx_mouse_x),
             ("mouse_y", gfx_mouse_y),
             ("mouse_down", gfx_mouse_down),
@@ -394,6 +399,7 @@ mod win32_gfx {
         });
         IMAGES.with(|imgs| imgs.borrow_mut().clear());
         LAST_FRAME.with(|lf| *lf.borrow_mut() = None);
+        PREV_KEYS.with(|pk| *pk.borrow_mut() = [false; 256]);
     }
 
     pub fn pump_events() -> bool {
@@ -423,6 +429,17 @@ mod win32_gfx {
                     ReleaseDC(state.hwnd, hdc);
                 }
             }
+            let focused = unsafe { GetForegroundWindow() == state.hwnd };
+            PREV_KEYS.with(|pk| {
+                let mut arr = pk.borrow_mut();
+                if !focused {
+                    *arr = [false; 256];
+                } else {
+                    for (vk, slot) in arr.iter_mut().enumerate().skip(1) {
+                        *slot = unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 };
+                    }
+                }
+            });
             Ok(())
         })
     }
@@ -442,6 +459,10 @@ mod win32_gfx {
         })
     }
 
+    pub fn has_window() -> bool {
+        WINDOW.with(|w| w.borrow().is_some())
+    }
+
     pub fn key_down(vk: i32) -> bool {
         let focused = WINDOW.with(|w| {
             w.borrow()
@@ -454,6 +475,13 @@ mod win32_gfx {
         unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
     }
 
+    pub fn key_pressed(vk: i32) -> bool {
+        if !(1..=254).contains(&vk) {
+            return false;
+        }
+        key_down(vk) && !PREV_KEYS.with(|pk| pk.borrow()[vk as usize])
+    }
+
     pub struct BmpImage {
         pub width: i32,
         pub height: i32,
@@ -464,6 +492,7 @@ mod win32_gfx {
     thread_local! {
         pub static IMAGES: RefCell<Vec<BmpImage>> = const { RefCell::new(Vec::new()) };
         pub static LAST_FRAME: RefCell<Option<std::time::Instant>> = const { RefCell::new(None) };
+        pub static PREV_KEYS: RefCell<[bool; 256]> = const { RefCell::new([false; 256]) };
     }
 
     pub fn parse_bmp_safe(data: &[u8]) -> Result<BmpImage, String> {
@@ -654,6 +683,48 @@ fn gfx_pixel(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 #[cfg(windows)]
+fn rect_fill_impl(
+    x: i32,
+    y: i32,
+    rw: i32,
+    rh: i32,
+    color: u32,
+    alpha: Option<u32>,
+) -> Result<(), String> {
+    win32_gfx::WINDOW.with(|w| {
+        let mut borrow = w.borrow_mut();
+        let state = borrow
+            .as_mut()
+            .ok_or_else(|| "No active gfx window".to_string())?;
+        if alpha == Some(0) {
+            return Ok(());
+        }
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = x.saturating_add(rw).min(state.width);
+        let y1 = y.saturating_add(rh).min(state.height);
+        if let Some(a) = alpha.filter(|&a| a < 255) {
+            let src = (a << 24) | color;
+            for py in y0..y1 {
+                let row = (py * state.width) as usize;
+                for px in x0..x1 {
+                    let idx = row + px as usize;
+                    state.buffer[idx] = blend_argb(src, state.buffer[idx]);
+                }
+            }
+        } else {
+            for py in y0..y1 {
+                let row = (py * state.width) as usize;
+                for px in x0..x1 {
+                    state.buffer[row + px as usize] = color;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
 fn gfx_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 7 {
         return Err("gfx.rect() expects 7 arguments (x, y, w, h, r, g, b)".to_string());
@@ -667,22 +738,77 @@ fn gfx_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[5], "rect")?,
         as_int(&args[6], "rect")?,
     );
+    rect_fill_impl(x, y, rw, rh, color, None)?;
+    Ok(Value::Unit)
+}
+
+#[cfg(windows)]
+fn gfx_rect_alpha(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 8 {
+        return Err("gfx.rect_alpha() expects 8 arguments (x, y, w, h, r, g, b, a)".to_string());
+    }
+    let x = as_int(&args[0], "rect_alpha")? as i32;
+    let y = as_int(&args[1], "rect_alpha")? as i32;
+    let rw = as_int(&args[2], "rect_alpha")? as i32;
+    let rh = as_int(&args[3], "rect_alpha")? as i32;
+    let color = rgb(
+        as_int(&args[4], "rect_alpha")?,
+        as_int(&args[5], "rect_alpha")?,
+        as_int(&args[6], "rect_alpha")?,
+    );
+    let alpha = as_int(&args[7], "rect_alpha")?.clamp(0, 255) as u32;
+    rect_fill_impl(x, y, rw, rh, color, Some(alpha))?;
+    Ok(Value::Unit)
+}
+
+#[cfg(windows)]
+fn circle_fill_impl(
+    cx: i32,
+    cy: i32,
+    rad: i64,
+    color: u32,
+    alpha: Option<u32>,
+) -> Result<(), String> {
     win32_gfx::WINDOW.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
             .ok_or_else(|| "No active gfx window".to_string())?;
-        let x0 = x.max(0);
-        let y0 = y.max(0);
-        let x1 = x.saturating_add(rw).min(state.width);
-        let y1 = y.saturating_add(rh).min(state.height);
-        for py in y0..y1 {
-            let row = (py * state.width) as usize;
-            for px in x0..x1 {
-                state.buffer[row + px as usize] = color;
+        if rad < 0 || alpha == Some(0) {
+            return Ok(());
+        }
+        let rad = rad.min(4096) as i32;
+        let x0 = (cx - rad).max(0);
+        let y0 = (cy - rad).max(0);
+        let x1 = (cx + rad).min(state.width - 1);
+        let y1 = (cy + rad).min(state.height - 1);
+        let r2 = rad * rad;
+        if let Some(a) = alpha.filter(|&a| a < 255) {
+            let src = (a << 24) | color;
+            for py in y0..=y1 {
+                let dy = py - cy;
+                let row = (py * state.width) as usize;
+                for px in x0..=x1 {
+                    let dx = px - cx;
+                    if dx * dx + dy * dy <= r2 {
+                        let idx = row + px as usize;
+                        state.buffer[idx] = blend_argb(src, state.buffer[idx]);
+                    }
+                }
+            }
+        } else {
+            for py in y0..=y1 {
+                let dy = py - cy;
+                let row = (py * state.width) as usize;
+                for px in x0..=x1 {
+                    let dx = px - cx;
+                    if dx * dx + dy * dy <= r2 {
+                        state.buffer[row + px as usize] = color;
+                    }
+                }
             }
         }
-        Ok(Value::Unit)
+        Ok(())
     })
 }
 
@@ -694,36 +820,60 @@ fn gfx_circle(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let cx = as_int(&args[0], "circle")? as i32;
     let cy = as_int(&args[1], "circle")? as i32;
     let rad = as_int(&args[2], "circle")?;
-    if rad < 0 {
-        return Ok(Value::Unit);
-    }
-    let rad = rad.min(4096) as i32;
     let color = rgb(
         as_int(&args[3], "circle")?,
         as_int(&args[4], "circle")?,
         as_int(&args[5], "circle")?,
     );
+    circle_fill_impl(cx, cy, rad, color, None)?;
+    Ok(Value::Unit)
+}
+
+#[cfg(windows)]
+fn gfx_circle_alpha(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 7 {
+        return Err(
+            "gfx.circle_alpha() expects 7 arguments (cx, cy, radius, r, g, b, a)".to_string(),
+        );
+    }
+    let cx = as_int(&args[0], "circle_alpha")? as i32;
+    let cy = as_int(&args[1], "circle_alpha")? as i32;
+    let rad = as_int(&args[2], "circle_alpha")?;
+    let color = rgb(
+        as_int(&args[3], "circle_alpha")?,
+        as_int(&args[4], "circle_alpha")?,
+        as_int(&args[5], "circle_alpha")?,
+    );
+    let alpha = as_int(&args[6], "circle_alpha")?.clamp(0, 255) as u32;
+    circle_fill_impl(cx, cy, rad, color, Some(alpha))?;
+    Ok(Value::Unit)
+}
+
+#[cfg(windows)]
+fn gfx_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.width() expects 0 arguments".to_string());
+    }
     win32_gfx::WINDOW.with(|w| {
-        let mut borrow = w.borrow_mut();
+        let borrow = w.borrow();
         let state = borrow
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| "No active gfx window".to_string())?;
-        let x0 = (cx - rad).max(0);
-        let y0 = (cy - rad).max(0);
-        let x1 = (cx + rad).min(state.width - 1);
-        let y1 = (cy + rad).min(state.height - 1);
-        let r2 = rad * rad;
-        for py in y0..=y1 {
-            let dy = py - cy;
-            let row = (py * state.width) as usize;
-            for px in x0..=x1 {
-                let dx = px - cx;
-                if dx * dx + dy * dy <= r2 {
-                    state.buffer[row + px as usize] = color;
-                }
-            }
-        }
-        Ok(Value::Unit)
+        Ok(Value::Int(state.width as i64))
+    })
+}
+
+#[cfg(windows)]
+fn gfx_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.height() expects 0 arguments".to_string());
+    }
+    win32_gfx::WINDOW.with(|w| {
+        let borrow = w.borrow();
+        let state = borrow
+            .as_ref()
+            .ok_or_else(|| "No active gfx window".to_string())?;
+        Ok(Value::Int(state.height as i64))
     })
 }
 
@@ -782,40 +932,63 @@ fn gfx_present(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 #[cfg(windows)]
-fn gfx_key_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err("gfx.key_down() expects 1 argument (key_name)".to_string());
-    }
-    let name = match &args[0] {
+fn parse_vk_name(arg: &Value, ctx: &str) -> Result<i32, String> {
+    let name = match arg {
         Value::Str(s) => s.to_uppercase(),
         other => {
             return Err(format!(
-                "gfx.key_down() expects a string key name, got '{}'",
+                "gfx.{}() expects a string key name, got '{}'",
+                ctx,
                 other.type_name()
             ));
         }
     };
-    let vk = match name.as_str() {
-        "LEFT" => 0x25,
-        "UP" => 0x26,
-        "RIGHT" => 0x27,
-        "DOWN" => 0x28,
-        "SPACE" => 0x20,
-        "ENTER" => 0x0D,
-        "ESC" | "ESCAPE" => 0x1B,
-        "SHIFT" => 0x10,
-        "CTRL" => 0x11,
+    match name.as_str() {
+        "LEFT" => Ok(0x25),
+        "UP" => Ok(0x26),
+        "RIGHT" => Ok(0x27),
+        "DOWN" => Ok(0x28),
+        "SPACE" => Ok(0x20),
+        "ENTER" => Ok(0x0D),
+        "TAB" => Ok(0x09),
+        "BACKSPACE" => Ok(0x08),
+        "ESC" | "ESCAPE" => Ok(0x1B),
+        "SHIFT" => Ok(0x10),
+        "CTRL" => Ok(0x11),
         s if s.len() == 1 => {
             let b = s.as_bytes()[0];
             if b.is_ascii_alphanumeric() {
-                b as i32
+                Ok(b as i32)
             } else {
-                return Err(format!("Unknown key '{}'", name));
+                Err(format!("Unknown key '{}'", name))
             }
         }
-        _ => return Err(format!("Unknown key '{}'", name)),
-    };
+        _ => Err(format!("Unknown key '{}'", name)),
+    }
+}
+
+#[cfg(windows)]
+fn gfx_key_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.key_down() expects 1 argument (key_name)".to_string());
+    }
+    let vk = parse_vk_name(&args[0], "key_down")?;
+    if !win32_gfx::has_window() {
+        return Err("No active gfx window".to_string());
+    }
     Ok(Value::Bool(win32_gfx::key_down(vk)))
+}
+
+#[cfg(windows)]
+fn gfx_key_pressed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.key_pressed() expects 1 argument (key_name)".to_string());
+    }
+    let vk = parse_vk_name(&args[0], "key_pressed")?;
+    if !win32_gfx::has_window() {
+        return Err("No active gfx window".to_string());
+    }
+    Ok(Value::Bool(win32_gfx::key_pressed(vk)))
 }
 
 #[cfg(windows)]
@@ -891,6 +1064,9 @@ fn gfx_mouse_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         "middle" => 0x04,
         _ => return Err(format!("Unknown mouse button '{}'", btn)),
     };
+    if !win32_gfx::has_window() {
+        return Err("No active gfx window".to_string());
+    }
     Ok(Value::Bool(win32_gfx::key_down(vk)))
 }
 
@@ -917,14 +1093,14 @@ fn gfx_rect_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[5], "rect_outline")?,
         as_int(&args[6], "rect_outline")?,
     );
-    if rw <= 0 || rh <= 0 {
-        return Ok(Value::Unit);
-    }
     win32_gfx::WINDOW.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
             .ok_or_else(|| "No active gfx window".to_string())?;
+        if rw <= 0 || rh <= 0 {
+            return Ok(Value::Unit);
+        }
         let mut put = |px: i32, py: i32| {
             if px >= 0 && py >= 0 && px < state.width && py < state.height {
                 let idx = (py * state.width + px) as usize;
@@ -1219,7 +1395,15 @@ use unsupported as gfx_clear;
 #[cfg(not(windows))]
 use unsupported as gfx_rect;
 #[cfg(not(windows))]
+use unsupported as gfx_rect_alpha;
+#[cfg(not(windows))]
 use unsupported as gfx_circle;
+#[cfg(not(windows))]
+use unsupported as gfx_circle_alpha;
+#[cfg(not(windows))]
+use unsupported as gfx_width;
+#[cfg(not(windows))]
+use unsupported as gfx_height;
 #[cfg(not(windows))]
 use unsupported as gfx_line;
 #[cfg(not(windows))]
@@ -1228,6 +1412,8 @@ use unsupported as gfx_pixel;
 use unsupported as gfx_present;
 #[cfg(not(windows))]
 use unsupported as gfx_key_down;
+#[cfg(not(windows))]
+use unsupported as gfx_key_pressed;
 #[cfg(not(windows))]
 use unsupported as gfx_close;
 #[cfg(not(windows))]
@@ -1257,6 +1443,7 @@ use unsupported as gfx_set_title;
 #[cfg(not(windows))]
 use unsupported as gfx_delta;
 
+#[cfg(any(windows, test))]
 fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     let a = a as i32;
     let b = b as i32;
@@ -1274,6 +1461,7 @@ fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
+#[cfg(any(windows, test))]
 fn unfilter_png_scanlines(
     raw: &[u8],
     row_bytes: usize,
@@ -1324,6 +1512,7 @@ fn unfilter_png_scanlines(
     Ok(out)
 }
 
+#[cfg(any(windows, test))]
 fn unpack_png_sub_byte(row: &[u8], x: usize, bit_depth: u8) -> u8 {
     let bits = bit_depth as usize;
     let per_byte = 8 / bits;
@@ -1333,6 +1522,7 @@ fn unpack_png_sub_byte(row: &[u8], x: usize, bit_depth: u8) -> u8 {
     (byte >> shift) & mask
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn decode_png(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {
     const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if data.len() < 8 || &data[..8] != SIG {

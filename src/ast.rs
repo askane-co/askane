@@ -116,18 +116,21 @@ pub enum Stmt {
     },
     Let {
         name: String,
+        name_span: Span,
         value: Expr,
         is_pub: bool,
         span: Span,
     },
     LetList {
         names: Vec<String>,
+        name_spans: Vec<Span>,
         value: Expr,
         is_pub: bool,
         span: Span,
     },
     LetDict {
         fields: Vec<String>,
+        field_spans: Vec<Span>,
         value: Expr,
         is_pub: bool,
         span: Span,

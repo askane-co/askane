@@ -409,6 +409,7 @@ impl Compiler {
                 value,
                 is_pub,
                 span,
+                ..
             } => {
                 self.check_pub(*is_pub, *span)?;
                 self.compile_expr(value)?;
@@ -425,6 +426,7 @@ impl Compiler {
                 value,
                 is_pub,
                 span,
+                ..
             } => {
                 self.check_pub(*is_pub, *span)?;
                 let top_level = self.current().scope_depth == 0;
@@ -455,6 +457,7 @@ impl Compiler {
                 value,
                 is_pub,
                 span,
+                ..
             } => {
                 self.check_pub(*is_pub, *span)?;
                 let top_level = self.current().scope_depth == 0;

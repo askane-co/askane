@@ -3,7 +3,7 @@
 
   <h1>
     <img src="docs/logo.png" alt="Askane Logo" width="38" height="38" align="absmiddle" />
-    &nbsp;Askane (v0.17.1 Open Beta)
+    &nbsp;Askane (v0.18.0 Open Beta)
   </h1>
 
   <p>
@@ -30,7 +30,7 @@
 - **Single standalone binary**: lexer, AST parser, bytecode compiler, register/stack fast VM (`execute_fast`), and a rich standard library in pure Rust with zero Cargo dependencies.
 - **Expression-first syntax**: `{ ... }` blocks, `if`/`else`, `match`, pipelines (`|>`, `|?>`, `|*>`, `|>=`, `_`), inline `recover`, tagged templates (`log"..."`, `sql"..."`), `struct`, `set`, `bytes`, and built-in `spec` tests.
 - **Sandbox & contracts**: default-deny permissions for network, filesystem outside root, env, args, clipboard, global input, and process execution, plus `needs` declarations and `sandbox { ... }` privilege attenuation.
-- **Built-in tooling**: multiline REPL, `askane check`, `askane fmt`, `askane test [--deterministic] [--update-snapshots]`, `askane permissions`, `askane init`, `askane setup`, benchmark suite (`bench/`), and Windows Askane Studio v2 (`--gui`) with project explorer, tabs, search/replace, line numbers, and permissions toggles.
+- **Built-in tooling**: multiline REPL, `askane check [--diagnostic-format=json]`, `askane --explain E0401`, `askane info`, `askane doctor`, `askane modules`, `askane clean`, `askane fmt`, `askane test [--deterministic] [--update-snapshots]`, `askane permissions`, `askane init`, `askane setup`, benchmark suite (`bench/`), and Windows Askane Studio v2 (`--gui`) with project explorer, tabs, search/replace, line numbers, and permissions toggles.
 
 ## How It Works Under the Hood
 
@@ -122,13 +122,13 @@ spec "player mana stays non-negative" {
 
 Global functions:
 - I/O: `print(...)`, `println(...)`, `read_line()`
-- Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `unique(list)`, `flatten(list)`, `chunk(list, size)`, `sum(seq)`, `has(dict, key)`
-- Higher-order & Sequences: `map(seq, fn)`, `filter(seq, fn)`, `reduce(seq, init, fn)`, `enumerate(seq)`, `zip(a, b)`, `take(seq, n)`, `skip(seq, n)`, `any(seq, fn)`, `all(seq, fn)`, `find(seq, fn)`
-- Conversions & Utils: `str(x)`, `int(x)`, `float(x)`, `type_of(x)`, `clock()`
+- Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `unique(list)`, `flatten(list)`, `chunk(list, size)`, `sum(seq)`, `has(dict, key)`, `first(seq)`, `last(seq)`, `is_empty(seq)`
+- Higher-order & Sequences: `map(seq, fn)`, `filter(seq, fn)`, `reduce(seq, init, fn)`, `enumerate(seq)`, `zip(a, b)`, `take(seq, n)`, `skip(seq, n)`, `any(seq, fn)`, `all(seq, fn)`, `find(seq, fn)`, `find_index(seq, pred)`, `count(seq, pred)`, `partition(seq, pred)`, `flat_map(seq, fn)`, `take_while(seq, pred)`, `drop_while(seq, pred)`, `zip_longest(a, b, [fill])`, `min_by(seq, key_fn)`, `max_by(seq, key_fn)`
+- Conversions, Arithmetic & Types: `str(x)`, `repr(x)`, `int(x)`, `try_int(x)`, `float(x)`, `try_float(x)`, `type_of(x)`, `is_same(a, b)`, `is_unit(x)`, `is_int(x)`, `is_float(x)`, `is_bool(x)`, `is_str(x)`, `is_bytes(x)`, `is_list(x)`, `is_dict(x)`, `is_set(x)`, `is_fn(x)`, `checked_add(a, b)`, `checked_sub(a, b)`, `checked_mul(a, b)`, `wrapping_add(a, b)`, `wrapping_sub(a, b)`, `wrapping_mul(a, b)`, `clock()`
 
 Built-in standard modules (`import <name>;`):
 - `math`: `pi`, `e`, `sqrt`, `abs`, `pow`, `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`, `clamp`, `lerp`, `dist`, `atan2`
-- `strings`: `split`, `trim`, `trim_start`, `trim_end`, `replace`, `contains`, `starts_with`, `ends_with`, `upper`, `lower`, `find`, `repeat`, `lines`, `pad_start`, `pad_end`, `slice`, `join`
+- `strings`: `split`, `trim`, `trim_start`, `trim_end`, `replace`, `contains`, `starts_with`, `ends_with`, `upper`, `lower`, `find`, `repeat`, `lines`, `pad_start`, `pad_end`, `slice`, `join`, `byte_len`, `eq_ignore_case`, `contains_ignore_case`, `strip_prefix`, `strip_suffix`, `split_once`, `rsplit_once`, `truncate_utf8`
 - `path`: `join`, `parent`, `name`, `stem`, `extension`, `is_absolute`, `normalize`
 - `time`: `now_ms`, `now_sec`, `elapsed_ms`, `sleep_ms`
 - `random`: `seed`, `int`, `float`, `bool`, `choice`, `shuffle`, `crypto_int`, `crypto_bytes`
@@ -137,7 +137,7 @@ Built-in standard modules (`import <name>;`):
 - `bytes` (and `b"..."` / `br"..."` literals): `from_hex`, `to_hex`, `from_str`, `to_str`, `concat`, `slice`, `fill`
 - `toml`: `parse`, `stringify`
 - `binary`: `pack`, `unpack`, `read_u16_le`/`be`, `read_u32_le`/`be`, `read_i32_le`/`be`, `read_i64_le`/`be`, `read_f32_le`/`be`, `read_f64_le`/`be`, `write_*`
-- `collections`: `deque`, `counter`, `priority_queue`, `groupby`, `window`
+- `collections`: `deque`, `counter`, `priority_queue`, `groupby`, `window`, `first`, `last`, `is_empty`, `find_index`, `count`, `partition`, `flat_map`, `take_while`, `drop_while`, `zip_longest`, `min_by`, `max_by`
 - `compress`: `deflate`, `inflate`, `zlib_compress`, `zlib_decompress`, `gzip_compress`, `gzip_decompress`, `crc32`, `adler32`
 - `archive`: `pack`, `create`, `list`, `read_entry`, `extract` (with Zip Slip and size guards)
 - `os`: `platform`, `arch`, `family`, `cpu_count`, `pid`, `sep`, `line_ending`, `cwd`, `home_dir`, `temp_dir`, `env`, `args`
@@ -170,20 +170,24 @@ Built-in standard modules (`import <name>;`):
 - `dialog` (Windows): `info`, `confirm`, `open_file`, `save_file`
 - `process`: `run(cmd, [args])` (requires `--allow-exec[=cmd]` or `--unsafe`)
 - `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`, `read_bytes`, `write_bytes`, `copy`, `move`, `size`, `glob`
-- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `rect_outline`, `circle`, `circle_outline`, `line`, `pixel`, `text`, `load_image` (BMP & PNG with alpha), `draw_image`, `draw_image_keyed`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
-- `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`
+- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `rect_alpha`, `rect_outline`, `circle`, `circle_alpha`, `circle_outline`, `line`, `pixel`, `text`, `width`, `height`, `load_image` (BMP & PNG with alpha), `draw_image`, `draw_image_keyed`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `key_pressed`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
+- `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`, `budget`
 - `json`: `parse`, `stringify`
 - `http` (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
 - `mem` (Windows): `current_pid`, `find_pid` (returns `unit` if not found), `open`, `close`, `module_base` (returns `unit` if not found), `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
 
 CLI tools:
 - `askane` — multiline REPL (supports `:help`, `:gui`, `:exit`, `:reset`, `:modules`, `:bc`)
-- `askane -e "<code>"` — evaluate inline Askane code
+- `askane -e "<code>"` — evaluate inline Askane code (pass script args after `--`)
 - `askane --gui [file.ask]` — Askane Studio v2 GUI editor & runner (Windows, project explorer, tabs, line numbers, find/replace, Fmt/Test, permission toggles, Setup modal, Job Object isolation)
-- `askane check [--json] <file_or_dir>` — syntax/compile check without execution
+- `askane check [--json|--diagnostic-format=json] [--no-color] <file_or_dir>` — multi-error syntax/compile check + static warnings (`W0101`/`W0102`) without execution
+- `askane --explain <E...|W...>` — explain diagnostic error or warning code
+- `askane info` / `askane doctor` — print runtime summary or run environment diagnostics
+- `askane modules [--json]` — list all 49 built-in standard library modules
+- `askane clean [--dry-run] [--snapshots] [dir]` — clean bytecode/temp artifacts
 - `askane fmt [--check] <file.ask>` — format Askane source code
-- `askane permissions <file.ask>` — inspect capabilities imported by a script
-- `askane init [dir]`: create a starter Askane project (`askane.toml`, `main.ask`, `tests/basic_test.ask`)
+- `askane permissions <file.ask>` — inspect static & dynamic capabilities imported by a script
+- `askane init [--name <name>] [dir]`: create a starter Askane project (`askane.toml`, `main.ask`, `tests/basic_test.ask`)
 - `askane setup [--status|--all|--default=run|studio|--uninstall]`: add Askane to User PATH and register `.ask` file associations (Windows)
 - `askane test [--deterministic] [--update-snapshots] <file_or_dir>`: run `.ask` test files in isolated VMs
 
@@ -197,8 +201,8 @@ to 32 MiB. Graphics scripts exceeding the budget need trusted mode for now.
 Granular permission flags are supported in addition to `--unsafe`:
 - `--allow-net[=host[:port],...]`: allow HTTPS requests (all hosts or specific allowlist)
 - `--allow-read[=dir,...]` / `--allow-write[=dir,...]`: allow reading/writing outside the script directory
-- `--allow-env[=VAR,...]`: allow `sys.env()` (all or specific variables)
-- `--allow-args`: allow `sys.args()`
+- `--allow-env[=VAR,...]`: allow `sys.env()` / `os.env()` (all or specific variables)
+- `--allow-args`: allow `sys.args()` / `os.args()`
 - `--max-steps=N`: override the 10-million sandbox instruction budget
 - `--timeout=MS`: override the 30-second sandbox wall-clock deadline
 - `--allow-clipboard`: allow `clipboard.get_text()` and `clipboard.set_text()`

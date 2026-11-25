@@ -1,6 +1,7 @@
 mod ast;
 mod bytecode;
 mod compiler;
+mod diag;
 mod gui;
 mod lexer;
 mod modules;
@@ -20,7 +21,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.17.1";
+const VERSION: &str = "0.18.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -65,34 +66,31 @@ fn compile_source_with_specs(source: &str) -> Result<std::rc::Rc<bytecode::Funct
     compile_source_mode(source, true)
 }
 
-fn format_error_with_source(source: &str, err: &str) -> String {
-    let mut line_num: Option<usize> = None;
-    let mut col_num: Option<usize> = None;
+fn use_cli_color(no_color: bool) -> bool {
+    use std::io::IsTerminal;
+    !no_color && diag::default_color_enabled() && std::io::stderr().is_terminal()
+}
 
-    if let Some(start) = err.find('[') {
-        if let Some(end) = err[start + 1..].find(']') {
-            let tag = &err[start + 1..start + 1 + end];
-            if let Some(rest) = tag.strip_prefix("line ") {
-                line_num = rest.trim().parse::<usize>().ok();
-            } else if let Some((l, c)) = tag.split_once(':') {
-                line_num = l.trim().parse::<usize>().ok();
-                col_num = c.trim().parse::<usize>().ok();
-            }
+fn format_error_with_opts(file: Option<&str>, source: &str, err: &str, use_color: bool) -> String {
+    let d = diag::classify_error(err, file);
+    let target_src = match (&d.file, file) {
+        (Some(df), Some(rf)) if df != rf => {
+            read_text_limited(std::path::Path::new(df), MAX_SOURCE_BYTES).ok()
         }
-    }
+        (Some(df), None) => read_text_limited(std::path::Path::new(df), MAX_SOURCE_BYTES).ok(),
+        _ => None,
+    };
+    let src_ref = match (&d.file, file, target_src.as_deref()) {
+        (_, _, Some(s)) => Some(s),
+        (Some(df), Some(rf), None) if df != rf => None,
+        (Some(_), None, None) => None,
+        _ => Some(source),
+    };
+    diag::format_diagnostic(&d, src_ref, use_color)
+}
 
-    let Some(ln) = line_num else {
-        return err.to_string();
-    };
-    let Some(src_line) = source.lines().nth(ln.saturating_sub(1)) else {
-        return err.to_string();
-    };
-    let mut out = format!("{}\n  {:>4} | {}", err, ln, src_line);
-    if let Some(col) = col_num {
-        let pad = " ".repeat(col.saturating_sub(1));
-        out.push_str(&format!("\n       | {}^", pad));
-    }
-    out
+fn format_error_with_source(source: &str, err: &str) -> String {
+    format_error_with_opts(None, source, err, false)
 }
 
 #[cfg(test)]
@@ -102,12 +100,14 @@ fn run_file_with_root(
     permissions: Permissions,
     sandbox_root_override: Option<&std::path::Path>,
 ) -> Result<(), String> {
-    run_file_with_options(
+    run_file_with_script_args(
         path,
         dump_bytecode,
         false,
         permissions,
         sandbox_root_override,
+        None,
+        true,
     )
 }
 
@@ -130,40 +130,26 @@ fn print_profile_report(vm: &VM) {
     }
 }
 
-fn run_file_with_options(
+fn run_file_with_script_args(
     path: &str,
     dump_bytecode: bool,
     profile: bool,
     permissions: Permissions,
     sandbox_root_override: Option<&std::path::Path>,
+    script_args: Option<&[String]>,
+    no_color: bool,
 ) -> Result<(), String> {
-    run_file_core(
+    run_file_core_full(
         path,
         dump_bytecode,
         profile,
         false,
         permissions,
         sandbox_root_override,
-    )
-}
-
-fn run_file_core(
-    path: &str,
-    dump_bytecode: bool,
-    profile: bool,
-    include_specs: bool,
-    permissions: Permissions,
-    sandbox_root_override: Option<&std::path::Path>,
-) -> Result<(), String> {
-    run_file_core_with_test_opts(
-        path,
-        dump_bytecode,
-        profile,
-        include_specs,
-        permissions,
-        sandbox_root_override,
         false,
         false,
+        script_args,
+        no_color,
     )
 }
 
@@ -178,6 +164,34 @@ fn run_file_core_with_test_opts(
     deterministic: bool,
     update_snapshots: bool,
 ) -> Result<(), String> {
+    run_file_core_full(
+        path,
+        dump_bytecode,
+        profile,
+        include_specs,
+        permissions,
+        sandbox_root_override,
+        deterministic,
+        update_snapshots,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_file_core_full(
+    path: &str,
+    dump_bytecode: bool,
+    profile: bool,
+    include_specs: bool,
+    permissions: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+    deterministic: bool,
+    update_snapshots: bool,
+    script_args: Option<&[String]>,
+    no_color: bool,
+) -> Result<(), String> {
+    let color = use_cli_color(no_color);
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
     let proto = if include_specs {
@@ -185,16 +199,20 @@ fn run_file_core_with_test_opts(
     } else {
         compile_source(&source)
     }
-    .map_err(|e| format_error_with_source(&source, &e))?;
+    .map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?;
     if dump_bytecode {
         print!("{}", proto.chunk.disassemble(&proto.name));
         return Ok(());
     }
     let mut vm = VM::new_with_sandbox(!permissions.allow_all);
     vm.set_permissions(permissions);
+    vm.set_script_file(path);
     vm.set_profile(profile);
     vm.set_deterministic(deterministic);
     vm.set_update_snapshots(update_snapshots);
+    if let Some(sargs) = script_args {
+        vm.set_script_args(sargs.to_vec());
+    }
     let entry_parent = match std::path::Path::new(path).parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
             Some(fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()))
@@ -214,7 +232,7 @@ fn run_file_core_with_test_opts(
     } else {
         vm.run(proto)
     };
-    run_result.map_err(|e| format_error_with_source(&source, &e))?;
+    run_result.map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?;
     if include_specs && !vm.spec_results().is_empty() {
         let mut failed_specs = 0usize;
         for (name, res) in vm.spec_results() {
@@ -254,61 +272,222 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn check_single_file(path: &str, json_out: bool) -> Result<(), String> {
-    let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
-        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
-    match compile_source_with_specs(&source) {
-        Ok(_) => {
-            if json_out {
-                println!("{{\"ok\":true,\"file\":{}}}", json_escape(path));
-            } else {
-                println!("OK: {}", path);
-            }
-            Ok(())
-        }
-        Err(err) => {
-            if json_out {
-                println!(
-                    "{{\"ok\":false,\"file\":{},\"error\":{}}}",
+struct CheckFileReport {
+    ok: bool,
+    file_json: String,
+    diag_jsons: Vec<String>,
+    err_text: Option<String>,
+}
+
+fn check_file_report(path: &str, json_out: bool, color: bool) -> CheckFileReport {
+    let source = match read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("Could not read '{}': {}", path, e);
+            let d = diag::classify_error(&msg, Some(path));
+            let d_json = diag::diagnostic_to_json(&d, json_escape);
+            return CheckFileReport {
+                ok: false,
+                file_json: format!(
+                    "{{\"ok\":false,\"file\":{},\"error\":{},\"diagnostics\":[{}]}}",
                     json_escape(path),
-                    json_escape(&err)
-                );
-                Err(String::new())
-            } else {
-                Err(format_error_with_source(&source, &err))
+                    json_escape(&msg),
+                    d_json
+                ),
+                diag_jsons: vec![d_json],
+                err_text: if json_out { None } else { Some(msg) },
+            };
+        }
+    };
+
+    let tokens = match Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(err) => {
+            let d = diag::classify_error(&err, Some(path));
+            let d_json = diag::diagnostic_to_json(&d, json_escape);
+            return CheckFileReport {
+                ok: false,
+                file_json: format!(
+                    "{{\"ok\":false,\"file\":{},\"error\":{},\"diagnostics\":[{}]}}",
+                    json_escape(path),
+                    json_escape(&err),
+                    d_json
+                ),
+                diag_jsons: vec![d_json],
+                err_text: if json_out {
+                    None
+                } else {
+                    Some(diag::format_diagnostic(&d, Some(&source), color))
+                },
+            };
+        }
+    };
+
+    let (program, parse_errs) = Parser::new(tokens).parse_program_recover();
+    let mut diags: Vec<diag::Diagnostic> = parse_errs
+        .iter()
+        .map(|e| diag::classify_error(e, Some(path)))
+        .collect();
+
+    let warnings = diag::analyze_warnings(&program, Some(path));
+    if diags.is_empty() {
+        if let Err(comp_err) = Compiler::compile_with_specs(&program) {
+            diags.push(diag::classify_error(&comp_err, Some(path)));
+        }
+    }
+
+    if diags.is_empty() {
+        let warn_json = warnings
+            .iter()
+            .map(|w| diag::diagnostic_to_json(w, json_escape))
+            .collect::<Vec<_>>();
+        if !json_out {
+            for w in &warnings {
+                eprintln!("{}\n", diag::format_diagnostic(w, Some(&source), color));
             }
+        }
+        let wj_joined = warn_json.join(",");
+        CheckFileReport {
+            ok: true,
+            file_json: format!(
+                "{{\"ok\":true,\"file\":{},\"warnings\":[{}],\"diagnostics\":[{}]}}",
+                json_escape(path),
+                wj_joined,
+                wj_joined
+            ),
+            diag_jsons: warn_json,
+            err_text: None,
+        }
+    } else {
+        let mut all_diags = diags.clone();
+        all_diags.extend(warnings.clone());
+        let first_err = parse_errs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| diags[0].message.clone());
+        let diag_jsons = all_diags
+            .iter()
+            .map(|d| diag::diagnostic_to_json(d, json_escape))
+            .collect::<Vec<_>>();
+        if !json_out {
+            for w in &warnings {
+                eprintln!("{}\n", diag::format_diagnostic(w, Some(&source), color));
+            }
+        }
+        let rendered = if json_out {
+            None
+        } else {
+            Some(
+                diags
+                    .iter()
+                    .map(|d| diag::format_diagnostic(d, Some(&source), color))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )
+        };
+        CheckFileReport {
+            ok: false,
+            file_json: format!(
+                "{{\"ok\":false,\"file\":{},\"error\":{},\"diagnostics\":[{}]}}",
+                json_escape(path),
+                json_escape(&first_err),
+                diag_jsons.join(",")
+            ),
+            diag_jsons,
+            err_text: rendered,
         }
     }
 }
 
-fn run_check(path: &str, json_out: bool) -> Result<(), String> {
+fn check_single_file_opts(path: &str, json_out: bool, no_color: bool) -> Result<(), String> {
+    let color = use_cli_color(no_color);
+    let rep = check_file_report(path, json_out, color);
+    if json_out {
+        println!("{}", rep.file_json);
+        if rep.ok { Ok(()) } else { Err(String::new()) }
+    } else if rep.ok {
+        println!("OK: {}", path);
+        Ok(())
+    } else {
+        Err(rep.err_text.unwrap_or_default())
+    }
+}
+
+fn check_dir_json_report(path: &str, color: bool) -> (bool, String) {
+    let p = std::path::Path::new(path);
+    let mut files = Vec::new();
+    if let Err(err) = collect_ask_files(p, &mut files) {
+        let json = format!(
+            "{{\"ok\":false,\"path\":{},\"error\":{},\"file_count\":0,\"failed_count\":0,\"files\":[],\"diagnostics\":[]}}",
+            json_escape(path),
+            json_escape(&err)
+        );
+        return (false, json);
+    }
+    if files.is_empty() {
+        let msg = format!("No .ask files found in '{}'", path);
+        let json = format!(
+            "{{\"ok\":false,\"path\":{},\"error\":{},\"file_count\":0,\"failed_count\":0,\"files\":[],\"diagnostics\":[]}}",
+            json_escape(path),
+            json_escape(&msg)
+        );
+        return (false, json);
+    }
+    let mut file_jsons = Vec::with_capacity(files.len());
+    let mut all_diags = Vec::new();
+    let mut failed = 0usize;
+    for f in &files {
+        let rep = check_file_report(&f.display().to_string(), true, color);
+        if !rep.ok {
+            failed += 1;
+        }
+        file_jsons.push(rep.file_json);
+        all_diags.extend(rep.diag_jsons);
+    }
+    let ok = failed == 0;
+    let json = format!(
+        "{{\"ok\":{},\"path\":{},\"file_count\":{},\"failed_count\":{},\"files\":[{}],\"diagnostics\":[{}]}}",
+        ok,
+        json_escape(path),
+        files.len(),
+        failed,
+        file_jsons.join(","),
+        all_diags.join(",")
+    );
+    (ok, json)
+}
+
+fn run_check_opts(path: &str, json_out: bool, no_color: bool) -> Result<(), String> {
     let p = std::path::Path::new(path);
     if p.is_dir() {
-        let mut files = Vec::new();
-        collect_ask_files(p, &mut files)?;
-        if files.is_empty() {
-            return Err(format!("No .ask files found in '{}'", path));
-        }
-        let mut failed = 0usize;
-        for f in &files {
-            if let Err(e) = check_single_file(&f.display().to_string(), json_out) {
-                if !e.is_empty() {
-                    eprintln!("Check failed: {}", e);
+        if json_out {
+            let color = use_cli_color(no_color);
+            let (ok, json) = check_dir_json_report(path, color);
+            println!("{}", json);
+            if ok { Ok(()) } else { Err(String::new()) }
+        } else {
+            let mut files = Vec::new();
+            collect_ask_files(p, &mut files)?;
+            if files.is_empty() {
+                return Err(format!("No .ask files found in '{}'", path));
+            }
+            let mut failed = 0usize;
+            for f in &files {
+                if let Err(e) = check_single_file_opts(&f.display().to_string(), false, no_color) {
+                    if !e.is_empty() {
+                        eprintln!("Check failed: {}", e);
+                    }
+                    failed += 1;
                 }
-                failed += 1;
+            }
+            if failed > 0 {
+                Err(format!("{} file(s) failed check", failed))
+            } else {
+                Ok(())
             }
         }
-        if failed > 0 {
-            Err(if json_out {
-                String::new()
-            } else {
-                format!("{} file(s) failed check", failed)
-            })
-        } else {
-            Ok(())
-        }
     } else {
-        check_single_file(path, json_out)
+        check_single_file_opts(path, json_out, no_color)
     }
 }
 
@@ -318,11 +497,87 @@ fn push_unique(out: &mut Vec<String>, item: String) {
     }
 }
 
-fn collect_imports_expr(
-    expr: &ast::Expr,
-    imports: &mut Vec<ast::ImportSource>,
-    needs: &mut Vec<String>,
+#[derive(Default)]
+struct ImportScanCtx {
+    imports: Vec<ast::ImportSource>,
+    needs: Vec<String>,
+    mod_aliases: std::collections::HashMap<String, String>,
+    fn_aliases: std::collections::HashMap<String, (String, String)>,
+}
+
+fn preregister_import_aliases(stmts: &[ast::Stmt], ctx: &mut ImportScanCtx) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Import {
+                source: ast::ImportSource::Name(mod_name),
+                alias,
+                ..
+            } => {
+                ctx.mod_aliases.insert(alias.clone(), mod_name.clone());
+            }
+            ast::Stmt::ImportFrom {
+                source: ast::ImportSource::Name(mod_name),
+                items,
+                ..
+            } => {
+                for item in items {
+                    ctx.fn_aliases
+                        .insert(item.alias.clone(), (mod_name.clone(), item.name.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_dynamic_cap_call(
+    ctx: &mut ImportScanCtx,
+    callee: &ast::Expr,
+    first_arg: Option<&ast::Expr>,
 ) {
+    let Some(arg0) = first_arg else {
+        return;
+    };
+    if matches!(arg0, ast::Expr::Str(_, _)) {
+        return;
+    }
+    let resolved: Option<(String, String)> = match callee {
+        ast::Expr::GetAttr { object, name, .. } => {
+            if let ast::Expr::Ident(ident, _) = object.as_ref() {
+                let mod_name = ctx
+                    .mod_aliases
+                    .get(ident)
+                    .map(String::as_str)
+                    .unwrap_or(ident.as_str());
+                Some((mod_name.to_string(), name.clone()))
+            } else {
+                None
+            }
+        }
+        ast::Expr::Ident(fn_name, _) => ctx.fn_aliases.get(fn_name).cloned(),
+        _ => None,
+    };
+    if let Some((mod_name, fn_name)) = resolved {
+        if matches!(
+            (mod_name.as_str(), fn_name.as_str()),
+            ("process", "run")
+                | ("http", "get")
+                | ("http", "post")
+                | ("net", "tcp_connect")
+                | ("ws", "connect")
+        ) {
+            push_unique(
+                &mut ctx.needs,
+                format!(
+                    "[dynamic] {}.{}() target is non-literal and cannot be statically verified",
+                    mod_name, fn_name
+                ),
+            );
+        }
+    }
+}
+
+fn collect_imports_expr(expr: &ast::Expr, ctx: &mut ImportScanCtx) {
     match expr {
         ast::Expr::Int(_, _)
         | ast::Expr::Float(_, _)
@@ -333,42 +588,47 @@ fn collect_imports_expr(
         | ast::Expr::Ident(_, _) => {}
         ast::Expr::List(items, _) => {
             for item in items {
-                collect_imports_expr(item, imports, needs);
+                collect_imports_expr(item, ctx);
             }
         }
         ast::Expr::Dict(entries, _) => {
             for (k, v) in entries {
-                collect_imports_expr(k, imports, needs);
-                collect_imports_expr(v, imports, needs);
+                collect_imports_expr(k, ctx);
+                collect_imports_expr(v, ctx);
             }
         }
         ast::Expr::Unary { expr: inner, .. } | ast::Expr::Throw { value: inner, .. } => {
-            collect_imports_expr(inner, imports, needs);
+            collect_imports_expr(inner, ctx);
         }
         ast::Expr::Binary { left, right, .. } | ast::Expr::NullCoalesce { left, right, .. } => {
-            collect_imports_expr(left, imports, needs);
-            collect_imports_expr(right, imports, needs);
+            collect_imports_expr(left, ctx);
+            collect_imports_expr(right, ctx);
         }
         ast::Expr::Assign { target, value, .. } => {
             match target.as_ref() {
                 ast::AssignTarget::Var(_) => {}
                 ast::AssignTarget::Index { object, index } => {
-                    collect_imports_expr(object, imports, needs);
-                    collect_imports_expr(index, imports, needs);
+                    collect_imports_expr(object, ctx);
+                    collect_imports_expr(index, ctx);
                 }
                 ast::AssignTarget::Attr { object, .. } => {
-                    collect_imports_expr(object, imports, needs);
+                    collect_imports_expr(object, ctx);
                 }
             }
-            collect_imports_expr(value, imports, needs);
+            collect_imports_expr(value, ctx);
         }
         ast::Expr::Block { stmts, tail, .. } => {
+            let saved_mods = ctx.mod_aliases.clone();
+            let saved_fns = ctx.fn_aliases.clone();
+            preregister_import_aliases(stmts, ctx);
             for s in stmts {
-                collect_imports_stmt(s, imports, needs);
+                collect_imports_stmt(s, ctx);
             }
             if let Some(t) = tail {
-                collect_imports_expr(t, imports, needs);
+                collect_imports_expr(t, ctx);
             }
+            ctx.mod_aliases = saved_mods;
+            ctx.fn_aliases = saved_fns;
         }
         ast::Expr::If {
             cond,
@@ -376,10 +636,10 @@ fn collect_imports_expr(
             else_branch,
             ..
         } => {
-            collect_imports_expr(cond, imports, needs);
-            collect_imports_expr(then_branch, imports, needs);
+            collect_imports_expr(cond, ctx);
+            collect_imports_expr(then_branch, ctx);
             if let Some(e) = else_branch {
-                collect_imports_expr(e, imports, needs);
+                collect_imports_expr(e, ctx);
             }
         }
         ast::Expr::TryCatch {
@@ -387,69 +647,81 @@ fn collect_imports_expr(
             catch_body,
             ..
         } => {
-            collect_imports_expr(try_body, imports, needs);
-            collect_imports_expr(catch_body, imports, needs);
+            collect_imports_expr(try_body, ctx);
+            collect_imports_expr(catch_body, ctx);
         }
         ast::Expr::Match { subject, arms, .. } => {
-            collect_imports_expr(subject, imports, needs);
+            collect_imports_expr(subject, ctx);
             for arm in arms {
                 if let Some(g) = &arm.guard {
-                    collect_imports_expr(g, imports, needs);
+                    collect_imports_expr(g, ctx);
                 }
-                collect_imports_expr(&arm.body, imports, needs);
+                collect_imports_expr(&arm.body, ctx);
             }
         }
         ast::Expr::Fn { params, body, .. } => {
             for p in params {
                 if let Some(d) = &p.default {
-                    collect_imports_expr(d, imports, needs);
+                    collect_imports_expr(d, ctx);
                 }
             }
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(body, ctx);
         }
         ast::Expr::Call { callee, args, .. } => {
-            collect_imports_expr(callee, imports, needs);
+            check_dynamic_cap_call(ctx, callee.as_ref(), args.first());
+            collect_imports_expr(callee, ctx);
             for a in args {
-                collect_imports_expr(a, imports, needs);
+                collect_imports_expr(a, ctx);
             }
         }
         ast::Expr::CallNamed(c) => {
-            collect_imports_expr(&c.callee, imports, needs);
+            let target_arg = c
+                .pos_args
+                .first()
+                .or_else(|| {
+                    c.named_args
+                        .iter()
+                        .find(|(k, _)| matches!(k.as_str(), "url" | "cmd" | "addr"))
+                        .map(|(_, e)| e)
+                })
+                .or_else(|| c.named_args.first().map(|(_, e)| e));
+            check_dynamic_cap_call(ctx, &c.callee, target_arg);
+            collect_imports_expr(&c.callee, ctx);
             for a in &c.pos_args {
-                collect_imports_expr(a, imports, needs);
+                collect_imports_expr(a, ctx);
             }
             for (_, a) in &c.named_args {
-                collect_imports_expr(a, imports, needs);
+                collect_imports_expr(a, ctx);
             }
         }
         ast::Expr::StructInit(st) => {
-            collect_imports_expr(&st.target, imports, needs);
+            collect_imports_expr(&st.target, ctx);
             if let Some(sp) = &st.spread {
-                collect_imports_expr(sp, imports, needs);
+                collect_imports_expr(sp, ctx);
             }
             for (_, v) in &st.fields {
-                collect_imports_expr(v, imports, needs);
+                collect_imports_expr(v, ctx);
             }
         }
         ast::Expr::ChainedCmp(c) => {
-            collect_imports_expr(&c.first, imports, needs);
+            collect_imports_expr(&c.first, ctx);
             for (_, rhs) in &c.comparisons {
-                collect_imports_expr(rhs, imports, needs);
+                collect_imports_expr(rhs, ctx);
             }
         }
         ast::Expr::Index { object, index, .. } => {
-            collect_imports_expr(object, imports, needs);
-            collect_imports_expr(index, imports, needs);
+            collect_imports_expr(object, ctx);
+            collect_imports_expr(index, ctx);
         }
         ast::Expr::Slice {
             object, start, end, ..
         } => {
-            collect_imports_expr(object, imports, needs);
+            collect_imports_expr(object, ctx);
             if let Some(s) = start {
-                collect_imports_expr(s, imports, needs);
+                collect_imports_expr(s, ctx);
             }
             if let Some(e) = end {
-                collect_imports_expr(e, imports, needs);
+                collect_imports_expr(e, ctx);
             }
         }
         ast::Expr::ListComp {
@@ -458,110 +730,122 @@ fn collect_imports_expr(
             cond,
             ..
         } => {
-            collect_imports_expr(iter, imports, needs);
+            collect_imports_expr(iter, ctx);
             if let Some(c) = cond {
-                collect_imports_expr(c, imports, needs);
+                collect_imports_expr(c, ctx);
             }
-            collect_imports_expr(item, imports, needs);
+            collect_imports_expr(item, ctx);
         }
         ast::Expr::GetAttr { object, .. } | ast::Expr::OptGetAttr { object, .. } => {
-            collect_imports_expr(object, imports, needs);
+            collect_imports_expr(object, ctx);
         }
         ast::Expr::SafePipe(p) => {
-            collect_imports_expr(&p.left, imports, needs);
-            collect_imports_expr(&p.apply, imports, needs);
+            collect_imports_expr(&p.left, ctx);
+            collect_imports_expr(&p.apply, ctx);
         }
         ast::Expr::MapPipe { left, mapper, .. } => {
-            collect_imports_expr(left, imports, needs);
-            collect_imports_expr(mapper, imports, needs);
+            collect_imports_expr(left, ctx);
+            collect_imports_expr(mapper, ctx);
         }
         ast::Expr::PipeAssign(p) => {
             match p.target.as_ref() {
                 ast::AssignTarget::Var(_) => {}
                 ast::AssignTarget::Index { object, index } => {
-                    collect_imports_expr(object, imports, needs);
-                    collect_imports_expr(index, imports, needs);
+                    collect_imports_expr(object, ctx);
+                    collect_imports_expr(index, ctx);
                 }
                 ast::AssignTarget::Attr { object, .. } => {
-                    collect_imports_expr(object, imports, needs);
+                    collect_imports_expr(object, ctx);
                 }
             }
             for st in &p.stages {
-                collect_imports_expr(st, imports, needs);
+                collect_imports_expr(st, ctx);
             }
         }
         ast::Expr::TaggedTemplate(t) => {
             for e in &t.exprs {
-                collect_imports_expr(e, imports, needs);
+                collect_imports_expr(e, ctx);
             }
         }
         ast::Expr::With(w) => {
-            collect_imports_expr(&w.resource, imports, needs);
-            collect_imports_expr(&w.body, imports, needs);
+            collect_imports_expr(&w.resource, ctx);
+            collect_imports_expr(&w.body, ctx);
         }
         ast::Expr::Sandbox(s) => {
+            push_unique(
+                &mut ctx.needs,
+                "sandbox(...) dynamically attenuates capabilities within block".to_string(),
+            );
             for (_, v) in &s.policy {
-                collect_imports_expr(v, imports, needs);
+                collect_imports_expr(v, ctx);
             }
-            collect_imports_expr(&s.body, imports, needs);
+            collect_imports_expr(&s.body, ctx);
         }
         ast::Expr::After { delay, body, .. } => {
-            collect_imports_expr(delay, imports, needs);
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(delay, ctx);
+            collect_imports_expr(body, ctx);
         }
     }
 }
 
-fn collect_imports_stmt(
-    stmt: &ast::Stmt,
-    imports: &mut Vec<ast::ImportSource>,
-    needs: &mut Vec<String>,
-) {
+fn collect_imports_stmt(stmt: &ast::Stmt, ctx: &mut ImportScanCtx) {
     match stmt {
-        ast::Stmt::Import { source, .. } | ast::Stmt::ImportFrom { source, .. } => {
-            imports.push(source.clone());
+        ast::Stmt::Import { source, alias, .. } => {
+            if let ast::ImportSource::Name(mod_name) = source {
+                ctx.mod_aliases.insert(alias.clone(), mod_name.clone());
+            }
+            ctx.imports.push(source.clone());
+        }
+        ast::Stmt::ImportFrom { source, items, .. } => {
+            if let ast::ImportSource::Name(mod_name) = source {
+                for item in items {
+                    ctx.fn_aliases
+                        .insert(item.alias.clone(), (mod_name.clone(), item.name.clone()));
+                }
+            }
+            ctx.imports.push(source.clone());
         }
         ast::Stmt::Let { value, .. }
         | ast::Stmt::LetList { value, .. }
         | ast::Stmt::LetDict { value, .. } => {
-            collect_imports_expr(value, imports, needs);
+            collect_imports_expr(value, ctx);
         }
         ast::Stmt::FnDecl { params, body, .. } => {
             for p in params {
                 if let Some(d) = &p.default {
-                    collect_imports_expr(d, imports, needs);
+                    collect_imports_expr(d, ctx);
                 }
             }
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(body, ctx);
         }
         ast::Stmt::StructDecl {
             fields, methods, ..
         } => {
             for f in fields {
                 if let Some(d) = &f.default {
-                    collect_imports_expr(d, imports, needs);
+                    collect_imports_expr(d, ctx);
                 }
             }
             for m in methods {
                 for p in &m.params {
                     if let Some(d) = &p.default {
-                        collect_imports_expr(d, imports, needs);
+                        collect_imports_expr(d, ctx);
                     }
                 }
-                collect_imports_expr(&m.body, imports, needs);
+                collect_imports_expr(&m.body, ctx);
             }
         }
         ast::Stmt::While { cond, body, .. } => {
-            collect_imports_expr(cond, imports, needs);
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(cond, ctx);
+            collect_imports_expr(body, ctx);
         }
         ast::Stmt::For { iter, body, .. } | ast::Stmt::ForPair { iter, body, .. } => {
-            collect_imports_expr(iter, imports, needs);
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(iter, ctx);
+            collect_imports_expr(body, ctx);
         }
         ast::Stmt::Return { value, .. } => {
             if let Some(v) = value {
-                collect_imports_expr(v, imports, needs);
+                collect_imports_expr(v, ctx);
             }
         }
         ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
@@ -572,21 +856,21 @@ fn collect_imports_stmt(
                 } else {
                     format!("needs: {}({})", name, args.join(", "))
                 };
-                push_unique(needs, label);
+                push_unique(&mut ctx.needs, label);
             }
         }
         ast::Stmt::Defer { body, .. } => {
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(body, ctx);
         }
         ast::Stmt::Every { interval, body, .. } => {
-            collect_imports_expr(interval, imports, needs);
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(interval, ctx);
+            collect_imports_expr(body, ctx);
         }
         ast::Stmt::Spec { body, .. } => {
-            collect_imports_expr(body, imports, needs);
+            collect_imports_expr(body, ctx);
         }
         ast::Stmt::Expr(e) => {
-            collect_imports_expr(e, imports, needs);
+            collect_imports_expr(e, ctx);
         }
     }
 }
@@ -618,13 +902,19 @@ fn inspect_permissions_file(
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
 
-    let mut imports = Vec::new();
+    let mut ctx = ImportScanCtx {
+        needs: std::mem::take(capabilities),
+        ..Default::default()
+    };
+    preregister_import_aliases(&program.stmts, &mut ctx);
     for stmt in &program.stmts {
-        collect_imports_stmt(stmt, &mut imports, capabilities);
+        collect_imports_stmt(stmt, &mut ctx);
     }
     if let Some(tail) = &program.tail {
-        collect_imports_expr(tail, &mut imports, capabilities);
+        collect_imports_expr(tail, &mut ctx);
     }
+    *capabilities = ctx.needs;
+    let imports = ctx.imports;
 
     for source in imports {
         match source {
@@ -716,14 +1006,24 @@ fn inspect_permissions(path: &str) -> Result<Vec<String>, String> {
     Ok(capabilities)
 }
 
-fn run_eval(code: &str, profile: bool, perms: Permissions) -> Result<(), String> {
-    let proto = compile_source(code).map_err(|e| format_error_with_source(code, &e))?;
+fn run_eval(
+    code: &str,
+    profile: bool,
+    perms: Permissions,
+    script_args: Option<&[String]>,
+    no_color: bool,
+) -> Result<(), String> {
+    let color = use_cli_color(no_color);
+    let proto = compile_source(code).map_err(|e| format_error_with_opts(None, code, &e, color))?;
     let mut vm = VM::new_with_sandbox(!perms.allow_all);
     vm.set_permissions(perms);
     vm.set_profile(profile);
+    if let Some(sargs) = script_args {
+        vm.set_script_args(sargs.to_vec());
+    }
     let val = vm
         .run(proto)
-        .map_err(|e| format_error_with_source(code, &e))?;
+        .map_err(|e| format_error_with_opts(None, code, &e, color))?;
     if !matches!(val, Value::Unit) {
         println!("{}", val);
     }
@@ -1399,56 +1699,300 @@ fn print_help() {
     println!("Askane v{}", VERSION);
     println!();
     println!("Usage:");
-    println!("  askane                       Start interactive REPL");
-    println!("  askane --gui [file.ask]      Open Askane Studio GUI editor (Windows)");
-    println!("  askane [run] <file_or_dir>   Run an Askane script or project (uses askane.toml)");
-    println!("  askane -e \"<code>\"           Evaluate inline code");
+    println!("  askane                              Start interactive REPL");
+    println!("  askane --gui [file.ask]             Open Askane Studio GUI editor (Windows)");
+    println!("  askane [run] <path> [-- args...]    Run a script or project (uses askane.toml)");
+    println!("  askane -e \"<code>\" [-- args...]     Evaluate inline code");
     println!(
-        "  askane check [--json] [path] Syntax & compile check for file, directory, or project"
+        "  askane check [opts] [path]          Syntax, compile & lint check (file, dir, or project)"
     );
-    println!("  askane permissions <file>    Inspect capabilities imported by a script");
-    println!("  askane fmt [--check] <path>  Format an Askane file or directory");
-    println!("  askane init [dir]            Create a starter Askane project");
+    println!("    --json | --diagnostic-format=json Emit structured JSON diagnostics");
+    println!("    --no-color                        Disable ANSI color output");
+    println!("  askane --explain <CODE>             Explain an error/warning code (e.g. E0401)");
+    println!("  askane permissions <file>           Inspect imported capabilities (transitive)");
+    println!("  askane fmt [--check] <path>         Format an Askane file or directory");
+    println!("  askane init [--name <name>] [dir]   Create a starter Askane project");
+    println!("  askane info                         Show Askane version, host & project info");
+    println!("  askane doctor                       Diagnose installation, PATH & environment");
+    println!("  askane modules [--json]             List all built-in modules & platforms");
     println!(
-        "  askane setup [opts]          Add Askane to User PATH & register .ask files (Windows)"
+        "  askane clean [opts] [dir]           Remove temporary/cache files (--dry-run, --snapshots)"
     );
-    println!("  askane test [opts] [path]    Run .ask test files or project tests");
-    println!("    --deterministic            Enable virtual time & fixed random seed for tests");
-    println!("    --update-snapshots         Overwrite mismatched snapshot files");
-    println!("  askane -b <file.ask>         Disassemble compiled bytecode");
-    println!("  askane --profile <file.ask>  Print function profiling stats after execution");
-    println!("  askane -h | --help           Show help");
-    println!("  askane -v | --version        Show version");
+    println!(
+        "  askane setup [opts]                 Add Askane to User PATH & .ask assoc (Windows)"
+    );
+    println!("  askane test [opts] [path]           Run .ask test files or project tests");
+    println!("    --deterministic                   Enable virtual time & fixed random seed");
+    println!("    --update-snapshots                Overwrite mismatched snapshot files");
+    println!("  askane -b <file.ask>                Disassemble compiled bytecode");
+    println!("  askane --profile <file.ask>         Print function profiling stats");
+    println!("  askane -h | --help                  Show help");
+    println!("  askane -v | --version               Show version");
     println!();
     println!("Sandbox permissions:");
+    println!("  --allow-net[=hosts]                 Allow HTTPS/TCP/WS access (host[:port],...)");
+    println!("  --allow-read[=dirs]                 Allow reading outside sandbox");
+    println!("  --allow-write[=dirs]                Allow writing outside sandbox");
+    println!("  --allow-env[=vars]                  Allow sys.env() / os.env()");
+    println!("  --allow-args                        Allow sys.args() / os.args()");
+    println!("  --allow-clipboard                   Allow clipboard.get_text() / set_text()");
+    println!("  --allow-input                       Allow global keyboard/mouse state in input");
+    println!("  --allow-exec[=cmds]                 Allow process.run()");
     println!(
-        "  --allow-net[=hosts]          Allow HTTPS access (optionally comma-separated host[:port])"
+        "  --max-steps=N                       Override sandbox instruction budget (default 10000000)"
     );
     println!(
-        "  --allow-read[=dirs]          Allow reading outside sandbox (optionally comma-separated dirs)"
+        "  --max-mem=MB                        Override sandbox allocation budget (default 64)"
     );
     println!(
-        "  --allow-write[=dirs]         Allow writing outside sandbox (optionally comma-separated dirs)"
+        "  --timeout=MS                        Override sandbox timeout in ms (default 30000)"
     );
-    println!("  --allow-env[=vars]           Allow sys.env() (optionally comma-separated names)");
-    println!("  --allow-args                 Allow sys.args()");
-    println!("  --allow-clipboard            Allow clipboard.get_text() / set_text()");
-    println!("  --allow-input                Allow global keyboard/mouse state in input module");
+    println!("  --no-color                          Disable colored diagnostic output");
     println!(
-        "  --allow-exec[=cmds]          Allow process.run() (optionally comma-separated commands)"
+        "  --unsafe                            Allow unrestricted files, network, env and process access"
     );
+}
+
+fn run_explain(code: &str) -> Result<(), String> {
+    if let Some((title, body)) = diag::explain_code(code) {
+        println!("{}: {}\n\n{}", code.to_ascii_uppercase(), title, body);
+        Ok(())
+    } else {
+        Err(format!(
+            "Unknown diagnostic code '{}'. Known codes: E0101, E0201, E0202, E0301, E0302, E0401, E0402, E0403, E0404, E0405, W0101, W0102",
+            code
+        ))
+    }
+}
+
+fn run_info() {
+    let exe = env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    println!("askane {}", VERSION);
     println!(
-        "  --max-steps=N                Override sandbox instruction budget (default 10000000)"
+        "OS / Arch        : {} / {} ({})",
+        env::consts::OS,
+        env::consts::ARCH,
+        env::consts::FAMILY
     );
+    println!("Executable       : {}", exe);
+    println!("Working Dir      : {}", cwd);
+    println!("Built-in Modules : {}", modules::BUILTIN_MODULE_NAMES.len());
+    match discover_manifest_from_cwd() {
+        Ok(Some((root, m))) => {
+            println!("Project Root     : {}", root.display());
+            println!(
+                "Manifest         : entry={}, tests={}",
+                m.entry.as_deref().unwrap_or("main.ask"),
+                m.tests.as_deref().unwrap_or("tests")
+            );
+        }
+        Ok(None) => println!("Project Root     : (no askane.toml found)"),
+        Err(e) => println!("Project Root     : error ({})", e),
+    }
+}
+
+fn run_doctor() -> Result<(), String> {
+    let mut issues = 0usize;
+    let exe = env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    println!("Askane Doctor v{}", VERSION);
+    println!("[ok] Executable: {}", exe);
     println!(
-        "  --max-mem=MB                 Override sandbox allocation budget in MiB (default 64)"
+        "[ok] Platform  : {} / {}",
+        env::consts::OS,
+        env::consts::ARCH
     );
-    println!(
-        "  --timeout=MS                 Override sandbox execution timeout in ms (default 30000)"
-    );
-    println!(
-        "  --unsafe                     Allow unrestricted files, network, env and process access"
-    );
+
+    #[cfg(windows)]
+    {
+        match setup::win32_setup::current_exe_clean() {
+            Ok(clean_exe) => {
+                let st = setup::win32_setup::current_status(&clean_exe);
+                if st.in_path {
+                    println!("[ok] User PATH : registered");
+                } else {
+                    println!(
+                        "[warn] User PATH : not registered (run `askane setup --path` if desired)"
+                    );
+                }
+                if st.assoc_registered {
+                    println!("[ok] .ask assoc: {}", st.assoc_mode);
+                } else {
+                    println!(
+                        "[info] .ask assoc: not registered (run `askane setup --assoc` to associate)"
+                    );
+                }
+            }
+            Err(err) => {
+                println!("[warn] Setup probe failed: {}", err);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        println!("[info] Windows setup checks skipped on {}", env::consts::OS);
+    }
+
+    let tmp_probe = env::temp_dir().join(format!("askane_doctor_{}.tmp", process::id()));
+    match fs::write(&tmp_probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp_probe);
+            println!("[ok] Temp dir  : writable ({})", env::temp_dir().display());
+        }
+        Err(e) => {
+            println!(
+                "[fail] Temp dir: not writable ({}): {}",
+                env::temp_dir().display(),
+                e
+            );
+            issues += 1;
+        }
+    }
+
+    match discover_manifest_from_cwd() {
+        Ok(Some((root, _))) => println!("[ok] Manifest  : found at {}", root.display()),
+        Ok(None) => println!("[info] Manifest: none in current directory tree"),
+        Err(e) => {
+            println!("[fail] Manifest: {}", e);
+            issues += 1;
+        }
+    }
+
+    if issues > 0 {
+        Err(format!("doctor found {} issue(s)", issues))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_modules_cmd(json_out: bool) {
+    if json_out {
+        let items: Vec<String> = modules::BUILTIN_MODULE_NAMES
+            .iter()
+            .map(|&name| {
+                let (cat, plat, desc) = modules::module_info(name);
+                format!(
+                    "{{\"name\":{},\"category\":{},\"platform\":{},\"description\":{}}}",
+                    json_escape(name),
+                    json_escape(cat),
+                    json_escape(plat),
+                    json_escape(desc)
+                )
+            })
+            .collect();
+        println!(
+            "{{\"count\":{},\"modules\":[{}]}}",
+            modules::BUILTIN_MODULE_NAMES.len(),
+            items.join(",")
+        );
+    } else {
+        println!(
+            "Built-in Askane modules ({}):",
+            modules::BUILTIN_MODULE_NAMES.len()
+        );
+        for &name in modules::BUILTIN_MODULE_NAMES {
+            let (cat, plat, desc) = modules::module_info(name);
+            println!("  {:<12} [{:<7} | {:<7}] {}", name, cat, plat, desc);
+        }
+    }
+}
+
+fn clean_dir_walk(
+    dir: &std::path::Path,
+    dry_run: bool,
+    include_snapshots: bool,
+    removed: &mut usize,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 16 {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|e| format!("clean '{}': {}", dir.display(), e))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let meta = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if meta.is_dir() {
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            if include_snapshots && name == "__snapshots__" {
+                if dry_run {
+                    println!("[dry-run] remove dir {}", p.display());
+                } else {
+                    fs::remove_dir_all(&p)
+                        .map_err(|e| format!("Failed to remove '{}': {}", p.display(), e))?;
+                    println!("Removed {}", p.display());
+                }
+                *removed += 1;
+                continue;
+            }
+            clean_dir_walk(&p, dry_run, include_snapshots, removed, depth + 1)?;
+        } else if meta.is_file() {
+            let is_tmp = name.ends_with(".askc")
+                || name.starts_with("_askane_tmp_")
+                || (name.ends_with(".tmp") && name.starts_with("askane_"));
+            if is_tmp {
+                if dry_run {
+                    println!("[dry-run] remove {}", p.display());
+                } else {
+                    fs::remove_file(&p)
+                        .map_err(|e| format!("Failed to remove '{}': {}", p.display(), e))?;
+                    println!("Removed {}", p.display());
+                }
+                *removed += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_clean_cmd(args: &[String]) -> Result<(), String> {
+    let mut dry_run = false;
+    let mut include_snapshots = false;
+    let mut target: Option<String> = None;
+    for arg in args {
+        if arg == "--dry-run" {
+            dry_run = true;
+        } else if arg == "--snapshots" {
+            include_snapshots = true;
+        } else if arg.starts_with('-') {
+            return Err(format!("Unknown clean option '{}'", arg));
+        } else if target.is_none() {
+            target = Some(arg.clone());
+        } else {
+            return Err("Usage: askane clean [--dry-run] [--snapshots] [dir]".to_string());
+        }
+    }
+    let root = std::path::Path::new(target.as_deref().unwrap_or("."));
+    if !root.is_dir() {
+        return Err(format!("'{}' is not a directory", root.display()));
+    }
+    let mut removed = 0usize;
+    clean_dir_walk(root, dry_run, include_snapshots, &mut removed, 0)?;
+    if removed == 0 {
+        println!("Nothing to clean in '{}'.", root.display());
+    } else if dry_run {
+        println!("Dry run: {} item(s) would be removed.", removed);
+    } else {
+        println!("Cleaned {} item(s).", removed);
+    }
+    Ok(())
 }
 
 fn append_csv(target: &mut Option<Vec<String>>, value: Option<&str>) {
@@ -2208,9 +2752,11 @@ enum CliParseOutcome {
         profile: bool,
         deterministic: bool,
         update_snapshots: bool,
+        no_color: bool,
         eval_code: Option<String>,
         perms: Permissions,
         script_path: Option<String>,
+        script_args: Option<Vec<String>>,
         explicit_limits: ExplicitLimits,
     },
 }
@@ -2220,16 +2766,22 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
     let mut profile = false;
     let mut deterministic = false;
     let mut update_snapshots = false;
+    let mut no_color = false;
     let mut eval_code: Option<String> = None;
     let mut perms = Permissions::sandboxed();
     let mut explicit_max_steps: Option<u64> = None;
     let mut explicit_max_mem: Option<u64> = None;
     let mut explicit_timeout: Option<u64> = None;
     let mut script_path: Option<String> = None;
+    let mut script_args: Option<Vec<String>> = None;
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if arg == "--" {
+            script_args = Some(args[i + 1..].to_vec());
+            break;
+        }
         if arg == "-h" || arg == "--help" {
             print_help();
             return Ok(CliParseOutcome::ExitZero);
@@ -2246,6 +2798,8 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
             deterministic = true;
         } else if arg == "--update-snapshots" {
             update_snapshots = true;
+        } else if arg == "--no-color" {
+            no_color = true;
         } else if arg == "-e" || arg == "--eval" {
             i += 1;
             let Some(code) = args.get(i) else {
@@ -2335,9 +2889,11 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
         profile,
         deterministic,
         update_snapshots,
+        no_color,
         eval_code,
         perms,
         script_path,
+        script_args,
         explicit_limits: ExplicitLimits {
             max_steps: explicit_max_steps.is_some(),
             max_mem: explicit_max_mem.is_some(),
@@ -2362,6 +2918,61 @@ fn main() {
         return;
     }
 
+    if args[1] == "--explain" || args[1] == "explain" {
+        let Some(code) = args.get(2) else {
+            eprintln!("Usage: askane --explain <ERROR_CODE>");
+            process::exit(1);
+        };
+        if let Err(e) = run_explain(code) {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
+    if args[1] == "info" {
+        if args.len() > 2 {
+            eprintln!("Usage: askane info");
+            process::exit(1);
+        }
+        run_info();
+        return;
+    }
+
+    if args[1] == "doctor" {
+        if args.len() > 2 {
+            eprintln!("Usage: askane doctor");
+            process::exit(1);
+        }
+        if let Err(e) = run_doctor() {
+            eprintln!("Doctor failed: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
+    if args[1] == "modules" {
+        let mut json_out = false;
+        for a in &args[2..] {
+            if a == "--json" {
+                json_out = true;
+            } else {
+                eprintln!("Unknown option '{}'. Usage: askane modules [--json]", a);
+                process::exit(1);
+            }
+        }
+        run_modules_cmd(json_out);
+        return;
+    }
+
+    if args[1] == "clean" {
+        if let Err(e) = run_clean_cmd(&args[2..]) {
+            eprintln!("Clean error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
     if args[1] == "setup" {
         if let Err(e) = setup::run_setup_cli(&args[2..]) {
             eprintln!("Setup error: {}", e);
@@ -2372,14 +2983,24 @@ fn main() {
 
     if args[1] == "check" {
         let mut json_out = false;
+        let mut no_color = false;
         let mut target: Option<String> = None;
         for arg in &args[2..] {
-            if arg == "--json" {
+            if arg == "--json" || arg == "--diagnostic-format=json" {
                 json_out = true;
+            } else if arg == "--no-color" {
+                no_color = true;
+            } else if arg.starts_with('-') {
+                eprintln!(
+                    "Usage: askane check [--json|--diagnostic-format=json] [--no-color] [file_or_dir]"
+                );
+                process::exit(1);
             } else if target.is_none() {
                 target = Some(arg.clone());
             } else {
-                eprintln!("Usage: askane check [--json] [file_or_dir]");
+                eprintln!(
+                    "Usage: askane check [--json|--diagnostic-format=json] [--no-color] [file_or_dir]"
+                );
                 process::exit(1);
             }
         }
@@ -2388,7 +3009,9 @@ fn main() {
             None => match discover_manifest_from_cwd() {
                 Ok(Some((root, _))) => root.display().to_string(),
                 Ok(None) => {
-                    eprintln!("Usage: askane check [--json] [file_or_dir]");
+                    eprintln!(
+                        "Usage: askane check [--json|--diagnostic-format=json] [--no-color] [file_or_dir]"
+                    );
                     process::exit(1);
                 }
                 Err(e) => {
@@ -2397,9 +3020,9 @@ fn main() {
                 }
             },
         };
-        if let Err(e) = run_check(&path, json_out) {
+        if let Err(e) = run_check_opts(&path, json_out, no_color) {
             if !e.is_empty() {
-                eprintln!("Check failed: {}", e);
+                eprintln!("{}", e);
             }
             process::exit(1);
         }
@@ -2431,21 +3054,57 @@ fn main() {
     }
 
     if args[1] == "init" {
-        let dir = args.get(2).map(String::as_str).unwrap_or(".");
+        let mut dir_arg: Option<String> = None;
+        let mut pkg_name: Option<String> = None;
+        let mut i = 2;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--name" {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    eprintln!("Missing package name after --name");
+                    process::exit(1);
+                };
+                pkg_name = Some(val.clone());
+            } else if let Some(val) = a.strip_prefix("--name=") {
+                pkg_name = Some(val.to_string());
+            } else if a.starts_with('-') {
+                eprintln!("Usage: askane init [--name <name>] [dir]");
+                process::exit(1);
+            } else if dir_arg.is_none() {
+                dir_arg = Some(a.clone());
+            } else {
+                eprintln!("Usage: askane init [--name <name>] [dir]");
+                process::exit(1);
+            }
+            i += 1;
+        }
+        let dir = dir_arg.as_deref().unwrap_or(".");
         let root = std::path::Path::new(dir);
+        let chosen_name = pkg_name.unwrap_or_else(|| {
+            root.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty() && s != ".")
+                .unwrap_or_else(|| "my-askane-app".to_string())
+        });
+        let safe_name = chosen_name.replace(['"', '\\', '\r', '\n'], "");
         if let Err(e) = fs::create_dir_all(root.join("tests")) {
             eprintln!("init failed: {}", e);
             process::exit(1);
         }
+        let manifest_content = format!(
+            "entry = \"main.ask\"\ntests = \"tests\"\n\n[package]\nname = \"{}\"\nversion = \"0.1.0\"\n",
+            safe_name
+        );
         let files = [
+            (root.join("askane.toml"), manifest_content),
             (
-                root.join("askane.toml"),
-                "name = \"my-askane-app\"\nversion = \"0.1.0\"\nentry = \"main.ask\"\ntests = \"tests\"\nsandbox = true\n",
+                root.join("main.ask"),
+                "println(\"Hello from Askane!\");\n".to_string(),
             ),
-            (root.join("main.ask"), "println(\"Hello from Askane!\");\n"),
             (
                 root.join("tests").join("basic_test.ask"),
-                "import test;\ntest.assert_eq(1 + 1, 2);\n",
+                "import test;\n\nspec \"basic\" {\n    test.assert_eq(1 + 1, 2);\n}\n".to_string(),
             ),
         ];
         for (path, content) in files {
@@ -2513,9 +3172,11 @@ fn main() {
         profile,
         deterministic,
         update_snapshots,
+        no_color,
         eval_code,
         mut perms,
         script_path,
+        script_args,
         explicit_limits,
     ) = match parse_run_args(&args[slice_start..]) {
         Ok(CliParseOutcome::ExitZero) => return,
@@ -2524,18 +3185,22 @@ fn main() {
             profile,
             deterministic,
             update_snapshots,
+            no_color,
             eval_code,
             perms,
             script_path,
+            script_args,
             explicit_limits,
         }) => (
             dump_bytecode,
             profile,
             deterministic,
             update_snapshots,
+            no_color,
             eval_code,
             perms,
             script_path,
+            script_args,
             explicit_limits,
         ),
         Err(e) => {
@@ -2545,8 +3210,8 @@ fn main() {
     };
 
     if let Some(code) = eval_code {
-        if let Err(e) = run_eval(&code, profile, perms) {
-            eprintln!("Error: {}", e);
+        if let Err(e) = run_eval(&code, profile, perms, script_args.as_deref(), no_color) {
+            eprintln!("{}", e);
             process::exit(1);
         }
         return;
@@ -2622,12 +3287,14 @@ fn main() {
                         apply_manifest_limits(&mut perms, &manifest, explicit_limits);
                         let entry_rel = manifest.entry.as_deref().unwrap_or("main.ask");
                         resolve_manifest_subpath(&root, entry_rel, "entry").and_then(|entry_path| {
-                            run_file_with_options(
+                            run_file_with_script_args(
                                 &entry_path.display().to_string(),
                                 dump_bytecode,
                                 profile,
                                 perms,
                                 Some(&root),
+                                script_args.as_deref(),
+                                no_color,
                             )
                         })
                     }
@@ -2638,7 +3305,15 @@ fn main() {
                     Err(e) => Err(e),
                 }
             } else {
-                run_file_with_options(path, dump_bytecode, profile, perms, None)
+                run_file_with_script_args(
+                    path,
+                    dump_bytecode,
+                    profile,
+                    perms,
+                    None,
+                    script_args.as_deref(),
+                    no_color,
+                )
             }
         }
         None => match discover_manifest_from_cwd() {
@@ -2646,12 +3321,14 @@ fn main() {
                 apply_manifest_limits(&mut perms, &manifest, explicit_limits);
                 let entry_rel = manifest.entry.as_deref().unwrap_or("main.ask");
                 resolve_manifest_subpath(&root, entry_rel, "entry").and_then(|entry_path| {
-                    run_file_with_options(
+                    run_file_with_script_args(
                         &entry_path.display().to_string(),
                         dump_bytecode,
                         profile,
                         perms,
                         Some(&root),
+                        script_args.as_deref(),
+                        no_color,
                     )
                 })
             }
@@ -2663,7 +3340,7 @@ fn main() {
         },
     };
     if let Err(e) = run_result {
-        eprintln!("Error: {}", e);
+        eprintln!("{}", e);
         process::exit(1);
     }
 }
@@ -6698,5 +7375,557 @@ closed_val == unit
             .unwrap();
         srv_thread.join().unwrap();
         let _ = std::fs::remove_dir_all(&ws_dir);
+    }
+
+    #[test]
+    fn test_v0180_semantics_diagnostics_and_cli() {
+        let mut vm = VM::new();
+        let res = vm
+            .run(
+                compile_source(
+                    r##"
+import strings;
+import collections;
+import gfx;
+import math;
+
+let ca = checked_add(10, 5);
+let cs = checked_sub(10, 3);
+let cm = checked_mul(6, 7);
+let wa = wrapping_add(9223372036854775807, 1);
+let ws = wrapping_sub(-9223372036854775807 - 1, 1);
+let wm = wrapping_mul(9223372036854775807, 2);
+
+let nan = math.sqrt(-1.0);
+let lst = [1, 2];
+let lst2 = [1, 2];
+let same_ref = is_same(lst, lst);
+let same_diff = is_same(lst, lst2);
+let same_num = is_same(1, 1.0);
+let same_nan = is_same(nan, nan);
+
+let r_str = repr("hi\n\"x\"");
+let ti_ok = try_int(" -42 ");
+let ti_bad = try_int("nope");
+let tf_ok = try_float("3.5");
+let tf_bad = try_float("abc");
+let preds = [
+    is_unit(unit), is_int(1), is_float(1.5), is_bool(true),
+    is_str("a"), is_bytes(b"a"), is_list([1]), is_dict(#{a: 1}),
+    is_set(set([1])), is_fn(|x| x)
+];
+
+let d = #{ z: 3, a: 1, m: 2 };
+let d_str = str(d);
+
+let nums = [1, 2, 3, 4, 5];
+let parts = partition(nums, |x| x % 2 == 0);
+let flat = flat_map([1, 2], |x| [x, x * 10]);
+let tw = take_while([2, 4, 5, 6], |x| x % 2 == 0);
+let dw = drop_while([2, 4, 5, 6], |x| x % 2 == 0);
+let zl = collections.zip_longest([1, 2], ["a"]);
+let mnb = collections.min_by(["ccc", "a", "bb"], |s| len(s));
+let mxb = max_by(["ccc", "a", "bb"], |s| len(s));
+
+let s_ops = [
+    strings.byte_len("a😊") == 5,
+    strings.eq_ignore_case("AskAne", "askane"),
+    strings.contains_ignore_case("Hello Askane", "ASK"),
+    strings.strip_prefix("prefix_val", "prefix_") == "val",
+    strings.strip_suffix("val.ask", ".ask") == "val",
+    strings.split_once("a=b=c", "=") == ["a", "b=c"],
+    strings.rsplit_once("a/b/c", "/") == ["a/b", "c"],
+    strings.truncate_utf8("ab😊cd", 4) == "ab"
+];
+
+let gfx_exports_ok = is_fn(gfx.rect_alpha)
+    && is_fn(gfx.circle_alpha)
+    && is_fn(gfx.width)
+    && is_fn(gfx.height)
+    && is_fn(gfx.key_pressed);
+
+[
+    ca == 15 && cs == 7 && cm == 42,
+    wa < 0 && ws > 0 && wm == -2,
+    same_ref && !same_diff && !same_num && same_nan,
+    r_str == "\"hi\\n\\\"x\\\"\"",
+    ti_ok == 0 - 42 && ti_bad == unit && tf_ok == 3.5 && tf_bad == unit,
+    all(preds, |p| p),
+    d_str == "#{\"a\": 1, \"m\": 2, \"z\": 3}",
+    first(nums) == 1 && last(nums) == 5 && is_empty([]) && !is_empty(nums),
+    find_index(nums, |x| x > 3) == 3 && count(nums, |x| x > 2) == 3,
+    parts == [[2, 4], [1, 3, 5]] && flat == [1, 10, 2, 20],
+    tw == [2, 4] && dw == [5, 6] && zl == [[1, "a"], [2, unit]],
+    mnb == "a" && mxb == "ccc",
+    all(s_ops, |p| p),
+    gfx_exports_ok
+]
+"##,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let Value::List(flags) = res else {
+            panic!("expected list, got {:?}", res);
+        };
+        for (idx, flag) in flags.borrow().iter().enumerate() {
+            assert!(
+                flag.equals(&Value::Bool(true)),
+                "v0.18.0 assertion {} failed: {:?}",
+                idx,
+                flag
+            );
+        }
+
+        let err_ovf = vm
+            .run(compile_source("checked_add(9223372036854775807, 1);").unwrap())
+            .unwrap_err();
+        assert!(err_ovf.contains("overflow"), "got: {}", err_ovf);
+
+        // Diagnostics: error classification, Levenshtein did-you-mean, multi-error recovery, and lint warnings.
+        let mut lexer = Lexer::new("let a = ;\nlet b = ;\n");
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let (_prog, parse_errs) = parser.parse_program_recover();
+        assert!(
+            parse_errs.len() >= 2,
+            "expected multi-error recovery, got {:?}",
+            parse_errs
+        );
+
+        let d = diag::classify_error(&err_ovf, Some("demo.ask"));
+        assert_eq!(d.code, "E0404");
+        let json_d = diag::diagnostic_to_json(&d, json_escape);
+        assert!(json_d.contains("\"code\":\"E0404\""));
+        assert!(diag::explain_code("e0401").is_some());
+
+        let typo_err = vm
+            .run(compile_source("let my_special_var = 1;\nmy_special_vra;").unwrap())
+            .unwrap_err();
+        assert!(
+            typo_err.contains("did you mean 'my_special_var'"),
+            "got: {}",
+            typo_err
+        );
+
+        let mod_typo_err = vm
+            .run(compile_source("import math;\nmath.sqrtt(4);").unwrap())
+            .unwrap_err();
+        assert!(
+            mod_typo_err.contains("did you mean 'sqrt'"),
+            "got: {}",
+            mod_typo_err
+        );
+
+        let import_typo = vm
+            .run(compile_source("import strigns;").unwrap())
+            .unwrap_err();
+        assert!(
+            import_typo.contains("did you mean 'strings'"),
+            "got: {}",
+            import_typo
+        );
+        assert!(
+            import_typo.contains("imported from"),
+            "got: {}",
+            import_typo
+        );
+
+        let mut lint_lex = Lexer::new(
+            "fn f(x) { let unused_var = 1; match x { 1 => \"a\", 1 => \"b\", _ => \"c\" } }",
+        );
+        let lint_tok = lint_lex.tokenize().unwrap();
+        let mut lint_p = Parser::new(lint_tok);
+        let lint_prog = lint_p.parse_program().unwrap();
+        let warns = diag::analyze_warnings(&lint_prog, Some("lint.ask"));
+        assert!(warns.iter().any(|w| w.code == "W0101"));
+        assert!(warns.iter().any(|w| w.code == "W0102"));
+
+        // CLI: `--` separator forwards script args without interpreting flags as Askane flags.
+        let cli_args = vec![
+            "--no-color".to_string(),
+            "app.ask".to_string(),
+            "--".to_string(),
+            "--unsafe".to_string(),
+            "arg2".to_string(),
+        ];
+        match parse_run_args(&cli_args).unwrap() {
+            CliParseOutcome::Run {
+                no_color,
+                perms,
+                script_path,
+                script_args,
+                ..
+            } => {
+                assert!(no_color);
+                assert!(!perms.allow_all);
+                assert_eq!(script_path.as_deref(), Some("app.ask"));
+                assert_eq!(
+                    script_args,
+                    Some(vec!["--unsafe".to_string(), "arg2".to_string()])
+                );
+            }
+            _ => panic!("expected Run outcome"),
+        }
+
+        // All built-in modules have metadata.
+        for &name in modules::BUILTIN_MODULE_NAMES {
+            let (cat, plat, desc) = modules::module_info(name);
+            assert!(!cat.is_empty() && !plat.is_empty() && !desc.is_empty());
+        }
+
+        // Static permissions report warns on dynamic targets.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("askane_v0180_{}", ts));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dyn_file = tmp_dir.join("dyn.ask");
+        std::fs::write(
+            &dyn_file,
+            "import http;\nlet u = \"https://example.com\";\nhttp.get(u);\n",
+        )
+        .unwrap();
+        let perms_list = inspect_permissions(&dyn_file.display().to_string()).unwrap();
+        assert!(perms_list.iter().any(|p| p.contains("[dynamic]")));
+
+        let tmp_clean = tmp_dir.join("a.askc");
+        std::fs::write(&tmp_clean, b"bc").unwrap();
+        let mut dry_cnt = 0usize;
+        clean_dir_walk(&tmp_dir, true, false, &mut dry_cnt, 0).unwrap();
+        assert_eq!(dry_cnt, 1);
+        assert!(tmp_clean.exists());
+        let mut real_cnt = 0usize;
+        clean_dir_walk(&tmp_dir, false, false, &mut real_cnt, 0).unwrap();
+        assert_eq!(real_cnt, 1);
+        assert!(!tmp_clean.exists());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_v0180_qa_bugfixes() {
+        // 1. Import chains, stack traces, did-you-mean hints, and accurate frame.ip.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("askane_qa_fixes_{}", ts));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let c_file = tmp_dir.join("c.ask");
+        let b_file = tmp_dir.join("b.ask");
+        let a_file = tmp_dir.join("a.ask");
+        std::fs::write(
+            &c_file,
+            "fn deep_fail() {\n    let unused = 1;\n    let x = 1;\n    // line 4\n    1 / 0;\n}\ndeep_fail();\n",
+        )
+        .unwrap();
+        std::fs::write(&b_file, "import \"c.ask\" as c;\npub fn run() { c }\n").unwrap();
+        std::fs::write(&a_file, "import \"b.ask\" as b;\nb.run();\n").unwrap();
+
+        let err_chain = run_file_with_root(
+            &a_file.display().to_string(),
+            false,
+            Permissions::sandboxed(),
+            Some(&tmp_dir),
+        )
+        .unwrap_err();
+        assert!(
+            err_chain.contains("Division by zero"),
+            "unexpected error: {}",
+            err_chain
+        );
+        assert!(
+            err_chain.contains("c.ask:5:"),
+            "expected c.ask:5 location, got:\n{}",
+            err_chain
+        );
+        assert!(
+            err_chain.contains("import chain:") && err_chain.contains("b.ask"),
+            "expected readable import chain, got:\n{}",
+            err_chain
+        );
+        assert!(
+            err_chain.contains("stack trace:") && err_chain.contains("at deep_fail (line 5)"),
+            "expected clean stack trace, got:\n{}",
+            err_chain
+        );
+
+        let d_hint_and_trace = diag::classify_error(
+            "[line 5] Undefined variable 'foo' (did you mean 'for'?) (in 'c.ask') (imported from 'b.ask')\n  at go (line 5)\n  at <script> (line 2)",
+            Some("a.ask"),
+        );
+        assert_eq!(d_hint_and_trace.file.as_deref(), Some("c.ask"));
+        assert_eq!(d_hint_and_trace.line, 5);
+        assert_eq!(
+            d_hint_and_trace.hint.as_deref(),
+            Some("did you mean 'for'?")
+        );
+        assert_eq!(d_hint_and_trace.import_chain, vec!["b.ask", "c.ask"]);
+        assert_eq!(
+            d_hint_and_trace.stack_trace,
+            vec!["at go (line 5)", "at <script> (line 2)"]
+        );
+
+        let mut vm = VM::new();
+        let line_err = vm
+            .run(compile_source("fn go() {\n    missing_global = 1;\n}\ngo();\n").unwrap())
+            .unwrap_err();
+        let d_line = diag::classify_error(&line_err, Some("lines.ask"));
+        assert!(
+            d_line.stack_trace.iter().any(|s| s == "at go (line 2)"),
+            "expected line 2 in stack trace, got: {:?}",
+            d_line.stack_trace
+        );
+        assert!(
+            !d_line.stack_trace.iter().any(|s| s.contains("(line 0)")),
+            "unexpected line 0 in stack trace: {:?}",
+            d_line.stack_trace
+        );
+
+        let div_err = vm
+            .run(
+                compile_source("fn bad() {\n    let x = 1;\n    1 / 0;\n}\nfn caller() { bad(); }\ncaller();\n")
+                    .unwrap(),
+            )
+            .unwrap_err();
+        let d_div = diag::classify_error(&div_err, Some("div.ask"));
+        assert_eq!(
+            d_div.stack_trace.first().map(String::as_str),
+            Some("at bad (line 3)")
+        );
+        assert!(d_div.stack_trace.iter().any(|s| s == "at caller (line 5)"));
+
+        // 2. Parser depth recovery: sequential deeply nested broken blocks do not leak self.depth.
+        let one_nested_err = format!("{} let x = ; {}", "{ ".repeat(60), "}".repeat(60));
+        let many_blocks = vec![one_nested_err; 6].join("\n");
+        let lex_many = Lexer::new(&many_blocks).tokenize().unwrap();
+        let (_prog, errs_many) = Parser::new(lex_many).parse_program_recover();
+        assert!(
+            !errs_many
+                .iter()
+                .any(|e| e.contains("Maximum nesting depth")),
+            "depth leaked across recovery: {:?}",
+            errs_many
+        );
+
+        // 3. Lexer error codes classify as E0101.
+        for msg in [
+            "Invalid integer literal '999999999999999999999'",
+            "Invalid float literal '1e99999'",
+            "Invalid duration literal '10x'",
+            "Duration literal out of range",
+            "Unknown escape sequence '\\q'",
+            "Invalid hex escape '\\xZZ'",
+            "Incomplete \\xHH escape",
+            "Byte literal can only contain ASCII characters",
+            "Raw byte literal can only contain ASCII characters",
+        ] {
+            let d = diag::classify_error(&format!("[line 1:1] {}", msg), Some("lex.ask"));
+            assert_eq!(
+                d.code, "E0101",
+                "expected E0101 for '{}', got {}",
+                msg, d.code
+            );
+        }
+
+        // 4. check --json produces single valid JSON for dirs, empty dirs, and missing files.
+        let dir_ok = tmp_dir.join("check_dir");
+        let dir_empty = tmp_dir.join("empty_dir");
+        std::fs::create_dir_all(&dir_ok).unwrap();
+        std::fs::create_dir_all(&dir_empty).unwrap();
+        std::fs::write(dir_ok.join("good.ask"), "let x = 1; x;\n").unwrap();
+        std::fs::write(dir_ok.join("bad.ask"), "let y = ;\n").unwrap();
+
+        let (ok_dir, json_dir) = check_dir_json_report(&dir_ok.display().to_string(), false);
+        assert!(!ok_dir);
+        let parsed_dir = vm
+            .run(
+                compile_source(&format!(
+                    "import json;\nlet d = json.parse({});\n!d[\"ok\"] && d[\"file_count\"] == 2 && d[\"failed_count\"] == 1 && len(d[\"files\"]) == 2\n",
+                    json_escape(&json_dir)
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            parsed_dir.equals(&Value::Bool(true)),
+            "json_dir: {} -> {:?}",
+            json_dir,
+            parsed_dir
+        );
+
+        let (ok_empty, json_empty) = check_dir_json_report(&dir_empty.display().to_string(), false);
+        assert!(!ok_empty);
+        let parsed_empty = vm
+            .run(
+                compile_source(&format!(
+                    "import json;\nlet d = json.parse({});\n!d[\"ok\"] && d[\"file_count\"] == 0\n",
+                    json_escape(&json_empty)
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(parsed_empty.equals(&Value::Bool(true)));
+
+        let missing_rep = check_file_report(
+            &tmp_dir.join("missing.ask").display().to_string(),
+            true,
+            false,
+        );
+        assert!(!missing_rep.ok);
+        let parsed_missing = vm
+            .run(
+                compile_source(&format!(
+                    "import json;\nlet d = json.parse({});\n!d[\"ok\"] && len(d[\"diagnostics\"]) == 1\n",
+                    json_escape(&missing_rep.file_json)
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(parsed_missing.equals(&Value::Bool(true)));
+
+        // 5. W0101 and W0102 precision improvements.
+        let lint_src = "\
+let html_tag = fn(parts, vals) { len(vals) };
+let used_tpl = html_tag\"select ${1}\";
+fn outer(a) {
+    let inner = fn(a) { a + 1 };
+    let sum = a + inner(2);
+    for a in [1, 2] { a; }
+    try { sum; } catch a { a; }
+    match 1 { a => a + sum }
+}
+outer(used_tpl);
+if true {
+    let dead_local = 42;
+}
+";
+        let lint_tok = Lexer::new(lint_src).tokenize().unwrap();
+        let lint_prog = Parser::new(lint_tok).parse_program().unwrap();
+        let w_list = diag::analyze_warnings(&lint_prog, Some("w.ask"));
+        let w0101_vars: Vec<&str> = w_list
+            .iter()
+            .filter(|w| w.code == "W0101")
+            .map(|w| w.message.as_str())
+            .collect();
+        assert_eq!(
+            w0101_vars.len(),
+            1,
+            "unexpected W0101 warnings: {:?}",
+            w_list
+        );
+        assert!(w0101_vars[0].contains("'dead_local'"));
+        let dead_w = w_list.iter().find(|w| w.code == "W0101").unwrap();
+        assert_eq!(dead_w.col, 9);
+        assert_eq!(dead_w.end_col, 18);
+
+        let pat_src = "\
+let _m1 = match 0.0 { -0.0 => 1, 0.0 => 2, _ => 3 };
+let _m2 = match 3 { 1..5 => \"a\", 3 => \"b\", 2..4 => \"c\", 1..5 => \"d\", _ => \"e\" };
+";
+        let pat_tok = Lexer::new(pat_src).tokenize().unwrap();
+        let pat_prog = Parser::new(pat_tok).parse_program().unwrap();
+        let w_pat = diag::analyze_warnings(&pat_prog, Some("pat.ask"));
+        let w0102_count = w_pat.iter().filter(|w| w.code == "W0102").count();
+        assert!(
+            w0102_count >= 4,
+            "expected float/range W0102 warnings, got: {:?}",
+            w_pat
+        );
+
+        // 6-10. Semantics, permissions dynamic detection, gfx checks, case folding, try_float.
+        let sem_res = vm
+            .run(
+                compile_source(
+                    "import math;\nimport strings;\n\
+                     struct Box { v = 1, fn get(self) { self.v } }\n\
+                     let b1 = Box {}; let b2 = Box { v: 2 };\n\
+                     let same_ok = is_same(b1.get, b1.get) && !is_same(b1.get, b2.get);\n\
+                     let cmp_ok = (9007199254740993 > 9007199254740992.0) && !(9007199254740993 < 9007199254740992.0);\n\
+                     let extremum_ok = is_same(min_by([9007199254740993, 9007199254740992.0], |x| x), 9007199254740992.0)\n\
+                         && is_same(max_by([9007199254740993, 9007199254740992.0], |x| x), 9007199254740993);\n\
+                     let tf_ok = is_unit(try_float(\"nan\")) && is_unit(try_float(\"inf\"))\n\
+                         && is_unit(try_float(\"-inf\")) && is_unit(try_float(\"1e9999\"))\n\
+                         && is_unit(try_float(math.sqrt(-1.0)))\n\
+                         && try_float(true) == 1.0 && try_float(false) == 0.0;\n\
+                     let eszett_ok = strings.eq_ignore_case(\"Straße\", \"STRASSE\")\n\
+                         && strings.contains_ignore_case(\"GROẞE\", \"ss\");\n\
+                     [same_ok, cmp_ok, extremum_ok, tf_ok, eszett_ok]\n",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let Value::List(flags) = sem_res else {
+            panic!("expected list, got {:?}", sem_res);
+        };
+        for (i, f) in flags.borrow().iter().enumerate() {
+            assert!(
+                f.equals(&Value::Bool(true)),
+                "qa semantic check {} failed",
+                i
+            );
+        }
+
+        assert!(
+            vm.run(compile_source("import math; min_by([1], |x| math.sqrt(-1.0));").unwrap())
+                .is_err()
+        );
+        assert!(
+            vm.run(compile_source("max_by([[1]], |x| x);").unwrap())
+                .is_err()
+        );
+        let map_num_err = vm
+            .run(compile_source("map(123, |x| x);").unwrap())
+            .unwrap_err();
+        assert!(map_num_err.contains("str"), "got: {}", map_num_err);
+
+        // Permissions detection with aliases, from-import, and CallNamed.
+        let alias_file = tmp_dir.join("perm_alias.ask");
+        std::fs::write(
+            &alias_file,
+            "import http as h;\nfrom http import post as p;\nlet u = \"https://example.com\";\nh.get(u);\np(u, \"ok\");\nh.post(url: u, body: \"x\");\n",
+        )
+        .unwrap();
+        let alias_perms = inspect_permissions(&alias_file.display().to_string()).unwrap();
+        assert!(
+            alias_perms
+                .iter()
+                .any(|s| s.contains("[dynamic] http.get()")),
+            "perms: {:?}",
+            alias_perms
+        );
+        assert!(
+            alias_perms
+                .iter()
+                .any(|s| s.contains("[dynamic] http.post()")),
+            "perms: {:?}",
+            alias_perms
+        );
+
+        #[cfg(windows)]
+        {
+            for call in [
+                "import gfx; gfx.rect(0, 0, 10, 10, 255, 0, 0);",
+                "import gfx; gfx.rect_alpha(0, 0, 10, 10, 255, 0, 0, 0);",
+                "import gfx; gfx.circle(0, 0, -5, 255, 0, 0);",
+                "import gfx; gfx.circle_alpha(0, 0, 5, 255, 0, 0, 0);",
+                "import gfx; gfx.rect_outline(0, 0, 0, 0, 255, 0, 0);",
+                "import gfx; gfx.key_down(\"A\");",
+                "import gfx; gfx.key_pressed(\"A\");",
+                "import gfx; gfx.mouse_down(\"left\");",
+            ] {
+                let err = vm.run(compile_source(call).unwrap()).unwrap_err();
+                assert!(
+                    err.contains("No active gfx window"),
+                    "expected no active window for `{}`: {}",
+                    call,
+                    err
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

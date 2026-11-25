@@ -29,7 +29,10 @@ fn sys_args(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("sys.args() expects 0 arguments".to_string());
     }
-    let list: Vec<Value> = env::args().map(Value::Str).collect();
+    let list: Vec<Value> = match vm.script_args_slice() {
+        Some(args) => args.iter().cloned().map(Value::Str).collect(),
+        None => env::args().map(Value::Str).collect(),
+    };
     Ok(Value::List(Rc::new(RefCell::new(list))))
 }
 

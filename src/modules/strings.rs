@@ -26,6 +26,14 @@ pub fn module() -> Value {
             ("pad_end", str_pad_end),
             ("slice", str_slice),
             ("join", str_join),
+            ("byte_len", str_byte_len),
+            ("eq_ignore_case", str_eq_ignore_case),
+            ("contains_ignore_case", str_contains_ignore_case),
+            ("strip_prefix", str_strip_prefix),
+            ("strip_suffix", str_strip_suffix),
+            ("split_once", str_split_once),
+            ("rsplit_once", str_rsplit_once),
+            ("truncate_utf8", str_truncate_utf8),
         ],
         &[],
     )
@@ -382,4 +390,127 @@ pub(crate) fn str_join(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     vm.charge_alloc(out.len())?;
     vm.charge_work((out.len() as u64) / 64 + 1)?;
     Ok(Value::Str(out))
+}
+
+fn str_byte_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("strings.byte_len() expects 1 argument (text)".to_string());
+    }
+    let text = expect_str(&args[0], "byte_len")?;
+    Ok(Value::Int(text.len() as i64))
+}
+
+fn case_fold_basic(s: &str) -> String {
+    s.to_lowercase().replace(['ß', 'ẞ'], "ss")
+}
+
+fn str_eq_ignore_case(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("strings.eq_ignore_case() expects 2 arguments (a, b)".to_string());
+    }
+    let a = expect_str(&args[0], "eq_ignore_case")?;
+    let b = expect_str(&args[1], "eq_ignore_case")?;
+    vm.charge_work(((a.len().max(b.len()) as u64) / 32) + 1)?;
+    if a.is_ascii() && b.is_ascii() {
+        return Ok(Value::Bool(a.eq_ignore_ascii_case(b)));
+    }
+    vm.charge_alloc(a.len().saturating_add(b.len()))?;
+    Ok(Value::Bool(case_fold_basic(a) == case_fold_basic(b)))
+}
+
+fn str_contains_ignore_case(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("strings.contains_ignore_case() expects 2 arguments (text, pat)".to_string());
+    }
+    let text = expect_str(&args[0], "contains_ignore_case")?;
+    let pat = expect_str(&args[1], "contains_ignore_case")?;
+    vm.charge_work(((text.len().saturating_add(pat.len()) as u64) / 32) + 1)?;
+    vm.charge_alloc(text.len().saturating_add(pat.len()))?;
+    Ok(Value::Bool(
+        case_fold_basic(text).contains(&case_fold_basic(pat)),
+    ))
+}
+
+fn str_strip_prefix(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("strings.strip_prefix() expects 2 arguments (text, prefix)".to_string());
+    }
+    let text = expect_str(&args[0], "strip_prefix")?;
+    let pfx = expect_str(&args[1], "strip_prefix")?;
+    let out = text.strip_prefix(pfx).unwrap_or(text);
+    vm.charge_alloc(out.len())?;
+    Ok(Value::Str(out.to_string()))
+}
+
+fn str_strip_suffix(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("strings.strip_suffix() expects 2 arguments (text, suffix)".to_string());
+    }
+    let text = expect_str(&args[0], "strip_suffix")?;
+    let sfx = expect_str(&args[1], "strip_suffix")?;
+    let out = text.strip_suffix(sfx).unwrap_or(text);
+    vm.charge_alloc(out.len())?;
+    Ok(Value::Str(out.to_string()))
+}
+
+fn split_once_impl(vm: &mut VM, args: &[Value], rev: bool, name: &str) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "strings.{}() expects 2 arguments (text, sep)",
+            name
+        ));
+    }
+    let text = expect_str(&args[0], name)?;
+    let sep = expect_str(&args[1], name)?;
+    if sep.is_empty() {
+        return Err(format!("strings.{}() separator cannot be empty", name));
+    }
+    vm.charge_work((text.len() as u64) / 32 + 1)?;
+    let res = if rev {
+        text.rsplit_once(sep)
+    } else {
+        text.split_once(sep)
+    };
+    match res {
+        Some((l, r)) => {
+            vm.charge_alloc(text.len())?;
+            Ok(Value::List(Rc::new(RefCell::new(vec![
+                Value::Str(l.to_string()),
+                Value::Str(r.to_string()),
+            ]))))
+        }
+        None => Ok(Value::Unit),
+    }
+}
+
+fn str_split_once(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    split_once_impl(vm, args, false, "split_once")
+}
+
+fn str_rsplit_once(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    split_once_impl(vm, args, true, "rsplit_once")
+}
+
+fn str_truncate_utf8(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("strings.truncate_utf8() expects 2 arguments (text, max_bytes)".to_string());
+    }
+    let text = expect_str(&args[0], "truncate_utf8")?;
+    let max_bytes = match &args[1] {
+        Value::Int(n) if *n >= 0 => *n as usize,
+        _ => {
+            return Err(
+                "strings.truncate_utf8() max_bytes must be a non-negative integer".to_string(),
+            );
+        }
+    };
+    if max_bytes >= text.len() {
+        return Ok(Value::Str(text.to_string()));
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    vm.charge_alloc(end)?;
+    Ok(Value::Str(text[..end].to_string()))
 }

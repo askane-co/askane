@@ -133,6 +133,9 @@ fn os_args(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("os.args() expects 0 arguments".to_string());
     }
     vm.check_sys_args()?;
-    let list: Vec<Value> = env::args().map(Value::Str).collect();
+    let list: Vec<Value> = match vm.script_args_slice() {
+        Some(args) => args.iter().cloned().map(Value::Str).collect(),
+        None => env::args().map(Value::Str).collect(),
+    };
     Ok(Value::List(Rc::new(RefCell::new(list))))
 }

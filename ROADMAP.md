@@ -16,8 +16,9 @@ Release roadmap for Askane, separated into completed milestones, immediate fixes
 | `0.14.3` | **Done** | Security, compiler, VM, and stdlib bugfix release (timeout enforcement, module recursion, glob boundaries, DAG limits, GUI/process/fs/fmt fixes) |
 | `0.15.0` | **Done** | First-class `bytes`, unified `ResourceBudget`, working `askane.toml`, multi-file `.ask` projects, AST `fmt`, `struct` & `set` |
 | `0.16.0 - 0.16.2` | **Done** | 2D Desktop UI (`ui`), signature pipelines (`|?>`, `|*>`, `recover`), `needs`/`sandbox`, `with`/`defer`, security fixes, embedded icon & `askane setup` |
-| `0.17.0` | **Done** | Askane Studio v2 + Setup UI, `crypto`, `kv`, `net`, `ws`, cooperative `task`/`channel`, `--deterministic`, snapshots, reactive `signal` & `on change` |
-| `0.18 - 0.22` | **Exploratory** | Diagnostics/LSP, streaming `fs`, cross-platform `gfx`/`ui`, fuzzing, experimental 3D (`0.22`) |
+| `0.17.0 - 0.17.1` | **Done** | Askane Studio v2 + Setup UI, `crypto`, `kv`, `net`, `ws`, cooperative `task`/`channel`, `--deterministic`, snapshots, reactive `signal` & `on change` |
+| `0.18.0` | **Done** | Diagnostics (`E...`/`W...`, `--explain`, `--diagnostic-format=json`, `did you mean`, recovery, lints), semantics/helpers, `gfx` alpha/`key_pressed`, CLI `info`/`doctor`/`modules`/`clean` |
+| `0.19 - 0.22` | **Exploratory** | Bytecode cache (`.askc`), streaming `fs`, cross-platform `gfx`/`ui`, `askane lsp`, fuzzing, experimental 3D (`0.22`) |
 
 ---
 
@@ -83,20 +84,18 @@ This release focuses on strengthening the existing foundation before adding heav
 
 ---
 
-## Upcoming Release (`Planned`)
-
-*(Next milestone `0.16.0` to be scoped from Long-Term Ideas below.)*
+### `0.18.0` - Diagnostics, Semantics & Developer Experience [Done]
+- **Language semantics, types & stdlib (`value.rs`, `vm.rs`, `strings.rs`, `collections.rs`):** checked/wrapping integer arithmetic (`checked_add`/`sub`/`mul`, `wrapping_add`/`sub`/`mul`), `is_same`, `repr`, `try_int`/`try_float`, type predicates (`is_unit`..`is_fn`), deterministic dict `Display` key ordering, collection helpers (`first`, `last`, `is_empty`, `find_index`, `count`, `partition`, `flat_map`, `take_while`, `drop_while`, `zip_longest`, `min_by`, `max_by`), and `strings` extensions (`byte_len`, `eq_ignore_case`, `contains_ignore_case`, `strip_prefix`/`strip_suffix`, `split_once`/`rsplit_once`, `truncate_utf8`).
+- **`gfx` 2D helpers (`gfx.rs`):** `rect_alpha`, `circle_alpha`, `width()`, `height()`, and per-frame `key_pressed()` tracking across `present()`.
+- **Diagnostics & static analysis (`diag.rs`, `parser.rs`, `vm.rs`):** structured error/warning codes (`E0101`..`E0405`, `W0101`, `W0102`), Levenshtein `did you mean` hints, import chains, ANSI/NO_COLOR output, `--explain`, `--diagnostic-format=json`, multi-error parse recovery, and unused-local / duplicate-`match` warnings.
+- **CLI tooling (`main.rs`, `modules/mod.rs`):** `askane info`, `askane doctor`, `askane modules [--json]`, `askane clean [--dry-run] [--snapshots]`, `askane init [--name]`, `--` script argument forwarding to `sys.args()`/`os.args()`, and dynamic/`sandbox` notices in `askane permissions`.
 
 ---
 
-## Long-Term Ideas (`0.16 - 0.22`, `Exploratory`)
+## Long-Term Ideas (`0.19 - 0.22`, `Exploratory`)
 
 These items are tracked across future milestones as exploratory directions rather than committed release scope, and promote to `Planned` once prerequisites land:
 
-- **`0.16` - 2D Desktop UI (`ui`) & Signature Askane Syntax:**
-  - lightweight 2D UI module ahead of 3D so developers can build real desktop utilities (settings windows, launchers, calculators) with `label`, `button`, `text_input`, `checkbox`, `slider`, `select`, vertical/horizontal layouts, events, RGB/RGBA/HEX themes, and resize handling;
-  - `_` pipeline placeholder, short-circuit `|?>` and element-wise `|*>` operators, inline `recover`, typed templates (`sql"..."`), `${x=}` debug formatting, `needs`/`sandbox` contracts, and `with`/`defer`.
-- **`0.17` - Storage, Crypto, Concurrency & Networking:** embedded transactional `kv` store, CNG-backed `crypto`, TCP/UDP `net`, WebSockets `ws`, `yield`/`async`/`task`/`channel`, `spec "..."` blocks, and deterministic simulation testing.
-- **`0.18 - 0.19` - Diagnostics, Tooling & Askane Studio v2:** error codes (`E...`), `--explain`, `--diagnostic-format=json`, transitive `askane permissions`, `askane doctor`, Askane Studio v2 (line numbers, syntax highlighting, tabs, find/replace, `Run tests`), streaming `fs.read_lines`, and 2D game layers/animations/input in `gfx`.
+- **`0.19` - Performance, Bytecode Cache & Streaming I/O:** content-hashed `.askc` bytecode cache with sandbox checks, streaming `fs.read_lines` / `fs.lines` / `fs.write_stream`, and module-scoped `askane test --filter` benchmarks.
 - **`0.20 - 0.21` - Cross-Platform, Ecosystem & Hardening:** portable Linux/macOS backends (`http`, `gfx`/`ui`, `clipboard`), `askane lsp` & VS Code extension, `askane bundle`, continuous performance benchmarks, fuzzing corpus for lexer/parser/bytecode/VM, OS isolation hardening (AppContainer, DNS rebinding protection, handle-based I/O), and `CHANGELOG`/release checksums.
 - **`0.22` - Experimental 3D & Native Acceleration:** basic 3D camera, meshes, materials, and lighting layered on the portable graphics backend once 2D UI and 2D games are stable, plus baseline JIT/AOT research.

@@ -13,6 +13,7 @@ pub struct Closure {
     pub proto: Rc<FunctionProto>,
     pub upvalues: Vec<Rc<RefCell<UpvalueState>>>,
     pub base_dir: Option<PathBuf>,
+    pub source_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,24 @@ pub(crate) fn float_as_exact_i64(f: f64) -> Option<i64> {
 #[inline]
 fn int_eq_float(i: i64, f: f64) -> bool {
     float_as_exact_i64(f).is_some_and(|fi| fi == i)
+}
+
+#[inline]
+pub(crate) fn cmp_int_float(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f < -9223372036854775808.0 {
+        return Some(std::cmp::Ordering::Greater);
+    }
+    if f >= 9223372036854775808.0 {
+        return Some(std::cmp::Ordering::Less);
+    }
+    let trunc = f.trunc() as i64;
+    match i.cmp(&trunc) {
+        std::cmp::Ordering::Equal => 0.0_f64.partial_cmp(&f.fract()),
+        ord => Some(ord),
+    }
 }
 
 impl SetKey {
@@ -223,6 +242,51 @@ impl Value {
                 ctx,
                 other.type_name()
             )),
+        }
+    }
+
+    pub fn is_same(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => {
+                (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+            }
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Unit, Value::Unit) => true,
+            (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
+                s1 == s2 && e1 == e2
+            }
+            (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
+            (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b),
+            (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b),
+            (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
+            (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
+            (Value::NativeFn(a), Value::NativeFn(b)) => {
+                a.name == b.name && std::ptr::fn_addr_eq(a.func, b.func)
+            }
+            (Value::BoundMethod(a), Value::BoundMethod(b)) => {
+                a.receiver.is_same(&b.receiver) && a.func.is_same(&b.func)
+            }
+            (Value::StructDef(a), Value::StructDef(b)) => Rc::ptr_eq(a, b),
+            (Value::StructInstance(a), Value::StructInstance(b)) => Rc::ptr_eq(a, b),
+            (Value::Module(a), Value::Module(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    pub fn repr_string(&self) -> String {
+        match self {
+            Value::Str(s) => format!("{:?}", s),
+            Value::Float(v) if v.is_nan() => "NaN".to_string(),
+            Value::Float(v) if v.is_infinite() => {
+                if v.is_sign_positive() {
+                    "inf".to_string()
+                } else {
+                    "-inf".to_string()
+                }
+            }
+            other => format!("{}", other),
         }
     }
 
@@ -684,8 +748,10 @@ impl Value {
                 }
                 budget.consume(3);
                 let map = d.borrow();
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
                 write!(f, "#{{")?;
-                for (i, (k, v)) in map.iter().enumerate() {
+                for (i, (k, v)) in entries.into_iter().enumerate() {
                     if budget.exhausted() {
                         if i > 0 {
                             write!(f, ", ")?;

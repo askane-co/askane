@@ -29,6 +29,94 @@ impl Parser {
         Ok(Program { stmts, tail })
     }
 
+    pub fn parse_program_recover(&mut self) -> (Program, Vec<String>) {
+        let mut stmts = Vec::new();
+        let mut tail = None;
+        let mut errors = Vec::new();
+        const MAX_RECOVER_ERRORS: usize = 25;
+
+        while !self.is_eof() {
+            let prev_pos = self.pos;
+            if self.check(&TokenKind::Semicolon) {
+                self.advance();
+                continue;
+            }
+            if self.is_stmt_start() {
+                match self.parse_stmt() {
+                    Ok(stmt) => stmts.push(stmt),
+                    Err(e) => {
+                        errors.push(e);
+                        if errors.len() >= MAX_RECOVER_ERRORS {
+                            break;
+                        }
+                        self.synchronize();
+                    }
+                }
+                if !self.is_eof() && self.pos == prev_pos {
+                    self.advance();
+                }
+                continue;
+            }
+            match self.parse_expr() {
+                Ok(expr) => {
+                    if self.match_kind(&TokenKind::Semicolon) {
+                        stmts.push(Stmt::Expr(expr));
+                    } else if self.is_eof() {
+                        tail = Some(Box::new(expr));
+                        break;
+                    } else if is_block_expr(&expr) {
+                        stmts.push(Stmt::Expr(expr));
+                    } else {
+                        let span = self.current_span();
+                        errors.push(format!(
+                            "[{}:{}] Expected ';' or 'EOF' after expression",
+                            span.line, span.col
+                        ));
+                        if errors.len() >= MAX_RECOVER_ERRORS {
+                            break;
+                        }
+                        self.synchronize();
+                    }
+                }
+                Err(e) => {
+                    errors.push(e);
+                    if errors.len() >= MAX_RECOVER_ERRORS {
+                        break;
+                    }
+                    self.synchronize();
+                }
+            }
+            if !self.is_eof() && self.pos == prev_pos {
+                self.advance();
+            }
+        }
+        (Program { stmts, tail }, errors)
+    }
+
+    fn synchronize(&mut self) {
+        while !self.is_eof() {
+            match self.peek_kind() {
+                TokenKind::Semicolon => {
+                    self.advance();
+                    return;
+                }
+                TokenKind::RBrace => {
+                    self.advance();
+                    return;
+                }
+                TokenKind::Match | TokenKind::If | TokenKind::Try => {
+                    return;
+                }
+                _ if self.is_stmt_start() => {
+                    return;
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
     fn parse_stmt_list(
         &mut self,
         terminator: TokenKind,
@@ -575,14 +663,14 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
+        if self.depth >= MAX_PARSE_DEPTH {
             let span = self.current_span();
             return Err(format!(
                 "[{}:{}] Maximum expression nesting depth ({}) exceeded",
                 span.line, span.col, MAX_PARSE_DEPTH
             ));
         }
+        self.depth += 1;
         let res = self.parse_assign();
         self.depth -= 1;
         res
@@ -1064,6 +1152,7 @@ impl Parser {
         match stmt {
             Stmt::Let {
                 name,
+                name_span,
                 value,
                 is_pub,
                 span,
@@ -1072,6 +1161,7 @@ impl Parser {
                 (
                     Stmt::Let {
                         name,
+                        name_span,
                         value: Self::replace_placeholders(value, replacement),
                         is_pub,
                         span,
@@ -1081,6 +1171,7 @@ impl Parser {
             }
             Stmt::LetList {
                 names,
+                name_spans,
                 value,
                 is_pub,
                 span,
@@ -1089,6 +1180,7 @@ impl Parser {
                 (
                     Stmt::LetList {
                         names,
+                        name_spans,
                         value: Self::replace_placeholders(value, replacement),
                         is_pub,
                         span,
@@ -1098,6 +1190,7 @@ impl Parser {
             }
             Stmt::LetDict {
                 fields,
+                field_spans,
                 value,
                 is_pub,
                 span,
@@ -1106,6 +1199,7 @@ impl Parser {
                 (
                     Stmt::LetDict {
                         fields,
+                        field_spans,
                         value: Self::replace_placeholders(value, replacement),
                         is_pub,
                         span,
@@ -1569,6 +1663,7 @@ impl Parser {
             return Expr::Block {
                 stmts: vec![Stmt::Let {
                     name: tmp_name,
+                    name_span: span,
                     value: lhs,
                     is_pub: false,
                     span,
@@ -2376,24 +2471,27 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Expr, String> {
-        self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
+        if self.depth >= MAX_PARSE_DEPTH {
             let span = self.current_span();
             return Err(format!(
                 "[{}:{}] Maximum block nesting depth ({}) exceeded",
                 span.line, span.col, MAX_PARSE_DEPTH
             ));
         }
-        let span = self.current_span();
-        self.expect(&TokenKind::LBrace, "Expected '{'")?;
-        let prev = self.allow_struct_literal;
-        self.allow_struct_literal = true;
-        let res = self.parse_stmt_list(TokenKind::RBrace);
-        self.allow_struct_literal = prev;
-        let (stmts, tail) = res?;
-        self.expect(&TokenKind::RBrace, "Expected '}'")?;
+        self.depth += 1;
+        let res = (|| -> Result<Expr, String> {
+            let span = self.current_span();
+            self.expect(&TokenKind::LBrace, "Expected '{'")?;
+            let prev = self.allow_struct_literal;
+            self.allow_struct_literal = true;
+            let list_res = self.parse_stmt_list(TokenKind::RBrace);
+            self.allow_struct_literal = prev;
+            let (stmts, tail) = list_res?;
+            self.expect(&TokenKind::RBrace, "Expected '}'")?;
+            Ok(Expr::Block { stmts, tail, span })
+        })();
         self.depth -= 1;
-        Ok(Expr::Block { stmts, tail, span })
+        res
     }
 
     fn check_chain(&self, start: usize) -> Result<(), String> {
@@ -2617,9 +2715,12 @@ impl Parser {
     fn parse_let_stmt(&mut self, span: Span, is_pub: bool) -> Result<Stmt, String> {
         if self.match_kind(&TokenKind::LBracket) {
             let mut names = Vec::new();
+            let mut name_spans = Vec::new();
             if !self.check(&TokenKind::RBracket) {
                 loop {
+                    let item_span = self.current_span();
                     names.push(self.expect_ident("Expected variable name in list destructuring")?);
+                    name_spans.push(item_span);
                     if !self.match_kind(&TokenKind::Comma) {
                         break;
                     }
@@ -2640,6 +2741,7 @@ impl Parser {
             self.expect(&TokenKind::Semicolon, "Expected ';' after 'let' statement")?;
             Ok(Stmt::LetList {
                 names,
+                name_spans,
                 value,
                 is_pub,
                 span,
@@ -2647,9 +2749,12 @@ impl Parser {
         } else if self.match_kind(&TokenKind::Hash) {
             self.expect(&TokenKind::LBrace, "Expected '{' after '#'")?;
             let mut fields = Vec::new();
+            let mut field_spans = Vec::new();
             if !self.check(&TokenKind::RBrace) {
                 loop {
+                    let field_span = self.current_span();
                     fields.push(self.expect_ident("Expected field name in dict destructuring")?);
+                    field_spans.push(field_span);
                     if !self.match_kind(&TokenKind::Comma) {
                         break;
                     }
@@ -2667,17 +2772,20 @@ impl Parser {
             self.expect(&TokenKind::Semicolon, "Expected ';' after 'let' statement")?;
             Ok(Stmt::LetDict {
                 fields,
+                field_spans,
                 value,
                 is_pub,
                 span,
             })
         } else {
+            let name_span = self.current_span();
             let name = self.expect_ident("Expected variable name after 'let'")?;
             self.expect(&TokenKind::Assign, "Expected '=' after variable name")?;
             let value = self.parse_expr()?;
             self.expect(&TokenKind::Semicolon, "Expected ';' after 'let' statement")?;
             Ok(Stmt::Let {
                 name,
+                name_span,
                 value,
                 is_pub,
                 span,

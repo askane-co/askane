@@ -262,8 +262,23 @@ pub struct VM {
     profile_stats: HashMap<String, ProfileEntry>,
     virtual_time_ms: Option<u64>,
     update_snapshots: bool,
+    script_args: Option<Vec<String>>,
+    script_file: Option<String>,
+    deferred_trace_frames: Vec<(String, usize)>,
+    deferred_error_file: Option<String>,
     execute_depth: usize,
     scheduler: GreenScheduler,
+}
+
+fn clean_display_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{}", rest)
+    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        rest.to_string()
+    } else {
+        s
+    }
 }
 
 impl Drop for VM {
@@ -316,6 +331,10 @@ impl VM {
             profile_stats: HashMap::new(),
             virtual_time_ms: None,
             update_snapshots: false,
+            script_args: None,
+            script_file: None,
+            deferred_trace_frames: Vec::new(),
+            deferred_error_file: None,
             execute_depth: 0,
             scheduler: GreenScheduler::new(),
         };
@@ -347,6 +366,18 @@ impl VM {
 
     pub fn set_profile(&mut self, enabled: bool) {
         self.profile_enabled = enabled;
+    }
+
+    pub fn set_script_args(&mut self, args: Vec<String>) {
+        self.script_args = Some(args);
+    }
+
+    pub fn set_script_file(&mut self, path: impl Into<String>) {
+        self.script_file = Some(path.into());
+    }
+
+    pub(crate) fn script_args_slice(&self) -> Option<&[String]> {
+        self.script_args.as_deref()
     }
 
     pub fn set_deterministic(&mut self, enabled: bool) {
@@ -1008,6 +1039,38 @@ impl VM {
             ("any", native_any),
             ("all", native_all),
             ("find", native_find),
+            ("checked_add", native_checked_add),
+            ("checked_sub", native_checked_sub),
+            ("checked_mul", native_checked_mul),
+            ("wrapping_add", native_wrapping_add),
+            ("wrapping_sub", native_wrapping_sub),
+            ("wrapping_mul", native_wrapping_mul),
+            ("is_same", native_is_same),
+            ("repr", native_repr),
+            ("try_int", native_try_int),
+            ("try_float", native_try_float),
+            ("is_unit", native_is_unit),
+            ("is_int", native_is_int),
+            ("is_float", native_is_float),
+            ("is_bool", native_is_bool),
+            ("is_str", native_is_str),
+            ("is_bytes", native_is_bytes),
+            ("is_list", native_is_list),
+            ("is_dict", native_is_dict),
+            ("is_set", native_is_set),
+            ("is_fn", native_is_fn),
+            ("first", native_first),
+            ("last", native_last),
+            ("is_empty", native_is_empty),
+            ("find_index", native_find_index),
+            ("count", native_count),
+            ("partition", native_partition),
+            ("flat_map", native_flat_map),
+            ("take_while", native_take_while),
+            ("drop_while", native_drop_while),
+            ("zip_longest", native_zip_longest),
+            ("min_by", native_min_by),
+            ("max_by", native_max_by),
             ("__pairs", native_pairs),
             ("__pipe_map", native_map),
             ("__tag_eval", native_tag_eval),
@@ -1040,13 +1103,24 @@ impl VM {
 
     pub fn run(&mut self, proto: Rc<FunctionProto>) -> Result<Value, String> {
         let base_dir = self.current_dir.clone();
-        self.run_with_base_dir(proto, Some(base_dir))
+        let source_file = self.script_file.clone();
+        self.run_with_source(proto, Some(base_dir), source_file)
     }
 
     pub fn run_with_base_dir(
         &mut self,
         proto: Rc<FunctionProto>,
         base_dir: Option<PathBuf>,
+    ) -> Result<Value, String> {
+        let source_file = self.script_file.clone();
+        self.run_with_source(proto, base_dir, source_file)
+    }
+
+    fn run_with_source(
+        &mut self,
+        proto: Rc<FunctionProto>,
+        base_dir: Option<PathBuf>,
+        source_file: Option<String>,
     ) -> Result<Value, String> {
         verify_proto(&proto)?;
         if self.frames.len() >= MAX_CALL_DEPTH || self.loading_modules.len() > 32 {
@@ -1064,6 +1138,8 @@ impl VM {
             self.cleanup_stack.clear();
             self.spec_results.clear();
             self.fmt_depth = 0;
+            self.deferred_trace_frames.clear();
+            self.deferred_error_file = None;
             self.scheduler.reset();
             self.ic_epoch = self.ic_epoch.wrapping_add(1).max(1);
             if self.profile_enabled {
@@ -1074,6 +1150,7 @@ impl VM {
             proto,
             upvalues: Vec::new(),
             base_dir,
+            source_file,
         });
         let base_depth = self.frames.len();
         let stack_base = self.stack.len();
@@ -1099,8 +1176,32 @@ impl VM {
             Err(e) => {
                 let run_defers = !Self::is_unrecoverable_error(&e);
                 let _ = self.unwind_cleanups_to_len(prev_cleanup_len, run_defers);
+                if base_depth > 0 {
+                    self.record_deferred_frames(base_depth);
+                }
                 let msg = if base_depth == 0 {
-                    self.format_stack_trace(&e)
+                    let mut final_err = e;
+                    if !final_err.contains(" (in '") && !final_err.contains(" (imported from '") {
+                        let err_file = self.deferred_error_file.take().or_else(|| {
+                            self.frames
+                                .last()
+                                .and_then(|f| f.closure.source_file.clone())
+                        });
+                        let root_file = self
+                            .frames
+                            .first()
+                            .and_then(|f| f.closure.source_file.as_deref())
+                            .or(self.script_file.as_deref());
+                        if let Some(ef) = err_file {
+                            if root_file != Some(ef.as_str()) {
+                                final_err = format!("{} (in '{}')", final_err, ef);
+                            }
+                        }
+                    }
+                    let formatted = self.format_stack_trace(&final_err);
+                    self.deferred_trace_frames.clear();
+                    self.deferred_error_file = None;
+                    formatted
                 } else {
                     e
                 };
@@ -1121,8 +1222,35 @@ impl VM {
         }
     }
 
+    fn record_deferred_frames(&mut self, base_depth: usize) {
+        if self.deferred_error_file.is_none() {
+            self.deferred_error_file = self.frames[base_depth..]
+                .last()
+                .and_then(|f| f.closure.source_file.clone());
+        }
+        for frame in self.frames[base_depth..].iter().rev() {
+            let line = if frame.ip > 0 {
+                frame
+                    .closure
+                    .proto
+                    .chunk
+                    .lines
+                    .get(frame.ip - 1)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            self.deferred_trace_frames
+                .push((frame.closure.proto.name.clone(), line));
+        }
+    }
+
     fn format_stack_trace(&self, err: &str) -> String {
         let mut out = err.to_string();
+        for (name, line) in &self.deferred_trace_frames {
+            out.push_str(&format!("\n  at {} (line {})", name, line));
+        }
         for frame in self.frames.iter().rev() {
             let line = if frame.ip > 0 {
                 frame
@@ -1320,9 +1448,13 @@ impl VM {
     ) -> Result<Value, String> {
         match &obj {
             Value::Module(m) => m.exports.borrow().get(attr).cloned().ok_or_else(|| {
+                let exports = m.exports.borrow();
+                let hint = crate::diag::suggest_similar(attr, exports.keys().map(String::as_str))
+                    .map(|s| format!(" (did you mean '{}'?)", s))
+                    .unwrap_or_default();
                 format!(
-                    "[line {}] Module '{}' has no export '{}'",
-                    line, m.name, attr
+                    "[line {}] Module '{}' has no export '{}'{}",
+                    line, m.name, attr, hint
                 )
             }),
             Value::StructDef(def) => def.methods.get(attr).cloned().ok_or_else(|| {
@@ -1460,6 +1592,12 @@ impl VM {
                     Err(e) => {
                         let run_defers = !Self::is_unrecoverable_error(&e);
                         let _ = self.unwind_cleanups_to_len(prev_cleanup_len, run_defers);
+                        if base_depth > 0 {
+                            self.record_deferred_frames(base_depth);
+                        } else {
+                            self.deferred_trace_frames.clear();
+                            self.deferred_error_file = None;
+                        }
                         if !self.open_upvalues.is_empty() {
                             self.close_upvalues_from(base);
                         }
@@ -1511,6 +1649,8 @@ impl VM {
                             self.stack.truncate(handler.stack_len);
                             self.stack.push(Value::Str(err));
                             self.frames.last_mut().unwrap().ip = handler.catch_ip;
+                            self.deferred_trace_frames.clear();
+                            self.deferred_error_file = None;
                             break 'dispatch_err;
                         }
                     }
@@ -1550,22 +1690,40 @@ impl VM {
     }
 
     fn execute_fast(&mut self, target_depth: usize) -> Result<Value, String> {
-        let mut cur_closure;
+        let mut cur_closure = self.frames.last().unwrap().closure.clone();
+        let mut last_ip = self.frames.last().unwrap().ip;
+        let res = self.execute_fast_inner(target_depth, &mut cur_closure, &mut last_ip);
+        if res.is_err() {
+            if let Some(frame) = self.frames.last_mut() {
+                if Rc::ptr_eq(&frame.closure, &cur_closure) {
+                    frame.ip = last_ip;
+                }
+            }
+        }
+        res
+    }
+
+    fn execute_fast_inner(
+        &mut self,
+        target_depth: usize,
+        cur_closure: &mut Rc<Closure>,
+        last_ip: &mut usize,
+    ) -> Result<Value, String> {
         let mut cur_base;
         let mut ip;
         let mut proto_id: u64;
         {
             let f = self.frames.last().unwrap();
-            cur_closure = f.closure.clone();
             cur_base = f.base;
             ip = f.ip;
             proto_id = cur_closure.proto.ic_id;
         }
 
         loop {
+            let op_ip = ip;
+            *last_ip = (op_ip + 1).min(cur_closure.proto.chunk.lines.len());
             self.check_budget_step()?;
             let chunk = &cur_closure.proto.chunk;
-            let op_ip = ip;
             let op = chunk.code[op_ip];
             ip += 1;
 
@@ -1724,7 +1882,13 @@ impl VM {
                         self.stack.push(lhs);
                         self.stack.push(rhs);
                         let line = chunk.lines[op_ip];
-                        self.cmp_op(line, |x, y| x < y, |x, y| x < y, |x, y| x < y)?;
+                        self.cmp_op(
+                            line,
+                            |x, y| x < y,
+                            |x, y| x < y,
+                            |o| o == std::cmp::Ordering::Less,
+                            |x, y| x < y,
+                        )?;
                     }
                 }
                 Op::IncLocalPop(slot, delta) => {
@@ -1783,7 +1947,13 @@ impl VM {
                         };
                         let line = chunk.lines[op_ip];
                         let slot = *self.global_slots.get(name).ok_or_else(|| {
-                            format!("[line {}] Undefined variable '{}'", line, name)
+                            let hint = crate::diag::suggest_similar(
+                                name,
+                                self.global_slots.keys().map(String::as_str),
+                            )
+                            .map(|s| format!(" (did you mean '{}'?)", s))
+                            .unwrap_or_default();
+                            format!("[line {}] Undefined variable '{}'{}", line, name, hint)
                         })?;
                         self.global_ic[ic_idx] = (self.ic_epoch, proto_id, op_ip, slot);
                         self.stack.push(self.global_values[slot].clone());
@@ -1812,7 +1982,16 @@ impl VM {
                     let val = self.stack.last().unwrap().clone();
                     let Some(&slot) = self.global_slots.get(name) else {
                         let line = chunk.lines[op_ip];
-                        return Err(format!("[line {}] Undefined variable '{}'", line, name));
+                        let hint = crate::diag::suggest_similar(
+                            name,
+                            self.global_slots.keys().map(String::as_str),
+                        )
+                        .map(|s| format!(" (did you mean '{}'?)", s))
+                        .unwrap_or_default();
+                        return Err(format!(
+                            "[line {}] Undefined variable '{}'{}",
+                            line, name, hint
+                        ));
                     };
                     self.global_values[slot] = val;
                 }
@@ -2023,7 +2202,13 @@ impl VM {
                         self.stack.pop();
                     } else {
                         let line = chunk.lines[op_ip];
-                        self.cmp_op(line, |a, b| a < b, |a, b| a < b, |a, b| a < b)?;
+                        self.cmp_op(
+                            line,
+                            |a, b| a < b,
+                            |a, b| a < b,
+                            |o| o == std::cmp::Ordering::Less,
+                            |a, b| a < b,
+                        )?;
                     }
                 }
                 Op::Le => {
@@ -2036,7 +2221,13 @@ impl VM {
                         self.stack.pop();
                     } else {
                         let line = chunk.lines[op_ip];
-                        self.cmp_op(line, |a, b| a <= b, |a, b| a <= b, |a, b| a <= b)?;
+                        self.cmp_op(
+                            line,
+                            |a, b| a <= b,
+                            |a, b| a <= b,
+                            |o| o != std::cmp::Ordering::Greater,
+                            |a, b| a <= b,
+                        )?;
                     }
                 }
                 Op::Gt => {
@@ -2049,7 +2240,13 @@ impl VM {
                         self.stack.pop();
                     } else {
                         let line = chunk.lines[op_ip];
-                        self.cmp_op(line, |a, b| a > b, |a, b| a > b, |a, b| a > b)?;
+                        self.cmp_op(
+                            line,
+                            |a, b| a > b,
+                            |a, b| a > b,
+                            |o| o == std::cmp::Ordering::Greater,
+                            |a, b| a > b,
+                        )?;
                     }
                 }
                 Op::Ge => {
@@ -2062,7 +2259,13 @@ impl VM {
                         self.stack.pop();
                     } else {
                         let line = chunk.lines[op_ip];
-                        self.cmp_op(line, |a, b| a >= b, |a, b| a >= b, |a, b| a >= b)?;
+                        self.cmp_op(
+                            line,
+                            |a, b| a >= b,
+                            |a, b| a >= b,
+                            |o| o != std::cmp::Ordering::Less,
+                            |a, b| a >= b,
+                        )?;
                     }
                 }
                 Op::In => {
@@ -2194,9 +2397,10 @@ impl VM {
                                 None
                             };
                             self.frames.last_mut().unwrap().ip = ip;
-                            cur_closure = closure.clone();
+                            *cur_closure = closure.clone();
                             cur_base = callee_idx;
                             ip = 0;
+                            *last_ip = 0;
                             proto_id = cur_closure.proto.ic_id;
                             self.frames.push(CallFrame {
                                 closure,
@@ -2240,9 +2444,10 @@ impl VM {
                             if let Some(req) = self.scheduler.pending_yield.take() {
                                 self.resume_after_suspend(req, target_depth)?;
                                 let caller = self.frames.last().unwrap();
-                                cur_closure = caller.closure.clone();
+                                *cur_closure = caller.closure.clone();
                                 cur_base = caller.base;
                                 ip = caller.ip;
+                                *last_ip = ip;
                                 proto_id = cur_closure.proto.ic_id;
                                 continue;
                             }
@@ -2279,9 +2484,10 @@ impl VM {
                                             } else {
                                                 None
                                             };
-                                            cur_closure = closure.clone();
+                                            *cur_closure = closure.clone();
                                             cur_base = callee_idx;
                                             ip = 0;
+                                            *last_ip = 0;
                                             proto_id = cur_closure.proto.ic_id;
                                             self.frames.push(CallFrame {
                                                 closure,
@@ -2300,9 +2506,10 @@ impl VM {
                                             if let Some(req) = self.scheduler.pending_yield.take() {
                                                 self.resume_after_suspend(req, target_depth)?;
                                                 let caller = self.frames.last().unwrap();
-                                                cur_closure = caller.closure.clone();
+                                                *cur_closure = caller.closure.clone();
                                                 cur_base = caller.base;
                                                 ip = caller.ip;
+                                                *last_ip = ip;
                                                 proto_id = cur_closure.proto.ic_id;
                                                 continue;
                                             }
@@ -2374,9 +2581,10 @@ impl VM {
                                 None
                             };
                             self.frames.last_mut().unwrap().ip = ip;
-                            cur_closure = closure.clone();
+                            *cur_closure = closure.clone();
                             cur_base = callee_idx;
                             ip = 0;
+                            *last_ip = 0;
                             proto_id = cur_closure.proto.ic_id;
                             self.frames.push(CallFrame {
                                 closure,
@@ -2418,8 +2626,9 @@ impl VM {
                             } else {
                                 None
                             };
-                            cur_closure = closure.clone();
+                            *cur_closure = closure.clone();
                             ip = 0;
+                            *last_ip = 0;
                             proto_id = cur_closure.proto.ic_id;
                             let frame = self.frames.last_mut().unwrap();
                             frame.closure = closure;
@@ -2461,9 +2670,10 @@ impl VM {
                         if let Some(req) = self.scheduler.pending_yield.take() {
                             self.resume_after_suspend(req, target_depth)?;
                             let caller = self.frames.last().unwrap();
-                            cur_closure = caller.closure.clone();
+                            *cur_closure = caller.closure.clone();
                             cur_base = caller.base;
                             ip = caller.ip;
+                            *last_ip = ip;
                             proto_id = cur_closure.proto.ic_id;
                             continue;
                         }
@@ -2471,9 +2681,10 @@ impl VM {
                             if target_depth == 0 && self.scheduler.current_task_id != 0 {
                                 self.finish_current_green_task(Ok(res))?;
                                 let caller = self.frames.last().unwrap();
-                                cur_closure = caller.closure.clone();
+                                *cur_closure = caller.closure.clone();
                                 cur_base = caller.base;
                                 ip = caller.ip;
+                                *last_ip = ip;
                                 proto_id = cur_closure.proto.ic_id;
                                 continue;
                             }
@@ -2481,9 +2692,10 @@ impl VM {
                         }
                         self.stack.push(res);
                         let caller = self.frames.last().unwrap();
-                        cur_closure = caller.closure.clone();
+                        *cur_closure = caller.closure.clone();
                         cur_base = caller.base;
                         ip = caller.ip;
+                        *last_ip = ip;
                         proto_id = cur_closure.proto.ic_id;
                     }
                 }
@@ -2522,9 +2734,10 @@ impl VM {
                             } else {
                                 None
                             };
-                            cur_closure = closure.clone();
+                            *cur_closure = closure.clone();
                             cur_base = callee_idx;
                             ip = 0;
+                            *last_ip = 0;
                             proto_id = cur_closure.proto.ic_id;
                             self.frames.push(CallFrame {
                                 closure,
@@ -2563,9 +2776,10 @@ impl VM {
                                     } else {
                                         None
                                     };
-                                    cur_closure = closure.clone();
+                                    *cur_closure = closure.clone();
                                     cur_base = callee_idx;
                                     ip = 0;
+                                    *last_ip = 0;
                                     proto_id = cur_closure.proto.ic_id;
                                     self.frames.push(CallFrame {
                                         closure,
@@ -2629,10 +2843,12 @@ impl VM {
                         }
                     }
                     let base_dir = cur_closure.base_dir.clone();
+                    let source_file = cur_closure.source_file.clone();
                     self.stack.push(Value::Closure(Rc::new(Closure {
                         proto,
                         upvalues,
                         base_dir,
+                        source_file,
                     })));
                 }
                 Op::MakeList(count) => {
@@ -2974,9 +3190,16 @@ impl VM {
                             let val =
                                 m.exports.borrow().get(attr_name).cloned().ok_or_else(|| {
                                     let line = chunk.lines[op_ip];
+                                    let exports = m.exports.borrow();
+                                    let hint = crate::diag::suggest_similar(
+                                        attr_name,
+                                        exports.keys().map(String::as_str),
+                                    )
+                                    .map(|s| format!(" (did you mean '{}'?)", s))
+                                    .unwrap_or_default();
                                     format!(
-                                        "[line {}] Module '{}' has no export '{}'",
-                                        line, m.name, attr_name
+                                        "[line {}] Module '{}' has no export '{}'{}",
+                                        line, m.name, attr_name, hint
                                     )
                                 })?;
                             self.module_ic[mic_idx] =
@@ -3163,9 +3386,13 @@ impl VM {
                     };
                     let line = chunk.lines[op_ip];
                     self.frames.last_mut().unwrap().ip = ip;
-                    let module = self
-                        .load_module(&source, is_path)
-                        .map_err(|e| format!("[line {}] {}", line, e))?;
+                    let module = self.load_module(&source, is_path).map_err(|e| {
+                        if e.contains(" (in '") {
+                            e
+                        } else {
+                            format!("[line {}] {}", line, e)
+                        }
+                    })?;
                     self.stack.push(module);
                 }
                 Op::MakeModule(name_idx, count) => {
@@ -3272,9 +3499,10 @@ impl VM {
                         if target_depth == 0 && self.scheduler.current_task_id != 0 {
                             self.finish_current_green_task(Ok(result))?;
                             let caller = self.frames.last().unwrap();
-                            cur_closure = caller.closure.clone();
+                            *cur_closure = caller.closure.clone();
                             cur_base = caller.base;
                             ip = caller.ip;
+                            *last_ip = ip;
                             proto_id = cur_closure.proto.ic_id;
                             continue;
                         }
@@ -3282,9 +3510,10 @@ impl VM {
                     }
                     self.stack.push(result);
                     let caller = self.frames.last().unwrap();
-                    cur_closure = caller.closure.clone();
+                    *cur_closure = caller.closure.clone();
                     cur_base = caller.base;
                     ip = caller.ip;
+                    *last_ip = ip;
                     proto_id = cur_closure.proto.ic_id;
                 }
             }
@@ -3798,6 +4027,34 @@ impl VM {
         self.open_upvalues = remaining;
     }
 
+    fn resolve_ask_module_fallback(
+        &self,
+        import_base: &std::path::Path,
+        mut raw_path: PathBuf,
+        source: &str,
+        is_path: bool,
+        parent_name: &str,
+    ) -> Result<PathBuf, String> {
+        raw_path.set_extension("ask");
+        match self.resolve_read_path_from(import_base, &raw_path.to_string_lossy()) {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                if !is_path {
+                    if let Some(sim) = crate::diag::suggest_similar(
+                        source,
+                        crate::modules::BUILTIN_MODULE_NAMES.iter().copied(),
+                    ) {
+                        return Err(format!(
+                            "Could not import '{}' (did you mean '{}'?) (imported from '{}')",
+                            source, sim, parent_name
+                        ));
+                    }
+                }
+                Err(format!("{} (imported from '{}')", e, parent_name))
+            }
+        }
+    }
+
     fn load_module(&mut self, source: &str, is_path: bool) -> Result<Value, String> {
         if !is_path {
             if source == "mem" && self.sandboxed {
@@ -3820,6 +4077,17 @@ impl VM {
             .unwrap_or_else(|| self.current_dir.clone());
 
         let raw_path = PathBuf::from(source);
+        let parent_name = self
+            .frames
+            .last()
+            .map(|f| {
+                f.closure
+                    .source_file
+                    .clone()
+                    .unwrap_or_else(|| f.closure.proto.name.clone())
+            })
+            .unwrap_or_else(|| "<script>".to_string());
+
         let file_path = if raw_path.extension().is_none() {
             let mod_candidate = raw_path.join("mod.ask");
             if let Ok(resolved_mod) =
@@ -3828,17 +4096,26 @@ impl VM {
                 if resolved_mod.is_file() {
                     resolved_mod
                 } else {
-                    let mut ask_path = raw_path;
-                    ask_path.set_extension("ask");
-                    self.resolve_read_path_from(&import_base, &ask_path.to_string_lossy())?
+                    self.resolve_ask_module_fallback(
+                        &import_base,
+                        raw_path,
+                        source,
+                        is_path,
+                        &parent_name,
+                    )?
                 }
             } else {
-                let mut ask_path = raw_path;
-                ask_path.set_extension("ask");
-                self.resolve_read_path_from(&import_base, &ask_path.to_string_lossy())?
+                self.resolve_ask_module_fallback(
+                    &import_base,
+                    raw_path,
+                    source,
+                    is_path,
+                    &parent_name,
+                )?
             }
         } else {
-            self.resolve_read_path_from(&import_base, &raw_path.to_string_lossy())?
+            self.resolve_read_path_from(&import_base, &raw_path.to_string_lossy())
+                .map_err(|e| format!("{} (imported from '{}')", e, parent_name))?
         };
 
         let cache_key = fs::canonicalize(&file_path)
@@ -3846,13 +4123,15 @@ impl VM {
             .to_string_lossy()
             .to_string();
 
+        let mod_disp = clean_display_path(&file_path);
+
         if let Some(cached) = self.module_cache.get(&cache_key) {
             return Ok(cached.clone());
         }
         if !self.loading_modules.insert(cache_key.clone()) {
             return Err(format!(
-                "Circular import detected for '{}'",
-                file_path.display()
+                "Circular import detected for '{}' (imported from '{}')",
+                mod_disp, parent_name
             ));
         }
 
@@ -3860,7 +4139,20 @@ impl VM {
             Ok(c) => c,
             Err(e) => {
                 self.loading_modules.remove(&cache_key);
-                return Err(format!("Could not import '{}': {}", file_path.display(), e));
+                let hint = if !is_path {
+                    crate::diag::suggest_similar(
+                        source,
+                        crate::modules::BUILTIN_MODULE_NAMES.iter().copied(),
+                    )
+                    .map(|s| format!(" (did you mean '{}'?)", s))
+                    .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                return Err(format!(
+                    "Could not import '{}': {}{} (imported from '{}')",
+                    mod_disp, e, hint, parent_name
+                ));
             }
         };
 
@@ -3881,7 +4173,10 @@ impl VM {
             Ok(p) => p,
             Err(e) => {
                 self.loading_modules.remove(&cache_key);
-                return Err(e);
+                return Err(format!(
+                    "{} (in '{}') (imported from '{}')",
+                    e, mod_disp, parent_name
+                ));
             }
         };
 
@@ -3890,11 +4185,20 @@ impl VM {
         if let Some(parent) = &mod_dir {
             self.current_dir = parent.clone();
         }
-        let result = self.run_with_base_dir(proto, mod_dir);
+        let result = self.run_with_source(proto, mod_dir, Some(mod_disp.clone()));
         self.current_dir = prev_dir;
         self.loading_modules.remove(&cache_key);
 
-        let module_val = result?;
+        let module_val = result.map_err(|e| {
+            if e.contains(" (in '") {
+                format!("{} (imported from '{}')", e, parent_name)
+            } else {
+                format!(
+                    "{} (in '{}') (imported from '{}')",
+                    e, mod_disp, parent_name
+                )
+            }
+        })?;
         self.module_cache.insert(cache_key, module_val.clone());
         Ok(module_val)
     }
@@ -3932,6 +4236,7 @@ impl VM {
         line: usize,
         int_op: fn(i64, i64) -> bool,
         float_op: fn(f64, f64) -> bool,
+        ord_ok: fn(std::cmp::Ordering) -> bool,
         str_op: fn(&str, &str) -> bool,
     ) -> Result<(), String> {
         let b = self.stack.pop().unwrap();
@@ -3939,8 +4244,14 @@ impl VM {
         let res = match (a, b) {
             (Value::Int(x), Value::Int(y)) => Value::Bool(int_op(x, y)),
             (Value::Float(x), Value::Float(y)) => Value::Bool(float_op(x, y)),
-            (Value::Int(x), Value::Float(y)) => Value::Bool(float_op(x as f64, y)),
-            (Value::Float(x), Value::Int(y)) => Value::Bool(float_op(x, y as f64)),
+            (Value::Int(x), Value::Float(y)) => {
+                Value::Bool(crate::value::cmp_int_float(x, y).is_some_and(ord_ok))
+            }
+            (Value::Float(x), Value::Int(y)) => Value::Bool(
+                crate::value::cmp_int_float(y, x)
+                    .map(|o| o.reverse())
+                    .is_some_and(ord_ok),
+            ),
             (Value::Str(x), Value::Str(y)) => Value::Bool(str_op(&x, &y)),
             (l, r) => {
                 return Err(format!(
@@ -4758,7 +5069,7 @@ fn collect_iterable_inner(
             collect_iterable_inner(vm, &next_val, fn_name, false)
         }
         other => Err(format!(
-            "{}() expects a list, set, bytes, or range, got '{}'",
+            "{}() expects a list, str, set, bytes, or range, got '{}'",
             fn_name,
             other.type_name()
         )),
@@ -5036,25 +5347,10 @@ fn native_sort(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 return std::cmp::Ordering::Equal;
             }
         }
-        match (a, b) {
-            (Value::Int(x), Value::Int(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => {
-                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            (Value::Int(x), Value::Float(y)) => (*x as f64)
-                .partial_cmp(y)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Float(x), Value::Int(y)) => x
-                .partial_cmp(&(*y as f64))
-                .unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Str(x), Value::Str(y)) => x.cmp(y),
-            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-            _ => {
-                err = Some(format!(
-                    "sort() cannot compare '{}' and '{}'",
-                    a.type_name(),
-                    b.type_name()
-                ));
+        match compare_order_values(a, b, "sort") {
+            Ok(ord) => ord,
+            Err(e) => {
+                err = Some(e);
                 std::cmp::Ordering::Equal
             }
         }
@@ -5063,6 +5359,28 @@ fn native_sort(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err(e);
     }
     Ok(Value::List(Rc::new(RefCell::new(items))))
+}
+
+fn compare_order_values(a: &Value, b: &Value, ctx: &str) -> Result<std::cmp::Ordering, String> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => x
+            .partial_cmp(y)
+            .ok_or_else(|| format!("{}() cannot compare NaN floats", ctx)),
+        (Value::Int(x), Value::Float(y)) => crate::value::cmp_int_float(*x, *y)
+            .ok_or_else(|| format!("{}() cannot compare NaN floats", ctx)),
+        (Value::Float(x), Value::Int(y)) => crate::value::cmp_int_float(*y, *x)
+            .map(|o| o.reverse())
+            .ok_or_else(|| format!("{}() cannot compare NaN floats", ctx)),
+        (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
+        _ => Err(format!(
+            "{}() cannot compare '{}' and '{}'",
+            ctx,
+            a.type_name(),
+            b.type_name()
+        )),
+    }
 }
 
 fn native_reverse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -5281,6 +5599,536 @@ fn native_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     }
     Ok(Value::Unit)
+}
+
+fn int_arith_op(
+    args: &[Value],
+    name: &str,
+    checked: bool,
+    op: fn(i64, i64) -> Option<i64>,
+    wrap_op: fn(i64, i64) -> i64,
+) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("{}() expects 2 integer arguments", name));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => {
+            if checked {
+                op(*a, *b)
+                    .map(Value::Int)
+                    .ok_or_else(|| format!("{}(): integer overflow ({}, {})", name, a, b))
+            } else {
+                Ok(Value::Int(wrap_op(*a, *b)))
+            }
+        }
+        (a, b) => Err(format!(
+            "{}() expects (int, int), got ({}, {})",
+            name,
+            a.type_name(),
+            b.type_name()
+        )),
+    }
+}
+
+fn native_checked_add(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    int_arith_op(
+        args,
+        "checked_add",
+        true,
+        i64::checked_add,
+        i64::wrapping_add,
+    )
+}
+
+fn native_checked_sub(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    int_arith_op(
+        args,
+        "checked_sub",
+        true,
+        i64::checked_sub,
+        i64::wrapping_sub,
+    )
+}
+
+fn native_checked_mul(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    int_arith_op(
+        args,
+        "checked_mul",
+        true,
+        i64::checked_mul,
+        i64::wrapping_mul,
+    )
+}
+
+fn native_wrapping_add(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    int_arith_op(
+        args,
+        "wrapping_add",
+        false,
+        i64::checked_add,
+        i64::wrapping_add,
+    )
+}
+
+fn native_wrapping_sub(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    int_arith_op(
+        args,
+        "wrapping_sub",
+        false,
+        i64::checked_sub,
+        i64::wrapping_sub,
+    )
+}
+
+fn native_wrapping_mul(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    int_arith_op(
+        args,
+        "wrapping_mul",
+        false,
+        i64::checked_mul,
+        i64::wrapping_mul,
+    )
+}
+
+fn native_is_same(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("is_same() expects 2 arguments, got {}", args.len()));
+    }
+    Ok(Value::Bool(args[0].is_same(&args[1])))
+}
+
+fn native_repr(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("repr() expects 1 argument, got {}", args.len()));
+    }
+    let out = args[0].repr_string();
+    vm.charge_alloc(out.len())?;
+    Ok(Value::Str(out))
+}
+
+fn native_try_int(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("try_int() expects 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::Int(v) => Ok(Value::Int(*v)),
+        Value::Float(v) => {
+            if !v.is_finite() || *v < (i64::MIN as f64) || *v >= 9223372036854775808.0 {
+                Ok(Value::Unit)
+            } else {
+                Ok(Value::Int(*v as i64))
+            }
+        }
+        Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+        Value::Str(s) => Ok(s
+            .trim()
+            .parse::<i64>()
+            .map(Value::Int)
+            .unwrap_or(Value::Unit)),
+        _ => Ok(Value::Unit),
+    }
+}
+
+fn native_try_float(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "try_float() expects 1 argument, got {}",
+            args.len()
+        ));
+    }
+    match &args[0] {
+        Value::Float(v) => {
+            if v.is_finite() {
+                Ok(Value::Float(*v))
+            } else {
+                Ok(Value::Unit)
+            }
+        }
+        Value::Int(v) => Ok(Value::Float(*v as f64)),
+        Value::Bool(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
+        Value::Str(s) => match s.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok(Value::Float(v)),
+            _ => Ok(Value::Unit),
+        },
+        _ => Ok(Value::Unit),
+    }
+}
+
+fn type_check(args: &[Value], name: &str, pred: fn(&Value) -> bool) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("{}() expects 1 argument, got {}", name, args.len()));
+    }
+    Ok(Value::Bool(pred(&args[0])))
+}
+
+fn native_is_unit(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_unit", |v| matches!(v, Value::Unit))
+}
+fn native_is_int(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_int", |v| matches!(v, Value::Int(_)))
+}
+fn native_is_float(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_float", |v| matches!(v, Value::Float(_)))
+}
+fn native_is_bool(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_bool", |v| matches!(v, Value::Bool(_)))
+}
+fn native_is_str(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_str", |v| matches!(v, Value::Str(_)))
+}
+fn native_is_bytes(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_bytes", |v| matches!(v, Value::Bytes(_)))
+}
+fn native_is_list(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_list", |v| matches!(v, Value::List(_)))
+}
+fn native_is_dict(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_dict", |v| matches!(v, Value::Dict(_)))
+}
+fn native_is_set(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_set", |v| matches!(v, Value::Set(_)))
+}
+fn native_is_fn(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    type_check(args, "is_fn", |v| {
+        matches!(
+            v,
+            Value::Closure(_) | Value::NativeFn(_) | Value::BoundMethod(_)
+        )
+    })
+}
+
+pub(crate) fn native_is_empty(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("is_empty() expects 1 argument, got {}", args.len()));
+    }
+    let empty = match &args[0] {
+        Value::Str(s) => s.is_empty(),
+        Value::Bytes(b) => b.is_empty(),
+        Value::List(l) => l.borrow().is_empty(),
+        Value::Dict(d) => d.borrow().is_empty(),
+        Value::Set(s) => s.borrow().items.is_empty(),
+        Value::Range { start, end } => end <= start,
+        other => {
+            return Err(format!(
+                "is_empty() expects a collection, string, bytes, or range, got '{}'",
+                other.type_name()
+            ));
+        }
+    };
+    Ok(Value::Bool(empty))
+}
+
+pub(crate) fn native_first(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("first() expects 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::List(l) => Ok(l.borrow().first().cloned().unwrap_or(Value::Unit)),
+        Value::Bytes(b) => Ok(b
+            .first()
+            .map(|&v| Value::Int(v as i64))
+            .unwrap_or(Value::Unit)),
+        Value::Str(s) => Ok(s
+            .chars()
+            .next()
+            .map(|c| Value::Str(c.to_string()))
+            .unwrap_or(Value::Unit)),
+        Value::Range { start, end } => {
+            if start < end {
+                Ok(Value::Int(*start))
+            } else {
+                Ok(Value::Unit)
+            }
+        }
+        other => Err(format!(
+            "first() expects a list, str, bytes, or range, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+pub(crate) fn native_last(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("last() expects 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::List(l) => Ok(l.borrow().last().cloned().unwrap_or(Value::Unit)),
+        Value::Bytes(b) => Ok(b
+            .last()
+            .map(|&v| Value::Int(v as i64))
+            .unwrap_or(Value::Unit)),
+        Value::Str(s) => Ok(s
+            .chars()
+            .next_back()
+            .map(|c| Value::Str(c.to_string()))
+            .unwrap_or(Value::Unit)),
+        Value::Range { start, end } => {
+            if start < end {
+                Ok(Value::Int(*end - 1))
+            } else {
+                Ok(Value::Unit)
+            }
+        }
+        other => Err(format!(
+            "last() expects a list, str, bytes, or range, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+pub(crate) fn native_find_index(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "find_index() expects 2 arguments (seq, pred), got {}",
+            args.len()
+        ));
+    }
+    let items = collect_iterable(vm, &args[0], "find_index")?;
+    let func = args[1].clone();
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        if vm.call_value(func.clone(), &[item])?.is_truthy() {
+            return Ok(Value::Int(i as i64));
+        }
+    }
+    Ok(Value::Int(-1))
+}
+
+pub(crate) fn native_count(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(format!(
+            "count() expects 1 or 2 arguments (seq, [pred]), got {}",
+            args.len()
+        ));
+    }
+    if args.len() == 1 {
+        return native_len(vm, args);
+    }
+    let items = collect_iterable(vm, &args[0], "count")?;
+    let func = args[1].clone();
+    let mut matched: i64 = 0;
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        if vm.call_value(func.clone(), &[item])?.is_truthy() {
+            matched += 1;
+        }
+    }
+    Ok(Value::Int(matched))
+}
+
+pub(crate) fn native_partition(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "partition() expects 2 arguments (seq, pred), got {}",
+            args.len()
+        ));
+    }
+    let items = collect_iterable(vm, &args[0], "partition")?;
+    let func = args[1].clone();
+    let mut yes = Vec::new();
+    let mut no = Vec::new();
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        if vm
+            .call_value(func.clone(), std::slice::from_ref(&item))?
+            .is_truthy()
+        {
+            yes.push(item);
+        } else {
+            no.push(item);
+        }
+    }
+    Ok(Value::List(Rc::new(RefCell::new(vec![
+        Value::List(Rc::new(RefCell::new(yes))),
+        Value::List(Rc::new(RefCell::new(no))),
+    ]))))
+}
+
+pub(crate) fn native_flat_map(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "flat_map() expects 2 arguments (seq, fn), got {}",
+            args.len()
+        ));
+    }
+    let items = collect_iterable(vm, &args[0], "flat_map")?;
+    let func = args[1].clone();
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        let res = vm.call_value(func.clone(), &[item])?;
+        match res {
+            Value::List(l) => {
+                let inner = l.borrow();
+                if out.len().saturating_add(inner.len()) > 1_000_000 {
+                    return Err("flat_map() output exceeds 1,000,000 elements limit".to_string());
+                }
+                vm.charge_alloc(inner.len().saturating_mul(std::mem::size_of::<Value>()))?;
+                out.extend(inner.iter().cloned());
+            }
+            Value::Set(s) => {
+                let inner = s.borrow();
+                if out.len().saturating_add(inner.items.len()) > 1_000_000 {
+                    return Err("flat_map() output exceeds 1,000,000 elements limit".to_string());
+                }
+                vm.charge_alloc(
+                    inner
+                        .items
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Value>()),
+                )?;
+                out.extend(inner.items.iter().cloned());
+            }
+            Value::Range { start, end } => {
+                let sub = collect_iterable(vm, &Value::Range { start, end }, "flat_map")?;
+                if out.len().saturating_add(sub.len()) > 1_000_000 {
+                    return Err("flat_map() output exceeds 1,000,000 elements limit".to_string());
+                }
+                out.extend(sub);
+            }
+            other => {
+                if out.len() >= 1_000_000 {
+                    return Err("flat_map() output exceeds 1,000,000 elements limit".to_string());
+                }
+                vm.charge_alloc(std::mem::size_of::<Value>())?;
+                out.push(other);
+            }
+        }
+    }
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+pub(crate) fn native_take_while(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "take_while() expects 2 arguments (seq, pred), got {}",
+            args.len()
+        ));
+    }
+    let items = collect_iterable(vm, &args[0], "take_while")?;
+    let func = args[1].clone();
+    let mut out = Vec::new();
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        if vm
+            .call_value(func.clone(), std::slice::from_ref(&item))?
+            .is_truthy()
+        {
+            out.push(item);
+        } else {
+            break;
+        }
+    }
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+pub(crate) fn native_drop_while(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "drop_while() expects 2 arguments (seq, pred), got {}",
+            args.len()
+        ));
+    }
+    let items = collect_iterable(vm, &args[0], "drop_while")?;
+    let func = args[1].clone();
+    let mut dropping = true;
+    let mut out = Vec::new();
+    for (i, item) in items.into_iter().enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        if dropping {
+            if vm
+                .call_value(func.clone(), std::slice::from_ref(&item))?
+                .is_truthy()
+            {
+                continue;
+            }
+            dropping = false;
+        }
+        out.push(item);
+    }
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+pub(crate) fn native_zip_longest(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!(
+            "zip_longest() expects 2 or 3 arguments (a, b, [fill]), got {}",
+            args.len()
+        ));
+    }
+    let a = collect_iterable(vm, &args[0], "zip_longest")?;
+    let b = collect_iterable(vm, &args[1], "zip_longest")?;
+    let fill = args.get(2).cloned().unwrap_or(Value::Unit);
+    let len = a.len().max(b.len());
+    vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>() * 3 + 24))?;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let va = a.get(i).cloned().unwrap_or_else(|| fill.clone());
+        let vb = b.get(i).cloned().unwrap_or_else(|| fill.clone());
+        out.push(Value::List(Rc::new(RefCell::new(vec![va, vb]))));
+    }
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+fn extremum_by_impl(
+    vm: &mut VM,
+    args: &[Value],
+    pick_max: bool,
+    name: &str,
+) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "{}() expects 2 arguments (seq, key_fn), got {}",
+            name,
+            args.len()
+        ));
+    }
+    let items = collect_iterable(vm, &args[0], name)?;
+    if items.is_empty() {
+        return Ok(Value::Unit);
+    }
+    let key_fn = args[1].clone();
+    let mut iter = items.into_iter();
+    let mut best_item = iter.next().unwrap();
+    let mut best_key = vm.call_value(key_fn.clone(), std::slice::from_ref(&best_item))?;
+    compare_order_values(&best_key, &best_key, name)?;
+    for (i, item) in iter.enumerate() {
+        if (i & 1023) == 0 {
+            vm.check_timeout()?;
+        }
+        let key = vm.call_value(key_fn.clone(), std::slice::from_ref(&item))?;
+        let ord = compare_order_values(&key, &best_key, name)?;
+        let take = if pick_max {
+            ord == std::cmp::Ordering::Greater
+        } else {
+            ord == std::cmp::Ordering::Less
+        };
+        if take {
+            best_item = item;
+            best_key = key;
+        }
+    }
+    Ok(best_item)
+}
+
+pub(crate) fn native_min_by(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    extremum_by_impl(vm, args, false, "min_by")
+}
+
+pub(crate) fn native_max_by(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    extremum_by_impl(vm, args, true, "max_by")
 }
 
 fn native_pairs(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
