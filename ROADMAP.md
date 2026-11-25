@@ -19,7 +19,7 @@ Release roadmap for Askane, separated into completed milestones, immediate fixes
 | `0.17.0 - 0.17.1` | **Done** | Askane Studio v2 + Setup UI, `crypto`, `kv`, `net`, `ws`, cooperative `task`/`channel`, `--deterministic`, snapshots, reactive `signal` & `on change` |
 | `0.18.0` | **Done** | Diagnostics (`E...`/`W...`, `--explain`, `--diagnostic-format=json`, `did you mean`, recovery, lints), semantics/helpers, `gfx` alpha/`key_pressed`, CLI `info`/`doctor`/`modules`/`clean` |
 | `0.19.0` | **Planned** | Bytecode cache (`.askc`), streaming `fs` (`read_lines`/`walk`/`temp_file`/`copy_dir`), `fmt --diff`/`--stdin`, `test --filter`, `gfx` layers & sprite animation |
-| `0.20.0 - 0.22.0` | **Exploratory** | Linux/macOS backends (`http`, `gfx`/`ui`, `clipboard`), `askane lsp` & VS Code, `askane bundle`, fuzzing corpus, AppContainer/DNS pinning, experimental 3D & baseline JIT |
+| `0.20.0 - 0.22.0` | **Exploratory** | VM speedup (60-80+ bench score), Linux/macOS backends (`http`, `gfx`/`ui`, `clipboard`), `askane lsp` & VS Code, `askane bundle`, fuzzing corpus, AppContainer/DNS pinning, 3D & baseline JIT |
 
 ---
 
@@ -122,7 +122,8 @@ This release focuses on strengthening the existing foundation before adding heav
 
 These items are tracked across future milestones as exploratory directions rather than committed release scope, and promote to `Planned` once prerequisites land:
 
-- **`0.20` - Cross-Platform Backends & IDE Integration:**
+- **`0.20` - VM Performance, Cross-Platform Backends & IDE Integration:**
+  - **VM speed optimization (target 60-80+ on `bench/`):** drop `last_ip` writes from non-throwing hot opcodes, expand specialized superinstructions / register-local fast paths, reduce `Value` cloning and `Rc` traffic in calls, closures and `json` / `dict` loops, and optimize loop & arithmetic dispatch without breaking sandbox guarantees;
   - portable Linux and macOS backends for `http` (TLS), `gfx`/`ui`, and `clipboard` without changing `.ask` user code;
   - built-in `askane lsp` server over JSON diagnostics, VS Code syntax/extension, shell completions (PowerShell/Bash/Zsh), and single-binary `askane bundle`.
 - **`0.21` - Fuzzing, Hardening & Release Discipline:**
