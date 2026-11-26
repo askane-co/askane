@@ -19,7 +19,8 @@ Release roadmap for Askane, separated into completed milestones, immediate fixes
 | `0.17.0 - 0.17.1` | **Done** | Askane Studio v2 + Setup UI, `crypto`, `kv`, `net`, `ws`, cooperative `task`/`channel`, `--deterministic`, snapshots, reactive `signal` & `on change` |
 | `0.18.0` | **Done** | Diagnostics (`E...`/`W...`, `--explain`, `--diagnostic-format=json`, `did you mean`, recovery, lints), semantics/helpers, `gfx` alpha/`key_pressed`, CLI `info`/`doctor`/`modules`/`clean` |
 | `0.19.0` | **Done** | Bytecode cache (`.askc` / `--no-cache`), streaming & directory `fs` (`read_lines`/`open_lines`/`write_stream`/`walk`/`copy_dir`/`temp_file`), `fmt --diff`/`--stdin` + `[fmt] indent`, `test --filter`, `gfx` sprite sheets, `mouse_pressed`, normalized `delta` & cross-platform `headless` |
-| `0.20.0 - 0.22.0` | **Planned / Exploratory** | VM speedup (60-80+ bench score), Linux/macOS backends (`http`, `gfx`/`ui`, `clipboard`), `askane lsp` & VS Code, `askane bundle`, fuzzing corpus, AppContainer/DNS pinning, 3D & baseline JIT |
+| `0.20.0` | **Planned** | Expanded media & world engine (`media::image` PNG/BMP/TGA/QOI/GIF/baseline JPEG, multi-channel `audio` `Mixer`/`Voice`/`Music`/`Bus` + `WAV`/`PCM`/`ADPCM`/`render_offline`, software `Surface` + DepthBuffer + fonts, Tiled maps, `.r16` terrain, `.obj`/`.mtl`/`.gltf`/`.glb` meshes, lighting/postfx, `TypedBuffer`, VM speedup `65-75+`, cross-platform HAL, `askane bundle`, `askane lsp`) |
+| `0.21.0 - 0.22.0` | **Exploratory** | Software triangle rasterizer, fuzzed TTF fonts, opt-in compressed audio (`FLAC`/`MP3`/`OGG`), fuzzing corpus, AppContainer/DNS hardening, dedicated `0.22` `gfx3d` 3D module (camera, PBR, IBL, lighting, skinning) over frozen `0.20` contracts & baseline JIT exploration |
 
 ---
 
@@ -113,9 +114,31 @@ This release focuses on strengthening the existing foundation before adding heav
 
 ## Next Milestone: `0.20.0` (`Planned`)
 
-- **VM speed optimization (target 60-80+ on `bench/`):** drop `last_ip` writes from non-throwing hot opcodes, expand specialized superinstructions / register-local fast paths, reduce `Value` cloning and `Rc` traffic in calls, closures and `json` / `dict` loops, and optimize loop & arithmetic dispatch without breaking sandbox guarantees.
-- **Cross-platform OS backends:** portable Linux and macOS backends for `http` (TLS), `gfx`/`ui`, and `clipboard` without changing `.ask` user code.
-- **IDE & packaging foundations:** built-in `askane lsp` server over JSON diagnostics, VS Code syntax/extension, shell completions (PowerShell/Bash/Zsh), and single-binary `askane bundle`.
+Designed around a clean `Core` + `Extension` architecture (zero external Rust crates, estimated `+410..685 KB` release binary growth to ~`4.8..5.1 MB`, `+5%` CI size gate) with 5 frozen runtime/asset contracts preparing Askane for native 3D in `0.22.0`:
+
+- **Stage 1 - VM speed (`41.35 -> 65-75+`), `TypedBuffer`, `.askc v2` & `BudgetCore`:**
+  - pack `enum Value` down to 16 bytes (`size_of::<Value>() == 16`) in 100% safe Rust, add stack `Vec2(f32, f32)`, `FxHash` map hashing, `SetKey::from_value` via `Rc::clone`, and zero-escape `&[u8]` scanning in `json.parse`;
+  - add the `buffer` module (`TypedBuffer`: `U8`, `I32`, `U32`, `F32` with copy-on-write mutation at `Rc::strong_count == 1` and zero `unsafe`) as the binary backbone for pixels, audio PCM, vertices, indices, and heightmaps;
+  - drop `*last_ip` writes on non-throwing hot opcodes, introduce register `steps_until_sync`, lightweight `CallFrame`, `Op::CallSelf` / `IndexLocal` / `SetIndexLocal` / `PushLocal`, zero-alloc `ForRange`, `Op::step_cost()`, atomic `BudgetCore` with RAII `TempCharge`, and `BYTECODE_CACHE_FORMAT_VERSION = 2` with opcode roundtrip verification.
+- **Stage 2 - Software `Surface`, layers, `Camera2D`, `geom` & raster fonts:**
+  - unified `0xAARRGGBB` software `Surface` across Windows (`StretchDIBits`), Linux (raw X11 `PutImage`), and headless CI, plus up to `32` layers and NDC `[0, 1]` `DepthBuffer` (`frag_z < buf_z`, clear `1.0`);
+  - freeze coordinate canon (2D Y-down, 3D RH Y-up `-Z` forward) and add `geom` / `scene::math` (`Vec2..4`, `Mat4`, `Quat`, `Transform`, `Aabb`, `Ray`, `Plane`, `Frustum`);
+  - built-in Latin + Cyrillic raster font, BMFont `.fnt` loader, and `ui.image` / `ui.rect` / `nine_slice` / `icon_button` widgets (TTF deferred to `0.21` with fuzz corpus).
+- **Stage 3 - Unified `media::image` pipeline, textures & sprite animations:**
+  - single shared decoder across `image`, `gfx`, `ui`, and `assets`: `PNG`, `BMP`, `TGA`, `QOI` in Core plus animated `GIF` and baseline `JPEG` (`SOF0`/`SOF1`, rejecting `SOF2` progressive with `E_MEDIA_UNSUPPORTED`) in Extension;
+  - sprite atlases, frame animations, `draw_sprite_ex` (flip, rotation, tint, scale, origin), `Rgba8`/`R8` mipmaps, and strict pre-alloc decompression-bomb limits (`MAX_DIM = 8192`, `MAX_PIXELS = 33,554,432`, `MAX_MEDIA_BYTES = 64 MiB`, `>= 150` fuzz/bomb tests).
+- **Stage 4 - Multi-channel `audio`, music & deterministic `Mixer`:**
+  - 100% safe-Rust `Mixer` (`S16Le`/`F32Le`, linear resampler, wavetable `sin` synth) with `Voice`, `Music`, and `Bus` handles (`MAX_VOICES = 64`, hard cap `256`, `MAX_MUSICS = 8`, `MAX_BUSES = 16` + master, `MAX_SOUND_BYTES = 64 MiB`);
+  - Core codecs `WAV`/`PCM`, `IMA ADPCM`, `A-law`, `u-law` (`FLAC`/`MP3`/`OGG` deferred to `0.21` opt-in outside `--deterministic`), deterministic `render_offline` WAV export, universal `NullSink`, Win32 `waveOut` via `CALLBACK_EVENT`, Linux `dlopen("libasound.so.2")`, and `--allow-audio` (preserving backward compatibility for legacy `audio.play`/`stop` under `--allow-read`).
+- **Stage 5 - Non-`.ask` maps, terrain, 3D file formats, lighting & post-FX (`0.22` bridge):**
+  - unified asset pipeline (`AssetRef::parse`, `AssetStore`, binary asset cache `ASKAS`) supporting non-`.ask` files directly;
+  - Tiled tilemaps (`.tmj`, `.tmx`, `.tsj`, `.tsx` orthogonal with `SolidGrid` collision), `terrain` heightmaps (`.r16`, 8/16-bit PNG, `height_at`, `normal_at`, Mode-7 projection), and `mesh` loaders for `.obj` + `.mtl` (PBR conversion in Core) and `.gltf` / `.glb` (Extension) producing shared `MeshData` + frozen PBR `Material`;
+  - `lighting` (half-res `RGBA16` light buffer, 16x16 tile culling, tile-DDA `cast_shadows`), `postfx` (bloom, LUT, vignette), `particles`, `procgen`, `nav`, and `scene.assemble` / `scene.draw` (depth-sorted billboards in `0.20`).
+- **Stage 6 - Cross-platform HAL, `askane bundle` & compile-time asset audit:**
+  - isolated `src/platform/dl.rs` loader (`LoadLibraryW` / `dlopen`), Linux raw X11 over `UnixStream` + `libssl.so.3` TLS IP pinning, and 4-job CI (`windows-latest`, `ubuntu-latest bare`, `ubuntu-backends`, `macos-latest`);
+  - single-binary `askane bundle` (`ASKANE-PAK` format with EOF SHA-256 trailer, in-RAM verification, and hermetic mode) plus compile-time literal asset-path checks in `askane check` / `askane permissions` (`E0501..E0506`, `W0501..W0505`).
+- **Stage 7 - Documentation sync, game starter & `askane lsp`:**
+  - centralized `REGISTRY` + per-module `FN_DOCS` with CI-enforced `docs_sync`, `askane init --template game` (<4 KiB const starter assets), `askane doctor` / `sys.backends()`, and `askane lsp` over stdio JSON-RPC (UTF-16 positions, diagnostics, completion, hover); dedicated `embed` syntax deferred past `0.20.0`.
 
 ---
 
@@ -123,10 +146,11 @@ This release focuses on strengthening the existing foundation before adding heav
 
 These items are tracked across future milestones as exploratory directions rather than committed release scope, and promote to `Planned` once prerequisites land:
 
-- **`0.21` - Fuzzing, Hardening & Release Discipline:**
-  - continuous benchmark suite tracking startup, VM throughput, and release binary size regressions;
-  - lexer/parser/compiler/verifier/VM fuzzing corpus guaranteeing zero Rust panics on malformed inputs;
+- **`0.21` - Rasterizer, Fuzzing, Hardening & Release Discipline:**
+  - software triangle rasterizer layered cleanly over the `0.20` `Surface`, `DepthBuffer`, and `MeshData`;
+  - fuzzed TTF font support (with hinting bytecode disabled) and opt-in compressed audio (`FLAC`/`MP3`/`OGG`) outside `--deterministic`;
+  - continuous benchmark suite tracking startup, VM throughput, and release binary size regressions, plus lexer/parser/compiler/verifier/VM fuzzing guaranteeing zero Rust panics on malformed inputs;
   - OS isolation hardening (Windows AppContainer / low-integrity worker, `http` DNS rebinding pinning, handle-based directory I/O), `CHANGELOG.md`, and release checksums.
-- **`0.22` - Experimental 3D & Native Acceleration:**
-  - experimental 3D camera, transforms, basic meshes, materials, and lighting layered cleanly over the portable graphics backend;
-  - baseline JIT / AOT exploration for hot numeric kernels while preserving Askane's zero-crate simplicity.
+- **`0.22` - Dedicated 3D Module (`gfx3d`) & Native Acceleration:**
+  - dedicated `gfx3d` module (perspective camera, meshes, PBR materials, IBL, lighting, shadows, and skeletal skinning) built directly on the frozen `0.20` contracts (`TypedBuffer`, `geom`, `MeshData`, `Material`, NDC `[0, 1]` depth);
+  - optional `ffi` module (`.dll`/`.so` gated behind `--allow-ffi`) and baseline JIT / AOT exploration for hot numeric kernels while preserving Askane's zero-crate simplicity.

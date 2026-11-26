@@ -11,15 +11,35 @@
   </p>
 
   <p>
+    <a href="https://github.com/askane-co/askane/releases/latest/download/askane.exe">
+      <img src="https://img.shields.io/badge/Download-askane.exe_(Win64)-2ea44f?style=for-the-badge&logo=windows" alt="Download askane.exe" />
+    </a>
     <a href="https://github.com/askane-co/askane/releases/latest">
-      <img src="https://img.shields.io/github/v/release/askane-co/askane?label=Release&color=26b8ec" alt="Release" />
+      <img src="https://img.shields.io/github/v/release/askane-co/askane?style=for-the-badge&label=Release&color=26b8ec" alt="Release" />
     </a>
-    &nbsp;&middot;&nbsp;
+    <a href="https://github.com/askane-co/askane/releases">
+      <img src="https://img.shields.io/github/downloads/askane-co/askane/total?style=for-the-badge&label=Downloads&color=6e7681" alt="Total Downloads" />
+    </a>
     <a href="https://github.com/askane-co/askane/actions/workflows/ci.yml">
-      <img src="https://github.com/askane-co/askane/actions/workflows/ci.yml/badge.svg" alt="CI" />
+      <img src="https://img.shields.io/github/actions/workflow/status/askane-co/askane/ci.yml?style=for-the-badge&label=CI" alt="CI" />
     </a>
+    <a href="LICENSE">
+      <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="MIT License" />
+    </a>
+  </p>
+
+  <p>
+    <a href="#quick-start">Quick Start</a>
+    &nbsp;&middot;&nbsp;
+    <a href="#repository-map">Repository Map</a>
+    &nbsp;&middot;&nbsp;
+    <a href="examples/README.md">Examples</a>
     &nbsp;&middot;&nbsp;
     <a href="docs/SYNTAX.md">Language Spec</a>
+    &nbsp;&middot;&nbsp;
+    <a href="#built-in-functions--modules">Stdlib (49)</a>
+    &nbsp;&middot;&nbsp;
+    <a href="bench/README.md">Benchmarks</a>
     &nbsp;&middot;&nbsp;
     <a href="SECURITY_AUDIT.md">Security Audit</a>
     &nbsp;&middot;&nbsp;
@@ -28,6 +48,47 @@
 </div>
 
 > **Transparency note**: This language and its runtime were designed and built in collaboration with **Gemini** and **ChatGPT** (AI-assisted development). Published as an open beta so anyone can inspect the VM, run benchmarks, test the sandbox, and suggest improvements.
+
+## Quick Start
+
+**Fastest way (Windows, no Rust required):**
+
+1. [Download `askane.exe` (4.4 MB single binary)](https://github.com/askane-co/askane/releases/latest/download/askane.exe) from the [latest release](https://github.com/askane-co/askane/releases/latest).
+2. Launch the **Askane Studio v2** GUI editor, open the REPL, or associate `.ask` files for 1-click launch:
+
+```powershell
+# Launch Askane Studio v2 GUI editor
+.\askane.exe --gui
+
+# Optional: add askane to PATH and register .ask double-click file association
+.\askane.exe setup
+
+# Start interactive REPL (:gui inside REPL also opens Studio)
+.\askane.exe
+```
+
+**Build & run from source (requires Rust `cargo`):**
+
+```bash
+cargo build --release
+cargo run -- examples/hello.ask
+./target/release/askane run examples/neon_dodge
+./target/release/askane -b examples/pipeline.ask
+```
+
+## Repository Map
+
+Everything in the repository is organized for one-click browsing:
+
+| Path | What You Will Find | Open |
+| --- | --- | --- |
+| `examples/` | Runnable scripts, `pong.ask`, `neon_dodge/` 2D game, procedural PNG generator | [Browse examples](examples/README.md) |
+| `docs/` | Full language specification ([`SYNTAX.md`](docs/SYNTAX.md)) & visual assets | [Browse docs](docs/README.md) |
+| `src/` | Compiler, bytecode VM, Studio v2 GUI, and 49 zero-crate stdlib modules | [Codebase tour](src/README.md) |
+| `bench/` | 5-suite benchmark comparing Askane VM against Python and Node.js | [Benchmark suite](bench/README.md) |
+| `ROADMAP.md` | Released history and detailed `0.20.0` (media, maps, 3D files, VM speedup) -> `0.22.0` (`gfx3d`) plan | [View roadmap](ROADMAP.md) |
+| `SECURITY_AUDIT.md` | Sandbox threat model, capability flags, and security findings | [Read audit](SECURITY_AUDIT.md) |
+| `LICENSE` | MIT License (`askane-co`) | [Read license](LICENSE) |
 
 ## Highlights
 
@@ -40,42 +101,10 @@
 
 Askane runs as a classic 4-stage pipeline in a single standalone binary:
 
-1. **Lexer** (`src/lexer.rs`): scans `.ask` source code into tokens with line/column spans.
-2. **Parser** (`src/parser.rs`): builds an AST (`src/ast.rs`). Blocks, `if`/`else`, and `match` are expressions, and `|>` desugars `x |> f(a)` into `f(x, a)`.
-3. **Bytecode Compiler** (`src/compiler.rs`, `src/bytecode.rs`): compiles the AST into stack-VM opcodes, resolving local variable slots, lexical closures (upvalues), loops, and `match` jumps.
-4. **Stack VM & Modules** (`src/vm.rs`, `src/value.rs`, `src/modules/`): executes verified bytecode (with optional `.askc` content-hashed caching in `__askcache__/`) on a value stack with built-in functions and 49 standard modules (`math`, `fs`, `sys`, `json`, cross-platform headless `gfx`, plus Windows-native Win32 `gfx`, `http`, `ui`, and `mem`).
-
-## Build & Run
-
-Requires Rust (`cargo`).
-
-```bash
-cargo build --release
-```
-
-Run a script:
-
-```bash
-cargo run -- examples/hello.ask
-```
-
-Or using the compiled binary:
-
-```bash
-./target/release/askane examples/pipeline.ask
-```
-
-Inspect compiled bytecode:
-
-```bash
-./target/release/askane -b examples/pipeline.ask
-```
-
-Start the interactive REPL:
-
-```bash
-./target/release/askane
-```
+1. **Lexer** ([`src/lexer.rs`](src/lexer.rs)): scans `.ask` source code into tokens with line/column spans.
+2. **Parser** ([`src/parser.rs`](src/parser.rs)): builds an AST ([`src/ast.rs`](src/ast.rs)). Blocks, `if`/`else`, and `match` are expressions, and `|>` desugars `x |> f(a)` into `f(x, a)`.
+3. **Bytecode Compiler** ([`src/compiler.rs`](src/compiler.rs), [`src/bytecode.rs`](src/bytecode.rs)): compiles the AST into stack-VM opcodes, resolving local variable slots, lexical closures (upvalues), loops, and `match` jumps.
+4. **Stack VM & Modules** ([`src/vm.rs`](src/vm.rs), [`src/value.rs`](src/value.rs), [`src/modules/`](src/modules/mod.rs)): executes verified bytecode (with optional `.askc` content-hashed caching in `__askcache__/`) on a value stack with built-in functions and 49 standard modules (`math`, `fs`, `sys`, `json`, cross-platform headless `gfx`, plus Windows-native Win32 `gfx`, `http`, `ui`, and `mem`).
 
 ## Quick Syntax Overview
 
@@ -122,65 +151,77 @@ spec "player mana stays non-negative" {
 }
 ```
 
+> Want more? Check out [`examples/pong.ask`](examples/pong.ask), [`examples/neon_dodge/`](examples/neon_dodge/main.ask), [`examples/logo_gen.ask`](examples/logo_gen.ask), or the full [`Language Spec`](docs/SYNTAX.md).
+
 ## Built-in Functions & Modules
 
-Global functions:
-- I/O: `print(...)`, `println(...)`, `read_line()`
-- Collections & Strings: `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `unique(list)`, `flatten(list)`, `chunk(list, size)`, `sum(seq)`, `has(dict, key)`, `first(seq)`, `last(seq)`, `is_empty(seq)`
-- Higher-order & Sequences: `map(seq, fn)`, `filter(seq, fn)`, `reduce(seq, init, fn)`, `enumerate(seq)`, `zip(a, b)`, `take(seq, n)`, `skip(seq, n)`, `any(seq, fn)`, `all(seq, fn)`, `find(seq, fn)`, `find_index(seq, pred)`, `count(seq, pred)`, `partition(seq, pred)`, `flat_map(seq, fn)`, `take_while(seq, pred)`, `drop_while(seq, pred)`, `zip_longest(a, b, [fill])`, `min_by(seq, key_fn)`, `max_by(seq, key_fn)`
-- Conversions, Arithmetic & Types: `str(x)`, `repr(x)`, `int(x)`, `try_int(x)`, `float(x)`, `try_float(x)`, `type_of(x)`, `is_same(a, b)`, `is_unit(x)`, `is_int(x)`, `is_float(x)`, `is_bool(x)`, `is_str(x)`, `is_bytes(x)`, `is_list(x)`, `is_dict(x)`, `is_set(x)`, `is_fn(x)`, `checked_add(a, b)`, `checked_sub(a, b)`, `checked_mul(a, b)`, `wrapping_add(a, b)`, `wrapping_sub(a, b)`, `wrapping_mul(a, b)`, `clock()`
+<details>
+<summary><strong>Global built-in functions (I/O, collections, types, checked arithmetic)</strong></summary>
 
-Built-in standard modules (`import <name>;`):
-- `math`: `pi`, `e`, `sqrt`, `abs`, `pow`, `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`, `clamp`, `lerp`, `dist`, `atan2`
-- `strings`: `split`, `trim`, `trim_start`, `trim_end`, `replace`, `contains`, `starts_with`, `ends_with`, `upper`, `lower`, `find`, `repeat`, `lines`, `pad_start`, `pad_end`, `slice`, `join`, `byte_len`, `eq_ignore_case`, `contains_ignore_case`, `strip_prefix`, `strip_suffix`, `split_once`, `rsplit_once`, `truncate_utf8`
-- `path`: `join`, `parent`, `name`, `stem`, `extension`, `is_absolute`, `normalize`
-- `time`: `now_ms`, `now_sec`, `elapsed_ms`, `sleep_ms`
-- `random`: `seed`, `int`, `float`, `bool`, `choice`, `shuffle`, `crypto_int`, `crypto_bytes`
-- `base64`: `encode`, `decode`, `encode_url`, `decode_url`
-- `csv`: `parse`, `parse_dicts`, `stringify`
-- `bytes` (and `b"..."` / `br"..."` literals): `from_hex`, `to_hex`, `from_str`, `to_str`, `concat`, `slice`, `fill`
-- `toml`: `parse`, `stringify`
-- `binary`: `pack`, `unpack`, `read_u16_le`/`be`, `read_u32_le`/`be`, `read_i32_le`/`be`, `read_i64_le`/`be`, `read_f32_le`/`be`, `read_f64_le`/`be`, `write_*`
-- `collections`: `deque`, `counter`, `priority_queue`, `groupby`, `window`, `first`, `last`, `is_empty`, `find_index`, `count`, `partition`, `flat_map`, `take_while`, `drop_while`, `zip_longest`, `min_by`, `max_by`
-- `compress`: `deflate`, `inflate`, `zlib_compress`, `zlib_decompress`, `gzip_compress`, `gzip_decompress`, `crc32`, `adler32`
-- `archive`: `pack`, `create`, `list`, `read_entry`, `extract` (with Zip Slip and size guards)
-- `os`: `platform`, `arch`, `family`, `cpu_count`, `pid`, `sep`, `line_ending`, `cwd`, `home_dir`, `temp_dir`, `env`, `args`
-- `cli`: `parse`, `has_flag`
-- `diff`: `lines`, `format`, `values`
-- `pprint`: `format`, `print`
-- `html`: `parse`, `select`, `text`, `escape`, `unescape`
-- `xml`: `parse`, `select`, `text`, `escape`, `unescape`
-- `log`: `set_level`, `json`, `format`, `debug`, `info`, `warn`, `error` (supports structured dict fields and secret redaction)
-- `test`: `assert`, `assert_eq`, `assert_ne`, `assert_err`, `assert_snapshot`
-- `crypto`: `hmac_sha256`, `hmac_sha256_hex`, `constant_time_eq`, `random_key`, `random_bytes`, `seal`, `open` (ChaCha20-Poly1305 AEAD)
-- `kv`: `open`, `get`, `set`, `delete`, `has`, `keys`, `prefix`, `batch`, `compact`, `len`, `close` (append-log KV store, sandbox-checked)
-- `net`: `tcp_listen`, `tcp_accept`, `tcp_connect`, `send`, `recv`, `udp_bind`, `udp_send_to`, `udp_recv_from`, `local_addr`, `peer_addr`, `close` (requires `--allow-net`)
-- `ws`: `listen`, `accept`, `connect`, `send`, `send_bytes`, `recv`, `local_addr`, `close` (RFC 6455 WebSocket, requires `--allow-net`)
-- `task` & `channel`: cooperative green tasks (`spawn`, `yield_now`, `sleep`, `join`, `is_done`, `select`, `timeout`) and bounded channels (`bounded`, `send`, `try_send`, `recv`, `try_recv`, `close`, `len`)
-- `signal` (and `on change(sig) { ... }`): reactive state cells (`new`, `get`, `set`, `update`, `watch`, `unwatch`, `unwatch_all`)
-- `hash`: `sha256`, `crc32`, `fnv1a`
-- `ini`: `parse`, `stringify`
-- `datetime`: `utc_now`, `from_timestamp`, `format`, `parse_iso`
-- `clipboard` (Windows): `get_text`, `set_text` (requires `--allow-clipboard` or `--unsafe`)
-- `input`: `vk_code`, `key_name`, plus global `key_down`, `key_pressed`, `hotkey`, `mouse_down`, `mouse_pos` (requires `--allow-input` or `--unsafe`)
-- `ui` (2D Declarative GUI): `window`, `is_open`, `close`, `render`, `events`, `layout`, `column`, `row`, `label`, `button`, `text_input`, `checkbox`, `slider`, `select`, `spacer`, `theme`, `color`, `hex`, `rgb`, `state`, `set_state`
-- `audio` (Windows): `play(wav_path)`, `stop()` (sandbox-checked)
-- `url`: `parse`, `encode`, `decode`, `query_parse`, `query_stringify`
-- `hex`: `encode`, `decode`
-- `uuid`: `v4`
-- `term`: `red`, `green`, `yellow`, `cyan`, `bold`, `clear`
-- `glob`: `match(pattern, text)`
-- `regex`: `is_match`, `find`, `find_all`, `replace` (step-bounded against ReDoS)
-- `dialog` (Windows): `info`, `confirm`, `open_file`, `save_file`
-- `process`: `run(cmd, [args])` (requires `--allow-exec[=cmd]` or `--unsafe`)
-- `fs`: `read`, `write`, `append`, `exists`, `remove`, `remove_dir`, `list_dir`, `walk`, `mkdir`, `is_dir`, `read_bytes`, `write_bytes`, `read_lines`, `write_lines`, `open_lines`, `open_writer`, `write_stream`, `temp_file`, `copy`, `copy_dir`, `move`, `size`, `glob`
-- `gfx` (Windows 2D & cross-platform headless): `window`, `headless`, `is_open`, `clear`, `rect`, `rect_alpha`, `rect_outline`, `circle`, `circle_alpha`, `circle_outline`, `line`, `pixel`, `text`, `width`, `height`, `load_image` (BMP & PNG with alpha), `draw_image`, `draw_image_keyed`, `draw_sprite_frame`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `key_pressed`, `mouse_x`, `mouse_y`, `mouse_down`, `mouse_pressed`, `close`
-- `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`, `budget`
-- `json`: `parse`, `stringify`
-- `http` (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
-- `mem` (Windows): `current_pid`, `find_pid` (returns `unit` if not found), `open`, `close`, `module_base` (returns `unit` if not found), `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
+- **I/O:** `print(...)`, `println(...)`, `read_line()`
+- **Collections & Strings:** `len(x)`, `push(list, val)`, `pop(list)`, `range(end)` / `range(start, end)`, `keys(dict)`, `values(dict)`, `entries(dict)`, `get(dict, key, [default])`, `remove(collection, key_or_idx)`, `sort(list)`, `reverse(list_or_str)`, `unique(list)`, `flatten(list)`, `chunk(list, size)`, `sum(seq)`, `has(dict, key)`, `first(seq)`, `last(seq)`, `is_empty(seq)`
+- **Higher-order & Sequences:** `map(seq, fn)`, `filter(seq, fn)`, `reduce(seq, init, fn)`, `enumerate(seq)`, `zip(a, b)`, `take(seq, n)`, `skip(seq, n)`, `any(seq, fn)`, `all(seq, fn)`, `find(seq, fn)`, `find_index(seq, pred)`, `count(seq, pred)`, `partition(seq, pred)`, `flat_map(seq, fn)`, `take_while(seq, pred)`, `drop_while(seq, pred)`, `zip_longest(a, b, [fill])`, `min_by(seq, key_fn)`, `max_by(seq, key_fn)`
+- **Conversions, Arithmetic & Types:** `str(x)`, `repr(x)`, `int(x)`, `try_int(x)`, `float(x)`, `try_float(x)`, `type_of(x)`, `is_same(a, b)`, `is_unit(x)`, `is_int(x)`, `is_float(x)`, `is_bool(x)`, `is_str(x)`, `is_bytes(x)`, `is_list(x)`, `is_dict(x)`, `is_set(x)`, `is_fn(x)`, `checked_add(a, b)`, `checked_sub(a, b)`, `checked_mul(a, b)`, `wrapping_add(a, b)`, `wrapping_sub(a, b)`, `wrapping_mul(a, b)`, `clock()`
 
-CLI tools:
+</details>
+
+<details>
+<summary><strong>All 49 standard library modules (<code>import &lt;name&gt;;</code> — click any module to view Rust source)</strong></summary>
+
+- [`math`](src/modules/math.rs): `pi`, `e`, `sqrt`, `abs`, `pow`, `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`, `clamp`, `lerp`, `dist`, `atan2`
+- [`strings`](src/modules/strings.rs): `split`, `trim`, `trim_start`, `trim_end`, `replace`, `contains`, `starts_with`, `ends_with`, `upper`, `lower`, `find`, `repeat`, `lines`, `pad_start`, `pad_end`, `slice`, `join`, `byte_len`, `eq_ignore_case`, `contains_ignore_case`, `strip_prefix`, `strip_suffix`, `split_once`, `rsplit_once`, `truncate_utf8`
+- [`path`](src/modules/path.rs): `join`, `parent`, `name`, `stem`, `extension`, `is_absolute`, `normalize`
+- [`time`](src/modules/time.rs): `now_ms`, `now_sec`, `elapsed_ms`, `sleep_ms`
+- [`random`](src/modules/random.rs): `seed`, `int`, `float`, `bool`, `choice`, `shuffle`, `crypto_int`, `crypto_bytes`
+- [`base64`](src/modules/base64.rs): `encode`, `decode`, `encode_url`, `decode_url`
+- [`csv`](src/modules/csv.rs): `parse`, `parse_dicts`, `stringify`
+- [`bytes`](src/modules/bytes.rs) (and `b"..."` / `br"..."` literals): `from_hex`, `to_hex`, `from_str`, `to_str`, `concat`, `slice`, `fill`
+- [`toml`](src/modules/toml.rs): `parse`, `stringify`
+- [`binary`](src/modules/binary.rs): `pack`, `unpack`, `read_u16_le`/`be`, `read_u32_le`/`be`, `read_i32_le`/`be`, `read_i64_le`/`be`, `read_f32_le`/`be`, `read_f64_le`/`be`, `write_*`
+- [`collections`](src/modules/collections.rs): `deque`, `counter`, `priority_queue`, `groupby`, `window`, `first`, `last`, `is_empty`, `find_index`, `count`, `partition`, `flat_map`, `take_while`, `drop_while`, `zip_longest`, `min_by`, `max_by`
+- [`compress`](src/modules/compress.rs): `deflate`, `inflate`, `zlib_compress`, `zlib_decompress`, `gzip_compress`, `gzip_decompress`, `crc32`, `adler32`
+- [`archive`](src/modules/archive.rs): `pack`, `create`, `list`, `read_entry`, `extract` (with Zip Slip and size guards)
+- [`os`](src/modules/os.rs): `platform`, `arch`, `family`, `cpu_count`, `pid`, `sep`, `line_ending`, `cwd`, `home_dir`, `temp_dir`, `env`, `args`
+- [`cli`](src/modules/cli.rs): `parse`, `has_flag`
+- [`diff`](src/modules/diff.rs): `lines`, `format`, `values`
+- [`pprint`](src/modules/pprint.rs): `format`, `print`
+- [`html`](src/modules/html.rs): `parse`, `select`, `text`, `escape`, `unescape`
+- [`xml`](src/modules/xml.rs): `parse`, `select`, `text`, `escape`, `unescape`
+- [`log`](src/modules/log.rs): `set_level`, `json`, `format`, `debug`, `info`, `warn`, `error` (supports structured dict fields and secret redaction)
+- [`test`](src/modules/test.rs): `assert`, `assert_eq`, `assert_ne`, `assert_err`, `assert_snapshot`
+- [`crypto`](src/modules/crypto.rs): `hmac_sha256`, `hmac_sha256_hex`, `constant_time_eq`, `random_key`, `random_bytes`, `seal`, `open` (ChaCha20-Poly1305 AEAD)
+- [`kv`](src/modules/kv.rs): `open`, `get`, `set`, `delete`, `has`, `keys`, `prefix`, `batch`, `compact`, `len`, `close` (append-log KV store, sandbox-checked)
+- [`net`](src/modules/net.rs): `tcp_listen`, `tcp_accept`, `tcp_connect`, `send`, `recv`, `udp_bind`, `udp_send_to`, `udp_recv_from`, `local_addr`, `peer_addr`, `close` (requires `--allow-net`)
+- [`ws`](src/modules/ws.rs): `listen`, `accept`, `connect`, `send`, `send_bytes`, `recv`, `local_addr`, `close` (RFC 6455 WebSocket, requires `--allow-net`)
+- [`task`](src/modules/task.rs) & [`channel`](src/modules/task.rs): cooperative green tasks (`spawn`, `yield_now`, `sleep`, `join`, `is_done`, `select`, `timeout`) and bounded channels (`bounded`, `send`, `try_send`, `recv`, `try_recv`, `close`, `len`)
+- [`signal`](src/modules/signal.rs) (and `on change(sig) { ... }`): reactive state cells (`new`, `get`, `set`, `update`, `watch`, `unwatch`, `unwatch_all`)
+- [`hash`](src/modules/hash.rs): `sha256`, `crc32`, `fnv1a`
+- [`ini`](src/modules/ini.rs): `parse`, `stringify`
+- [`datetime`](src/modules/datetime.rs): `utc_now`, `from_timestamp`, `format`, `parse_iso`
+- [`clipboard`](src/modules/clipboard.rs) (Windows): `get_text`, `set_text` (requires `--allow-clipboard` or `--unsafe`)
+- [`input`](src/modules/input.rs): `vk_code`, `key_name`, plus global `key_down`, `key_pressed`, `hotkey`, `mouse_down`, `mouse_pos` (requires `--allow-input` or `--unsafe`)
+- [`ui`](src/modules/ui.rs) (2D Declarative GUI): `window`, `is_open`, `close`, `render`, `events`, `layout`, `column`, `row`, `label`, `button`, `text_input`, `checkbox`, `slider`, `select`, `spacer`, `theme`, `color`, `hex`, `rgb`, `state`, `set_state`
+- [`audio`](src/modules/audio.rs) (Windows): `play(wav_path)`, `stop()` (sandbox-checked)
+- [`url`](src/modules/url.rs): `parse`, `encode`, `decode`, `query_parse`, `query_stringify`
+- [`hex`](src/modules/hex.rs): `encode`, `decode`
+- [`uuid`](src/modules/uuid.rs): `v4`
+- [`term`](src/modules/term.rs): `red`, `green`, `yellow`, `cyan`, `bold`, `clear`
+- [`glob`](src/modules/glob.rs): `match(pattern, text)`
+- [`regex`](src/modules/regex.rs): `is_match`, `find`, `find_all`, `replace` (step-bounded against ReDoS)
+- [`dialog`](src/modules/dialog.rs) (Windows): `info`, `confirm`, `open_file`, `save_file`
+- [`process`](src/modules/process.rs): `run(cmd, [args])` (requires `--allow-exec[=cmd]` or `--unsafe`)
+- [`fs`](src/modules/fs.rs): `read`, `write`, `append`, `exists`, `remove`, `remove_dir`, `list_dir`, `walk`, `mkdir`, `is_dir`, `read_bytes`, `write_bytes`, `read_lines`, `write_lines`, `open_lines`, `open_writer`, `write_stream`, `temp_file`, `copy`, `copy_dir`, `move`, `size`, `glob`
+- [`gfx`](src/modules/gfx.rs) (Windows 2D & cross-platform headless): `window`, `headless`, `is_open`, `clear`, `rect`, `rect_alpha`, `rect_outline`, `circle`, `circle_alpha`, `circle_outline`, `line`, `pixel`, `text`, `width`, `height`, `load_image` (BMP & PNG with alpha), `draw_image`, `draw_image_keyed`, `draw_sprite_frame`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `key_pressed`, `mouse_x`, `mouse_y`, `mouse_down`, `mouse_pressed`, `close`
+- [`sys`](src/modules/sys.rs): `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`, `budget`
+- [`json`](src/modules/json.rs): `parse`, `stringify`
+- [`http`](src/modules/http.rs) (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
+- [`mem`](src/modules/mem.rs) (Windows): `current_pid`, `find_pid` (returns `unit` if not found), `open`, `close`, `module_base` (returns `unit` if not found), `read_i32`, `read_i64`, `read_f32`, `read_f64`, `read_bytes`, `write_i32`, `write_i64`, `write_f32`, `write_f64`
+
+</details>
+
+<details>
+<summary><strong>CLI commands reference (<code>askane --help</code>)</strong></summary>
+
 - `askane` — multiline REPL (supports `:help`, `:gui`, `:exit`, `:reset`, `:modules`, `:bc`)
 - `askane -e "<code>"` — evaluate inline Askane code (pass script args after `--`)
 - `askane --gui [file.ask]` — Askane Studio v2 GUI editor & runner (Windows, project explorer, tabs, line numbers, find/replace, Fmt/Test, permission toggles, Setup modal, Job Object isolation)
@@ -195,12 +236,11 @@ CLI tools:
 - `askane setup [--status|--all|--default=run|studio|--uninstall]`: add Askane to User PATH and register `.ask` file associations (Windows)
 - `askane test [--deterministic] [--update-snapshots] [--filter=<pattern>] [--no-cache] <file_or_dir>`: run `.ask` test files in isolated VMs
 
+</details>
+
 ## Security model
 
-By default filesystem paths are checked against the script directory. Network access,
-`sys.env`, `sys.args`, `sys.exit`, and `mem` are blocked. The VM has a 10-million
-instruction budget per top-level run; source files are limited to 4 MiB and `fs.read`
-to 32 MiB. Graphics scripts exceeding the budget need trusted mode for now.
+By default filesystem paths are checked against the script directory. Network access, `sys.env`, `sys.args`, `sys.exit`, and `mem` are blocked. The VM has a 10-million instruction budget per top-level run; source files are limited to 4 MiB and `fs.read` to 32 MiB. Graphics scripts exceeding the budget need `--max-steps` or trusted mode (`neon_dodge` configures its limits in [`askane.toml`](examples/neon_dodge/askane.toml)).
 
 Granular permission flags are supported in addition to `--unsafe`:
 - `--allow-net[=host[:port],...]`: allow HTTPS requests (all hosts or specific allowlist)
@@ -213,22 +253,17 @@ Granular permission flags are supported in addition to `--unsafe`:
 - `--allow-input`: allow global `input.key_down()`, `hotkey()`, `mouse_down()`, `mouse_pos()`
 - `--allow-exec[=cmd,...]`: allow `process.run()` for specific executables or any command
 
-`askane --unsafe script.ask` enables unrestricted files, HTTPS network requests and
-system functions. Memory access additionally requires `ASKANE_ENABLE_UNSAFE_MEM=1`.
-HTTPS requests verify certificates using WinHTTP, disable automatic redirects and
-ambient Windows authentication, and use per-operation timeouts. HTTP errors omit URLs
-to avoid leaking query-string credentials. The API example requires `--unsafe`.
+`askane --unsafe script.ask` enables unrestricted files, HTTPS network requests and system functions. Memory access additionally requires `ASKANE_ENABLE_UNSAFE_MEM=1`. HTTPS requests verify certificates using WinHTTP, disable automatic redirects and ambient Windows authentication, and use per-operation timeouts. HTTP errors omit URLs to avoid leaking query-string credentials. The API example requires `--allow-net=httpbin.org` or `--unsafe`.
 
-This is an in-process policy, **not an OS security boundary**: filesystem checks are
-not atomic with opening files, hard links are not isolated, memory is not fully metered,
-and graphics/console I/O remain available. Run hostile scripts in an OS-isolated
-environment without sensitive files. HTTPS is encryption, not anonymity: a contacted
-server can see your public IP address. See [SECURITY_AUDIT.md](SECURITY_AUDIT.md)
-for findings and [ROADMAP.md](ROADMAP.md) for proposed next releases.
+This is an in-process policy, **not an OS security boundary**: filesystem checks are not atomic with opening files, hard links are not isolated, memory is not fully metered, and graphics/console I/O remain available. Run hostile scripts in an OS-isolated environment without sensitive files. HTTPS is encryption, not anonymity: a contacted server can see your public IP address. See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for findings and [ROADMAP.md](ROADMAP.md) for proposed next releases.
 
 ## Roadmap
 
-![Askane Roadmap](docs/roadmap.jpg)
+<a href="ROADMAP.md">
+  <img src="docs/roadmap.jpg" alt="Askane Roadmap" />
+</a>
+
+Click [ROADMAP.md](ROADMAP.md) for the full milestone breakdown (`v0.20.0` media, maps, terrain, `.obj`/`.gltf` 3D assets, VM speedup & LSP -> `v0.22.0` `gfx3d`).
 
 ## Mascot
 
@@ -236,4 +271,4 @@ Askane's official mascot is a **Plecostomus** (**Pleco**), a humble little armor
 
 ## License
 
-MIT
+[MIT](LICENSE)
