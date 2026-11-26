@@ -3,7 +3,7 @@
 
   <h1>
     <img src="docs/logo.png" alt="Askane Logo" width="38" height="38" align="absmiddle" />
-    &nbsp;Askane (v0.18.0 Open Beta)
+    &nbsp;Askane (v0.19.0 Open Beta)
   </h1>
 
   <p>
@@ -34,7 +34,7 @@
 - **Single standalone binary**: lexer, AST parser, bytecode compiler, register/stack fast VM (`execute_fast`), and a rich standard library in pure Rust with zero Cargo dependencies.
 - **Expression-first syntax**: `{ ... }` blocks, `if`/`else`, `match`, pipelines (`|>`, `|?>`, `|*>`, `|>=`, `_`), inline `recover`, tagged templates (`log"..."`, `sql"..."`), `struct`, `set`, `bytes`, and built-in `spec` tests.
 - **Sandbox & contracts**: default-deny permissions for network, filesystem outside root, env, args, clipboard, global input, and process execution, plus `needs` declarations and `sandbox { ... }` privilege attenuation.
-- **Built-in tooling**: multiline REPL, `askane check [--diagnostic-format=json]`, `askane --explain E0401`, `askane info`, `askane doctor`, `askane modules`, `askane clean`, `askane fmt`, `askane test [--deterministic] [--update-snapshots]`, `askane permissions`, `askane init`, `askane setup`, benchmark suite (`bench/`), and Windows Askane Studio v2 (`--gui`) with project explorer, tabs, search/replace, line numbers, and permissions toggles.
+- **Built-in tooling**: multiline REPL, `.askc` bytecode cache (`--no-cache`, cleaned via `askane clean`), `askane check [--diagnostic-format=json]`, `askane --explain E0401`, `askane info`, `askane doctor`, `askane modules`, `askane clean`, `askane fmt [--check] [--diff] [--stdin]`, `askane test [--deterministic] [--update-snapshots] [--filter=<pattern>]`, `askane permissions`, `askane init`, `askane setup`, benchmark suite (`bench/`), and Windows Askane Studio v2 (`--gui`) with project explorer, tabs, search/replace, line numbers, and permissions toggles.
 
 ## How It Works Under the Hood
 
@@ -43,7 +43,7 @@ Askane runs as a classic 4-stage pipeline in a single standalone binary:
 1. **Lexer** (`src/lexer.rs`): scans `.ask` source code into tokens with line/column spans.
 2. **Parser** (`src/parser.rs`): builds an AST (`src/ast.rs`). Blocks, `if`/`else`, and `match` are expressions, and `|>` desugars `x |> f(a)` into `f(x, a)`.
 3. **Bytecode Compiler** (`src/compiler.rs`, `src/bytecode.rs`): compiles the AST into stack-VM opcodes, resolving local variable slots, lexical closures (upvalues), loops, and `match` jumps.
-4. **Stack VM & Modules** (`src/vm.rs`, `src/value.rs`, `src/modules/`): executes bytecode on a value stack with built-in functions and standard modules (`math`, `fs`, `sys`, `json`, plus Windows-native `http`, `gfx`, and `mem` using system Win32 DLLs).
+4. **Stack VM & Modules** (`src/vm.rs`, `src/value.rs`, `src/modules/`): executes verified bytecode (with optional `.askc` content-hashed caching in `__askcache__/`) on a value stack with built-in functions and 49 standard modules (`math`, `fs`, `sys`, `json`, cross-platform headless `gfx`, plus Windows-native Win32 `gfx`, `http`, `ui`, and `mem`).
 
 ## Build & Run
 
@@ -173,8 +173,8 @@ Built-in standard modules (`import <name>;`):
 - `regex`: `is_match`, `find`, `find_all`, `replace` (step-bounded against ReDoS)
 - `dialog` (Windows): `info`, `confirm`, `open_file`, `save_file`
 - `process`: `run(cmd, [args])` (requires `--allow-exec[=cmd]` or `--unsafe`)
-- `fs`: `read`, `write`, `append`, `exists`, `remove`, `list_dir`, `mkdir`, `is_dir`, `read_bytes`, `write_bytes`, `copy`, `move`, `size`, `glob`
-- `gfx` (Windows 2D): `window`, `is_open`, `clear`, `rect`, `rect_alpha`, `rect_outline`, `circle`, `circle_alpha`, `circle_outline`, `line`, `pixel`, `text`, `width`, `height`, `load_image` (BMP & PNG with alpha), `draw_image`, `draw_image_keyed`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `key_pressed`, `mouse_x`, `mouse_y`, `mouse_down`, `close`
+- `fs`: `read`, `write`, `append`, `exists`, `remove`, `remove_dir`, `list_dir`, `walk`, `mkdir`, `is_dir`, `read_bytes`, `write_bytes`, `read_lines`, `write_lines`, `open_lines`, `open_writer`, `write_stream`, `temp_file`, `copy`, `copy_dir`, `move`, `size`, `glob`
+- `gfx` (Windows 2D & cross-platform headless): `window`, `headless`, `is_open`, `clear`, `rect`, `rect_alpha`, `rect_outline`, `circle`, `circle_alpha`, `circle_outline`, `line`, `pixel`, `text`, `width`, `height`, `load_image` (BMP & PNG with alpha), `draw_image`, `draw_image_keyed`, `draw_sprite_frame`, `image_width`, `image_height`, `set_title`, `delta`, `present`, `key_down`, `key_pressed`, `mouse_x`, `mouse_y`, `mouse_down`, `mouse_pressed`, `close`
 - `sys`: `args`, `env` (requires `--allow-env` or `--unsafe`), `exit`, `os`, `arch`, `sleep`, `budget`
 - `json`: `parse`, `stringify`
 - `http` (Windows): `get(url, [headers])`, `post(url, body, [content_type_or_headers])`
@@ -188,12 +188,12 @@ CLI tools:
 - `askane --explain <E...|W...>` — explain diagnostic error or warning code
 - `askane info` / `askane doctor` — print runtime summary or run environment diagnostics
 - `askane modules [--json]` — list all 49 built-in standard library modules
-- `askane clean [--dry-run] [--snapshots] [dir]` — clean bytecode/temp artifacts
-- `askane fmt [--check] <file.ask>` — format Askane source code
+- `askane clean [--dry-run] [--snapshots] [dir]` — clean `.askc` bytecode caches (`__askcache__/`) and temp artifacts
+- `askane fmt [--check] [--diff] [--stdin] <file_or_dir>` — format Askane source code (reads `[fmt] indent` from `askane.toml`)
 - `askane permissions <file.ask>` — inspect static & dynamic capabilities imported by a script
 - `askane init [--name <name>] [dir]`: create a starter Askane project (`askane.toml`, `main.ask`, `tests/basic_test.ask`)
 - `askane setup [--status|--all|--default=run|studio|--uninstall]`: add Askane to User PATH and register `.ask` file associations (Windows)
-- `askane test [--deterministic] [--update-snapshots] <file_or_dir>`: run `.ask` test files in isolated VMs
+- `askane test [--deterministic] [--update-snapshots] [--filter=<pattern>] [--no-cache] <file_or_dir>`: run `.ask` test files in isolated VMs
 
 ## Security model
 

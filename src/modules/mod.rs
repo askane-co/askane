@@ -15,7 +15,7 @@ pub(crate) mod diff;
 mod fs;
 pub(crate) mod gfx;
 mod glob;
-mod hash;
+pub(crate) mod hash;
 mod hex;
 mod html;
 mod http;
@@ -82,6 +82,7 @@ pub fn build_module(
 }
 
 pub fn reset_runtime_state() {
+    fs::reset_state();
     gfx::reset_state();
     input::reset_state();
     ui::reset_state();
@@ -152,7 +153,7 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
         "fs" => (
             "io",
             "all",
-            "Sandboxed filesystem I/O (read, write, read_bytes, write_bytes, copy, move, glob)",
+            "Sandboxed filesystem & streaming I/O (read_lines, walk, copy_dir, open_lines, write_stream)",
         ),
         "sys" => (
             "runtime",
@@ -176,8 +177,8 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
         ),
         "gfx" => (
             "gui",
-            "windows",
-            "Win32 2D framebuffer window with RGBA sprites, alpha shapes, input & text",
+            "all",
+            "2D framebuffer graphics (Win32 window & headless mode, sprite sheets, shapes, input & text)",
         ),
         "strings" => (
             "stdlib",

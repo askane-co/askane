@@ -18,8 +18,8 @@ Release roadmap for Askane, separated into completed milestones, immediate fixes
 | `0.16.0 - 0.16.2` | **Done** | 2D Desktop UI (`ui`), signature pipelines (`|?>`, `|*>`, `recover`), `needs`/`sandbox`, `with`/`defer`, security fixes, embedded icon & `askane setup` |
 | `0.17.0 - 0.17.1` | **Done** | Askane Studio v2 + Setup UI, `crypto`, `kv`, `net`, `ws`, cooperative `task`/`channel`, `--deterministic`, snapshots, reactive `signal` & `on change` |
 | `0.18.0` | **Done** | Diagnostics (`E...`/`W...`, `--explain`, `--diagnostic-format=json`, `did you mean`, recovery, lints), semantics/helpers, `gfx` alpha/`key_pressed`, CLI `info`/`doctor`/`modules`/`clean` |
-| `0.19.0` | **Planned** | Bytecode cache (`.askc`), streaming `fs` (`read_lines`/`walk`/`temp_file`/`copy_dir`), `fmt --diff`/`--stdin`, `test --filter`, `gfx` layers & sprite animation |
-| `0.20.0 - 0.22.0` | **Exploratory** | VM speedup (60-80+ bench score), Linux/macOS backends (`http`, `gfx`/`ui`, `clipboard`), `askane lsp` & VS Code, `askane bundle`, fuzzing corpus, AppContainer/DNS pinning, 3D & baseline JIT |
+| `0.19.0` | **Done** | Bytecode cache (`.askc` / `--no-cache`), streaming & directory `fs` (`read_lines`/`open_lines`/`write_stream`/`walk`/`copy_dir`/`temp_file`), `fmt --diff`/`--stdin` + `[fmt] indent`, `test --filter`, `gfx` sprite sheets, `mouse_pressed`, normalized `delta` & cross-platform `headless` |
+| `0.20.0 - 0.22.0` | **Planned / Exploratory** | VM speedup (60-80+ bench score), Linux/macOS backends (`http`, `gfx`/`ui`, `clipboard`), `askane lsp` & VS Code, `askane bundle`, fuzzing corpus, AppContainer/DNS pinning, 3D & baseline JIT |
 
 ---
 
@@ -103,29 +103,26 @@ This release focuses on strengthening the existing foundation before adding heav
 
 ---
 
-## Next Milestone: `0.19.0` (`Planned`)
-
-1. **Bytecode cache (`.askc`)**:
-   - content-hashed and schema-versioned `.askc` module cache under project/temp boundaries with mandatory `verify_proto` validation on load;
-   - seamless invalidation when source files or compiler version change, controllable via `askane clean`.
-2. **Streaming & directory filesystem helpers (`fs`)**:
-   - size- and line-bounded `fs.read_lines`, streaming text/byte writers, and `fs.temp_file` with safe automatic cleanup;
-   - `fs.walk` (explicit symlink policy, depth/entry limits), `fs.copy_dir`, and explicit `fs.remove_dir` separation.
-3. **Formatter, test ergonomics & 2D game helpers**:
-   - `askane fmt --diff` and `askane fmt --stdin` backed by project `[fmt]` settings in `askane.toml` and golden corpus tests;
-   - `askane test --filter <pattern>` for focused test runs;
-   - `gfx` 2D layers, sprite-sheet frame helpers, normalized `delta`, and headless frame-step testing for game loops.
+### `0.19.0` - Bytecode Cache, Streaming I/O, Formatter Tooling & Headless 2D Gfx [Done]
+- **Bytecode cache (`bytecode.rs`, `vm.rs`, `main.rs`, `.gitignore`):** content-hashed (`SHA-256`) and schema/version-checked `.askc` cache under `__askcache__/`, mandatory `verify_proto` check on load, sandbox write/symlink guards, `--no-cache` CLI flag, and `askane clean` cleanup.
+- **Streaming & directory `fs` (`fs.rs`, `mod.rs`):** line/byte-bounded `fs.read_lines` & `fs.write_lines`, RAII handles `fs.open_lines` (`next`/`close`) and `fs.open_writer`/`fs.write_stream` (`write`/`write_line`/`flush`/`close`) integrated with `with` and VM teardown, `fs.temp_file`, bounded symlink-safe `fs.walk`, `fs.copy_dir`, and `fs.remove_dir`.
+- **Formatter, config & test ergonomics (`main.rs`, `diff.rs`):** `askane fmt --diff` unified diff preview, `askane fmt --stdin` pipe formatting, project `[fmt] indent = 1..=8` in `askane.toml`, and `askane test --filter=<pattern>` filtering test files and individual `spec "..."` blocks.
+- **`gfx` 2D helpers & cross-platform headless mode (`gfx.rs`, `mod.rs`):** `gfx.draw_sprite_frame` for scaled sprite sheets, per-frame edge-triggered `gfx.mouse_pressed`, normalized/clamped `gfx.delta()`, and cross-platform framebuffer `gfx.headless(enabled, [w], [h])` for automated rendering tests on Windows and Linux CI.
 
 ---
 
-## Long-Term Ideas (`0.20 - 0.22`, `Exploratory`)
+## Next Milestone: `0.20.0` (`Planned`)
+
+- **VM speed optimization (target 60-80+ on `bench/`):** drop `last_ip` writes from non-throwing hot opcodes, expand specialized superinstructions / register-local fast paths, reduce `Value` cloning and `Rc` traffic in calls, closures and `json` / `dict` loops, and optimize loop & arithmetic dispatch without breaking sandbox guarantees.
+- **Cross-platform OS backends:** portable Linux and macOS backends for `http` (TLS), `gfx`/`ui`, and `clipboard` without changing `.ask` user code.
+- **IDE & packaging foundations:** built-in `askane lsp` server over JSON diagnostics, VS Code syntax/extension, shell completions (PowerShell/Bash/Zsh), and single-binary `askane bundle`.
+
+---
+
+## Long-Term Ideas (`0.21 - 0.22`, `Exploratory`)
 
 These items are tracked across future milestones as exploratory directions rather than committed release scope, and promote to `Planned` once prerequisites land:
 
-- **`0.20` - VM Performance, Cross-Platform Backends & IDE Integration:**
-  - **VM speed optimization (target 60-80+ on `bench/`):** drop `last_ip` writes from non-throwing hot opcodes, expand specialized superinstructions / register-local fast paths, reduce `Value` cloning and `Rc` traffic in calls, closures and `json` / `dict` loops, and optimize loop & arithmetic dispatch without breaking sandbox guarantees;
-  - portable Linux and macOS backends for `http` (TLS), `gfx`/`ui`, and `clipboard` without changing `.ask` user code;
-  - built-in `askane lsp` server over JSON diagnostics, VS Code syntax/extension, shell completions (PowerShell/Bash/Zsh), and single-binary `askane bundle`.
 - **`0.21` - Fuzzing, Hardening & Release Discipline:**
   - continuous benchmark suite tracking startup, VM throughput, and release binary size regressions;
   - lexer/parser/compiler/verifier/VM fuzzing corpus guaranteeing zero Rust panics on malformed inputs;

@@ -3,8 +3,7 @@ use crate::value::Value;
 use crate::vm::VM;
 
 pub fn reset_state() {
-    #[cfg(windows)]
-    win32_gfx::close_window();
+    gfx_state::close_window(true);
 }
 
 pub fn module() -> Value {
@@ -12,6 +11,7 @@ pub fn module() -> Value {
         "gfx",
         &[
             ("window", gfx_window),
+            ("headless", gfx_headless),
             ("is_open", gfx_is_open),
             ("clear", gfx_clear),
             ("rect", gfx_rect),
@@ -28,6 +28,7 @@ pub fn module() -> Value {
             ("load_image", gfx_load_image),
             ("draw_image", gfx_draw_image),
             ("draw_image_keyed", gfx_draw_image_keyed),
+            ("draw_sprite_frame", gfx_draw_sprite_frame),
             ("image_width", gfx_image_width),
             ("image_height", gfx_image_height),
             ("set_title", gfx_set_title),
@@ -38,10 +39,180 @@ pub fn module() -> Value {
             ("mouse_x", gfx_mouse_x),
             ("mouse_y", gfx_mouse_y),
             ("mouse_down", gfx_mouse_down),
+            ("mouse_pressed", gfx_mouse_pressed),
             ("close", gfx_close),
         ],
         &[],
     )
+}
+
+mod gfx_state {
+    use std::cell::RefCell;
+
+    #[allow(dead_code)]
+    pub struct TextDraw {
+        pub x: i32,
+        pub y: i32,
+        pub text: Vec<u16>,
+        pub color_bgr: u32,
+    }
+
+    pub struct BmpImage {
+        pub width: i32,
+        pub height: i32,
+        pub pixels: Vec<u32>,
+        pub has_alpha: bool,
+    }
+
+    pub struct FrameState {
+        pub width: i32,
+        pub height: i32,
+        pub buffer: Vec<u32>,
+        pub texts: Vec<TextDraw>,
+        pub open: bool,
+        pub headless: bool,
+    }
+
+    thread_local! {
+        pub static FRAME: RefCell<Option<FrameState>> = const { RefCell::new(None) };
+        pub static IMAGES: RefCell<Vec<BmpImage>> = const { RefCell::new(Vec::new()) };
+        pub static LAST_FRAME: RefCell<Option<std::time::Instant>> = const { RefCell::new(None) };
+        pub static PREV_KEYS: RefCell<[bool; 256]> = const { RefCell::new([false; 256]) };
+        pub static HEADLESS_ENABLED: RefCell<bool> = const { RefCell::new(false) };
+    }
+
+    pub fn is_headless_enabled() -> bool {
+        HEADLESS_ENABLED.with(|h| *h.borrow())
+    }
+
+    pub fn set_headless_enabled(v: bool) {
+        HEADLESS_ENABLED.with(|h| *h.borrow_mut() = v);
+    }
+
+    pub fn open_headless(width: i32, height: i32) {
+        close_window(false);
+        let buffer = vec![0u32; (width * height) as usize];
+        FRAME.with(|f| {
+            *f.borrow_mut() = Some(FrameState {
+                width,
+                height,
+                buffer,
+                texts: Vec::new(),
+                open: true,
+                headless: true,
+            });
+        });
+    }
+
+    pub fn close_window(reset_headless: bool) {
+        FRAME.with(|f| {
+            *f.borrow_mut() = None;
+        });
+        #[cfg(windows)]
+        super::win32_gfx::destroy_native_window();
+        IMAGES.with(|imgs| imgs.borrow_mut().clear());
+        LAST_FRAME.with(|lf| *lf.borrow_mut() = None);
+        PREV_KEYS.with(|pk| *pk.borrow_mut() = [false; 256]);
+        if reset_headless {
+            HEADLESS_ENABLED.with(|h| *h.borrow_mut() = false);
+        }
+    }
+
+    pub fn is_frame_headless() -> Option<bool> {
+        FRAME.with(|f| f.borrow().as_ref().map(|s| s.headless))
+    }
+
+    #[cfg(test)]
+    pub fn peek_pixel(x: i32, y: i32) -> Option<u32> {
+        FRAME.with(|f| {
+            let borrow = f.borrow();
+            let s = borrow.as_ref()?;
+            if x < 0 || y < 0 || x >= s.width || y >= s.height {
+                return None;
+            }
+            Some(s.buffer[(y * s.width + x) as usize])
+        })
+    }
+
+    #[cfg(test)]
+    pub fn text_count() -> usize {
+        FRAME.with(|f| f.borrow().as_ref().map_or(0, |s| s.texts.len()))
+    }
+
+    pub fn parse_bmp_safe(data: &[u8]) -> Result<BmpImage, String> {
+        if data.len() < 54 || &data[0..2] != b"BM" {
+            return Err("gfx.load_image(): invalid BMP header".to_string());
+        }
+        let offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+        let dib_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
+        if dib_size < 40 {
+            return Err("gfx.load_image(): unsupported BMP DIB header".to_string());
+        }
+        let width = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+        let raw_height = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+        let bpp = u16::from_le_bytes([data[28], data[29]]);
+        let compression = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
+        if compression != 0 || (bpp != 24 && bpp != 32) {
+            return Err(
+                "gfx.load_image(): only uncompressed 24-bit or 32-bit BMP is supported".to_string(),
+            );
+        }
+        if width <= 0 || width > 4096 || raw_height == 0 || raw_height.unsigned_abs() > 4096 {
+            return Err("gfx.load_image(): BMP dimensions out of 1..=4096 bounds".to_string());
+        }
+        let height = raw_height.abs();
+        let top_down = raw_height < 0;
+        let bytes_per_pixel = (bpp / 8) as usize;
+        let row_bytes = (width as usize)
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(|| "BMP row overflow".to_string())?;
+        let stride = (row_bytes + 3) & !3;
+        let needed = offset
+            .checked_add(
+                stride
+                    .checked_mul(height as usize)
+                    .ok_or_else(|| "BMP size overflow".to_string())?,
+            )
+            .ok_or_else(|| "BMP offset overflow".to_string())?;
+        if needed > data.len() {
+            return Err("gfx.load_image(): truncated BMP pixel data".to_string());
+        }
+        let pixel_count = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or_else(|| "BMP pixel count overflow".to_string())?;
+        let mut pixels = vec![0u32; pixel_count];
+        for y in 0..height as usize {
+            let src_y = if top_down {
+                y
+            } else {
+                (height as usize - 1) - y
+            };
+            let row_start = offset + src_y * stride;
+            for x in 0..width as usize {
+                let p = row_start + x * bytes_per_pixel;
+                let b = data[p] as u32;
+                let g = data[p + 1] as u32;
+                let r = data[p + 2] as u32;
+                pixels[y * width as usize + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+        Ok(BmpImage {
+            width,
+            height,
+            pixels,
+            has_alpha: false,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_peek_pixel(x: i32, y: i32) -> Option<u32> {
+    gfx_state::peek_pixel(x, y)
+}
+
+#[cfg(test)]
+pub(crate) fn test_text_count() -> usize {
+    gfx_state::text_count()
 }
 
 #[cfg(windows)]
@@ -211,27 +382,11 @@ mod win32_gfx {
         fn TextOutW(hdc: Hdc, x: i32, y: i32, lpString: *const u16, c: i32) -> i32;
     }
 
-    pub struct TextDraw {
-        pub x: i32,
-        pub y: i32,
-        pub text: Vec<u16>,
-        pub color_bgr: u32,
-    }
-
-    pub struct WindowState {
-        pub hwnd: Hwnd,
-        pub width: i32,
-        pub height: i32,
-        pub buffer: Vec<u32>,
-        pub texts: Vec<TextDraw>,
-        pub open: bool,
-    }
-
     thread_local! {
-        pub static WINDOW: RefCell<Option<WindowState>> = const { RefCell::new(None) };
+        pub static WIN32_HWND: RefCell<Hwnd> = const { RefCell::new(std::ptr::null_mut()) };
     }
 
-    unsafe fn paint_state_to_hdc(state: &WindowState, hdc: Hdc) {
+    unsafe fn paint_state_to_hdc(state: &super::gfx_state::FrameState, hdc: Hdc) {
         let bmi = BitmapInfo {
             bmi_header: BitmapInfoHeader {
                 bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
@@ -284,26 +439,37 @@ mod win32_gfx {
                     let mut ps: PaintStruct = std::mem::zeroed();
                     let hdc = BeginPaint(hwnd, &mut ps);
                     if !hdc.is_null() {
-                        WINDOW.with(|w| {
-                            if let Some(state) = w.borrow().as_ref() {
-                                if state.hwnd == hwnd {
-                                    paint_state_to_hdc(state, hdc);
+                        let matches = WIN32_HWND.with(|h| *h.borrow() == hwnd);
+                        if matches {
+                            super::gfx_state::FRAME.with(|w| {
+                                if let Ok(borrow) = w.try_borrow() {
+                                    if let Some(state) = borrow.as_ref() {
+                                        if !state.headless {
+                                            paint_state_to_hdc(state, hdc);
+                                        }
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
                     EndPaint(hwnd, &ps);
                 }
                 0
             }
             WM_CLOSE | WM_DESTROY => {
-                WINDOW.with(|w| {
-                    if let Some(state) = w.borrow_mut().as_mut() {
-                        if state.hwnd == hwnd {
-                            state.open = false;
+                let matches = WIN32_HWND.with(|h| *h.borrow() == hwnd);
+                if matches {
+                    super::gfx_state::FRAME.with(|w| {
+                        if let Ok(mut borrow) = w.try_borrow_mut() {
+                            if let Some(state) = borrow.as_mut() {
+                                state.open = false;
+                            }
                         }
+                    });
+                    if msg == WM_DESTROY {
+                        WIN32_HWND.with(|h| *h.borrow_mut() = std::ptr::null_mut());
                     }
-                });
+                }
                 if msg == WM_CLOSE {
                     unsafe {
                         DestroyWindow(hwnd);
@@ -321,7 +487,7 @@ mod win32_gfx {
     }
 
     pub fn create_window(title: &str, width: i32, height: i32) -> Result<(), String> {
-        close_window();
+        super::gfx_state::close_window(false);
 
         let class_name = to_wide("AskaneGfxWindow");
         let title_w = to_wide(title);
@@ -372,34 +538,32 @@ mod win32_gfx {
             }
 
             let buffer = vec![0u32; (width * height) as usize];
-            WINDOW.with(|w| {
-                *w.borrow_mut() = Some(WindowState {
-                    hwnd,
+            WIN32_HWND.with(|h| *h.borrow_mut() = hwnd);
+            super::gfx_state::FRAME.with(|w| {
+                *w.borrow_mut() = Some(super::gfx_state::FrameState {
                     width,
                     height,
                     buffer,
                     texts: Vec::new(),
                     open: true,
+                    headless: false,
                 });
             });
         }
         Ok(())
     }
 
-    pub fn close_window() {
-        WINDOW.with(|w| {
-            let state = w.borrow_mut().take();
-            if let Some(state) = state {
-                if !state.hwnd.is_null() && state.open {
-                    unsafe {
-                        DestroyWindow(state.hwnd);
-                    }
-                }
-            }
+    pub fn destroy_native_window() {
+        let hwnd = WIN32_HWND.with(|h| {
+            let old = *h.borrow();
+            *h.borrow_mut() = std::ptr::null_mut();
+            old
         });
-        IMAGES.with(|imgs| imgs.borrow_mut().clear());
-        LAST_FRAME.with(|lf| *lf.borrow_mut() = None);
-        PREV_KEYS.with(|pk| *pk.borrow_mut() = [false; 256]);
+        if !hwnd.is_null() {
+            unsafe {
+                DestroyWindow(hwnd);
+            }
+        }
     }
 
     pub fn pump_events() -> bool {
@@ -410,27 +574,28 @@ mod win32_gfx {
                 DispatchMessageW(&msg);
             }
         }
-        WINDOW.with(|w| w.borrow().as_ref().is_some_and(|s| s.open))
+        super::gfx_state::FRAME.with(|w| w.borrow().as_ref().is_some_and(|s| s.open))
     }
 
-    pub fn present() -> Result<(), String> {
-        WINDOW.with(|w| {
+    pub fn present_native() -> Result<(), String> {
+        let hwnd = WIN32_HWND.with(|h| *h.borrow());
+        super::gfx_state::FRAME.with(|w| {
             let borrow = w.borrow();
             let state = borrow
                 .as_ref()
                 .ok_or_else(|| "No active gfx window".to_string())?;
-            if !state.open {
+            if !state.open || hwnd.is_null() {
                 return Ok(());
             }
             unsafe {
-                let hdc = GetDC(state.hwnd);
+                let hdc = GetDC(hwnd);
                 if !hdc.is_null() {
                     paint_state_to_hdc(state, hdc);
-                    ReleaseDC(state.hwnd, hdc);
+                    ReleaseDC(hwnd, hdc);
                 }
             }
-            let focused = unsafe { GetForegroundWindow() == state.hwnd };
-            PREV_KEYS.with(|pk| {
+            let focused = unsafe { GetForegroundWindow() == hwnd };
+            super::gfx_state::PREV_KEYS.with(|pk| {
                 let mut arr = pk.borrow_mut();
                 if !focused {
                     *arr = [false; 256];
@@ -445,29 +610,27 @@ mod win32_gfx {
     }
 
     pub fn mouse_pos() -> Result<(i32, i32), String> {
-        WINDOW.with(|w| {
-            let borrow = w.borrow();
-            let state = borrow
-                .as_ref()
-                .ok_or_else(|| "No active gfx window".to_string())?;
-            let mut pt = Point { x: 0, y: 0 };
-            unsafe {
-                GetCursorPos(&mut pt);
-                ScreenToClient(state.hwnd, &mut pt);
-            }
-            Ok((pt.x, pt.y))
-        })
-    }
-
-    pub fn has_window() -> bool {
-        WINDOW.with(|w| w.borrow().is_some())
+        let hwnd = WIN32_HWND.with(|h| *h.borrow());
+        if hwnd.is_null() {
+            return Err("No active gfx window".to_string());
+        }
+        let mut pt = Point { x: 0, y: 0 };
+        unsafe {
+            GetCursorPos(&mut pt);
+            ScreenToClient(hwnd, &mut pt);
+        }
+        Ok((pt.x, pt.y))
     }
 
     pub fn key_down(vk: i32) -> bool {
-        let focused = WINDOW.with(|w| {
+        let hwnd = WIN32_HWND.with(|h| *h.borrow());
+        if hwnd.is_null() {
+            return false;
+        }
+        let focused = super::gfx_state::FRAME.with(|w| {
             w.borrow()
                 .as_ref()
-                .is_some_and(|s| s.open && unsafe { GetForegroundWindow() == s.hwnd })
+                .is_some_and(|s| s.open && !s.headless && unsafe { GetForegroundWindow() == hwnd })
         });
         if !focused {
             return false;
@@ -479,103 +642,22 @@ mod win32_gfx {
         if !(1..=254).contains(&vk) {
             return false;
         }
-        key_down(vk) && !PREV_KEYS.with(|pk| pk.borrow()[vk as usize])
-    }
-
-    pub struct BmpImage {
-        pub width: i32,
-        pub height: i32,
-        pub pixels: Vec<u32>,
-        pub has_alpha: bool,
-    }
-
-    thread_local! {
-        pub static IMAGES: RefCell<Vec<BmpImage>> = const { RefCell::new(Vec::new()) };
-        pub static LAST_FRAME: RefCell<Option<std::time::Instant>> = const { RefCell::new(None) };
-        pub static PREV_KEYS: RefCell<[bool; 256]> = const { RefCell::new([false; 256]) };
-    }
-
-    pub fn parse_bmp_safe(data: &[u8]) -> Result<BmpImage, String> {
-        if data.len() < 54 || &data[0..2] != b"BM" {
-            return Err("gfx.load_image(): invalid BMP header".to_string());
-        }
-        let offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
-        let dib_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
-        if dib_size < 40 {
-            return Err("gfx.load_image(): unsupported BMP DIB header".to_string());
-        }
-        let width = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
-        let raw_height = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
-        let bpp = u16::from_le_bytes([data[28], data[29]]);
-        let compression = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
-        if compression != 0 || (bpp != 24 && bpp != 32) {
-            return Err(
-                "gfx.load_image(): only uncompressed 24-bit or 32-bit BMP is supported".to_string(),
-            );
-        }
-        if width <= 0 || width > 4096 || raw_height == 0 || raw_height.unsigned_abs() > 4096 {
-            return Err("gfx.load_image(): BMP dimensions out of 1..=4096 bounds".to_string());
-        }
-        let height = raw_height.abs();
-        let top_down = raw_height < 0;
-        let bytes_per_pixel = (bpp / 8) as usize;
-        let row_bytes = (width as usize)
-            .checked_mul(bytes_per_pixel)
-            .ok_or_else(|| "BMP row overflow".to_string())?;
-        let stride = (row_bytes + 3) & !3;
-        let needed = offset
-            .checked_add(
-                stride
-                    .checked_mul(height as usize)
-                    .ok_or_else(|| "BMP size overflow".to_string())?,
-            )
-            .ok_or_else(|| "BMP offset overflow".to_string())?;
-        if needed > data.len() {
-            return Err("gfx.load_image(): truncated BMP pixel data".to_string());
-        }
-        let pixel_count = (width as usize)
-            .checked_mul(height as usize)
-            .ok_or_else(|| "BMP pixel count overflow".to_string())?;
-        let mut pixels = vec![0u32; pixel_count];
-        for y in 0..height as usize {
-            let src_y = if top_down {
-                y
-            } else {
-                (height as usize - 1) - y
-            };
-            let row_start = offset + src_y * stride;
-            for x in 0..width as usize {
-                let p = row_start + x * bytes_per_pixel;
-                let b = data[p] as u32;
-                let g = data[p + 1] as u32;
-                let r = data[p + 2] as u32;
-                pixels[y * width as usize + x] = (r << 16) | (g << 8) | b;
-            }
-        }
-        Ok(BmpImage {
-            width,
-            height,
-            pixels,
-            has_alpha: false,
-        })
+        key_down(vk) && !super::gfx_state::PREV_KEYS.with(|pk| pk.borrow()[vk as usize])
     }
 
     pub fn set_window_title(title: &str) -> Result<(), String> {
-        WINDOW.with(|w| {
-            let borrow = w.borrow();
-            let state = borrow
-                .as_ref()
-                .ok_or_else(|| "No active gfx window".to_string())?;
-            let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe {
-                SetWindowTextW(state.hwnd, wide.as_ptr());
-            }
-            Ok(())
-        })
+        let hwnd = WIN32_HWND.with(|h| *h.borrow());
+        if hwnd.is_null() {
+            return Err("No active gfx window".to_string());
+        }
+        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            SetWindowTextW(hwnd, wide.as_ptr());
+        }
+        Ok(())
     }
 }
 
-#[cfg(windows)]
 fn rgb(r: i64, g: i64, b: i64) -> u32 {
     let r = r.clamp(0, 255) as u32;
     let g = g.clamp(0, 255) as u32;
@@ -583,7 +665,6 @@ fn rgb(r: i64, g: i64, b: i64) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-#[cfg(windows)]
 fn as_int(v: &Value, fn_name: &str) -> Result<i64, String> {
     match v {
         Value::Int(i) if (-32767..=32767).contains(i) => Ok(*i),
@@ -600,7 +681,49 @@ fn as_int(v: &Value, fn_name: &str) -> Result<i64, String> {
     }
 }
 
-#[cfg(windows)]
+fn gfx_headless(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 && args.len() != 3 {
+        return Err(
+            "gfx.headless() expects 1 argument (enabled) or 3 arguments (enabled, width, height)"
+                .to_string(),
+        );
+    }
+    let enabled = match &args[0] {
+        Value::Bool(b) => *b,
+        other => {
+            return Err(format!(
+                "gfx.headless() expects boolean enabled flag, got '{}'",
+                other.type_name()
+            ));
+        }
+    };
+    if !enabled {
+        gfx_state::set_headless_enabled(false);
+        if gfx_state::is_frame_headless() == Some(true) {
+            gfx_state::close_window(true);
+        }
+        return Ok(Value::Unit);
+    }
+    let (w, h) = if args.len() == 3 {
+        let w = as_int(&args[1], "headless")?;
+        let h = as_int(&args[2], "headless")?;
+        if !(1..=4096).contains(&w) || !(1..=4096).contains(&h) {
+            return Err("gfx.headless() width and height must be between 1 and 4096".to_string());
+        }
+        (w as i32, h as i32)
+    } else {
+        (640, 480)
+    };
+    vm.charge_alloc(
+        (w as usize)
+            .saturating_mul(h as usize)
+            .saturating_mul(std::mem::size_of::<u32>()),
+    )?;
+    gfx_state::set_headless_enabled(true);
+    gfx_state::open_headless(w, h);
+    Ok(Value::Unit)
+}
+
 fn gfx_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err("gfx.window() expects 3 arguments (title, width, height)".to_string());
@@ -624,19 +747,45 @@ fn gfx_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .saturating_mul(h as usize)
             .saturating_mul(std::mem::size_of::<u32>()),
     )?;
-    win32_gfx::create_window(title, w as i32, h as i32)?;
-    Ok(Value::Unit)
+    if gfx_state::is_headless_enabled() {
+        let _ = title;
+        gfx_state::open_headless(w as i32, h as i32);
+        return Ok(Value::Unit);
+    }
+    #[cfg(windows)]
+    {
+        win32_gfx::create_window(title, w as i32, h as i32)?;
+        Ok(Value::Unit)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        Err("gfx.window() requires Windows or gfx.headless(true)".to_string())
+    }
 }
 
-#[cfg(windows)]
 fn gfx_is_open(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.is_open() expects 0 arguments".to_string());
     }
-    Ok(Value::Bool(win32_gfx::pump_events()))
+    match gfx_state::is_frame_headless() {
+        Some(true) => Ok(Value::Bool(
+            gfx_state::FRAME.with(|f| f.borrow().as_ref().is_some_and(|s| s.open)),
+        )),
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                Ok(Value::Bool(win32_gfx::pump_events()))
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(Value::Bool(false))
+            }
+        }
+        None => Ok(Value::Bool(false)),
+    }
 }
 
-#[cfg(windows)]
 fn gfx_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err("gfx.clear() expects 3 arguments (r, g, b)".to_string());
@@ -646,7 +795,7 @@ fn gfx_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[1], "clear")?,
         as_int(&args[2], "clear")?,
     );
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -657,7 +806,6 @@ fn gfx_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_pixel(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 5 {
         return Err("gfx.pixel() expects 5 arguments (x, y, r, g, b)".to_string());
@@ -669,7 +817,7 @@ fn gfx_pixel(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[3], "pixel")?,
         as_int(&args[4], "pixel")?,
     );
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -682,7 +830,6 @@ fn gfx_pixel(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn rect_fill_impl(
     x: i32,
     y: i32,
@@ -691,7 +838,7 @@ fn rect_fill_impl(
     color: u32,
     alpha: Option<u32>,
 ) -> Result<(), String> {
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -724,7 +871,6 @@ fn rect_fill_impl(
     })
 }
 
-#[cfg(windows)]
 fn gfx_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 7 {
         return Err("gfx.rect() expects 7 arguments (x, y, w, h, r, g, b)".to_string());
@@ -742,7 +888,6 @@ fn gfx_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-#[cfg(windows)]
 fn gfx_rect_alpha(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 8 {
         return Err("gfx.rect_alpha() expects 8 arguments (x, y, w, h, r, g, b, a)".to_string());
@@ -761,7 +906,6 @@ fn gfx_rect_alpha(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-#[cfg(windows)]
 fn circle_fill_impl(
     cx: i32,
     cy: i32,
@@ -769,7 +913,7 @@ fn circle_fill_impl(
     color: u32,
     alpha: Option<u32>,
 ) -> Result<(), String> {
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -812,7 +956,6 @@ fn circle_fill_impl(
     })
 }
 
-#[cfg(windows)]
 fn gfx_circle(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 6 {
         return Err("gfx.circle() expects 6 arguments (cx, cy, radius, r, g, b)".to_string());
@@ -829,7 +972,6 @@ fn gfx_circle(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-#[cfg(windows)]
 fn gfx_circle_alpha(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 7 {
         return Err(
@@ -849,12 +991,11 @@ fn gfx_circle_alpha(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-#[cfg(windows)]
 fn gfx_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.width() expects 0 arguments".to_string());
     }
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let borrow = w.borrow();
         let state = borrow
             .as_ref()
@@ -863,12 +1004,11 @@ fn gfx_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.height() expects 0 arguments".to_string());
     }
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let borrow = w.borrow();
         let state = borrow
             .as_ref()
@@ -877,7 +1017,6 @@ fn gfx_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_line(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 7 {
         return Err("gfx.line() expects 7 arguments (x1, y1, x2, y2, r, g, b)".to_string());
@@ -891,7 +1030,7 @@ fn gfx_line(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[5], "line")?,
         as_int(&args[6], "line")?,
     );
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -922,16 +1061,30 @@ fn gfx_line(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_present(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.present() expects 0 arguments".to_string());
     }
-    win32_gfx::present()?;
-    Ok(Value::Unit)
+    match gfx_state::is_frame_headless() {
+        Some(true) => {
+            gfx_state::PREV_KEYS.with(|pk| *pk.borrow_mut() = [false; 256]);
+            Ok(Value::Unit)
+        }
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                win32_gfx::present_native()?;
+                Ok(Value::Unit)
+            }
+            #[cfg(not(windows))]
+            {
+                Err("No active gfx window".to_string())
+            }
+        }
+        None => Err("No active gfx window".to_string()),
+    }
 }
 
-#[cfg(windows)]
 fn parse_vk_name(arg: &Value, ctx: &str) -> Result<i32, String> {
     let name = match arg {
         Value::Str(s) => s.to_uppercase(),
@@ -967,31 +1120,56 @@ fn parse_vk_name(arg: &Value, ctx: &str) -> Result<i32, String> {
     }
 }
 
-#[cfg(windows)]
 fn gfx_key_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("gfx.key_down() expects 1 argument (key_name)".to_string());
     }
     let vk = parse_vk_name(&args[0], "key_down")?;
-    if !win32_gfx::has_window() {
-        return Err("No active gfx window".to_string());
+    match gfx_state::is_frame_headless() {
+        Some(true) => {
+            let _ = vk;
+            Ok(Value::Bool(false))
+        }
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                Ok(Value::Bool(win32_gfx::key_down(vk)))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = vk;
+                Ok(Value::Bool(false))
+            }
+        }
+        None => Err("No active gfx window".to_string()),
     }
-    Ok(Value::Bool(win32_gfx::key_down(vk)))
 }
 
-#[cfg(windows)]
 fn gfx_key_pressed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("gfx.key_pressed() expects 1 argument (key_name)".to_string());
     }
     let vk = parse_vk_name(&args[0], "key_pressed")?;
-    if !win32_gfx::has_window() {
-        return Err("No active gfx window".to_string());
+    match gfx_state::is_frame_headless() {
+        Some(true) => {
+            let _ = vk;
+            Ok(Value::Bool(false))
+        }
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                Ok(Value::Bool(win32_gfx::key_pressed(vk)))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = vk;
+                Ok(Value::Bool(false))
+            }
+        }
+        None => Err("No active gfx window".to_string()),
     }
-    Ok(Value::Bool(win32_gfx::key_pressed(vk)))
 }
 
-#[cfg(windows)]
 fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 6 {
         return Err("gfx.text() expects 6 arguments (x, y, text, r, g, b)".to_string());
@@ -1006,7 +1184,7 @@ fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let g = as_int(&args[4], "text")?.clamp(0, 255) as u32;
     let b = as_int(&args[5], "text")?.clamp(0, 255) as u32;
     let color_bgr = (b << 16) | (g << 8) | r;
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -1014,7 +1192,7 @@ fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         if state.texts.len() >= 4096 {
             return Err("gfx.text(): maximum per-frame text count (4096) exceeded".to_string());
         }
-        state.texts.push(win32_gfx::TextDraw {
+        state.texts.push(gfx_state::TextDraw {
             x,
             y,
             text,
@@ -1024,62 +1202,130 @@ fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_mouse_x(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.mouse_x() expects 0 arguments".to_string());
     }
-    let (x, _) = win32_gfx::mouse_pos()?;
-    Ok(Value::Int(x as i64))
+    match gfx_state::is_frame_headless() {
+        Some(true) => Ok(Value::Int(0)),
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                let (x, _) = win32_gfx::mouse_pos()?;
+                Ok(Value::Int(x as i64))
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(Value::Int(0))
+            }
+        }
+        None => Err("No active gfx window".to_string()),
+    }
 }
 
-#[cfg(windows)]
 fn gfx_mouse_y(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.mouse_y() expects 0 arguments".to_string());
     }
-    let (_, y) = win32_gfx::mouse_pos()?;
-    Ok(Value::Int(y as i64))
+    match gfx_state::is_frame_headless() {
+        Some(true) => Ok(Value::Int(0)),
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                let (_, y) = win32_gfx::mouse_pos()?;
+                Ok(Value::Int(y as i64))
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(Value::Int(0))
+            }
+        }
+        None => Err("No active gfx window".to_string()),
+    }
 }
 
-#[cfg(windows)]
+fn parse_mouse_vk(arg: &Value, fn_name: &str) -> Result<i32, String> {
+    let btn = match arg {
+        Value::Str(s) => s.to_lowercase(),
+        other => {
+            return Err(format!(
+                "gfx.{}() expects string button name, got '{}'",
+                fn_name,
+                other.type_name()
+            ));
+        }
+    };
+    match btn.as_str() {
+        "left" => Ok(0x01),
+        "right" => Ok(0x02),
+        "middle" => Ok(0x04),
+        _ => Err(format!("Unknown mouse button '{}'", btn)),
+    }
+}
+
 fn gfx_mouse_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(
             "gfx.mouse_down() expects 1 argument (\"left\" | \"right\" | \"middle\")".to_string(),
         );
     }
-    let btn = match &args[0] {
-        Value::Str(s) => s.to_lowercase(),
-        other => {
-            return Err(format!(
-                "gfx.mouse_down() expects string button name, got '{}'",
-                other.type_name()
-            ));
+    let vk = parse_mouse_vk(&args[0], "mouse_down")?;
+    match gfx_state::is_frame_headless() {
+        Some(true) => {
+            let _ = vk;
+            Ok(Value::Bool(false))
         }
-    };
-    let vk = match btn.as_str() {
-        "left" => 0x01,
-        "right" => 0x02,
-        "middle" => 0x04,
-        _ => return Err(format!("Unknown mouse button '{}'", btn)),
-    };
-    if !win32_gfx::has_window() {
-        return Err("No active gfx window".to_string());
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                Ok(Value::Bool(win32_gfx::key_down(vk)))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = vk;
+                Ok(Value::Bool(false))
+            }
+        }
+        None => Err("No active gfx window".to_string()),
     }
-    Ok(Value::Bool(win32_gfx::key_down(vk)))
 }
 
-#[cfg(windows)]
+fn gfx_mouse_pressed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(
+            "gfx.mouse_pressed() expects 1 argument (\"left\" | \"right\" | \"middle\")"
+                .to_string(),
+        );
+    }
+    let vk = parse_mouse_vk(&args[0], "mouse_pressed")?;
+    match gfx_state::is_frame_headless() {
+        Some(true) => {
+            let _ = vk;
+            Ok(Value::Bool(false))
+        }
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                Ok(Value::Bool(win32_gfx::key_pressed(vk)))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = vk;
+                Ok(Value::Bool(false))
+            }
+        }
+        None => Err("No active gfx window".to_string()),
+    }
+}
+
 fn gfx_close(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.close() expects 0 arguments".to_string());
     }
-    win32_gfx::close_window();
+    gfx_state::close_window(false);
     Ok(Value::Unit)
 }
 
-#[cfg(windows)]
 fn gfx_rect_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 7 {
         return Err("gfx.rect_outline() expects 7 arguments (x, y, w, h, r, g, b)".to_string());
@@ -1093,7 +1339,7 @@ fn gfx_rect_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[5], "rect_outline")?,
         as_int(&args[6], "rect_outline")?,
     );
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -1121,7 +1367,6 @@ fn gfx_rect_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_circle_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 6 {
         return Err(
@@ -1136,7 +1381,7 @@ fn gfx_circle_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[4], "circle_outline")?,
         as_int(&args[5], "circle_outline")?,
     );
-    win32_gfx::WINDOW.with(|w| {
+    gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
             .as_mut()
@@ -1171,7 +1416,6 @@ fn gfx_circle_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     use std::io::Read;
     if args.len() != 1 {
@@ -1199,16 +1443,16 @@ fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let img = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         let (width, height, pixels) = decode_png(&bytes)?;
-        win32_gfx::BmpImage {
+        gfx_state::BmpImage {
             width,
             height,
             pixels,
             has_alpha: true,
         }
     } else {
-        win32_gfx::parse_bmp_safe(&bytes)?
+        gfx_state::parse_bmp_safe(&bytes)?
     };
-    let id = win32_gfx::IMAGES.with(|imgs| -> Result<usize, String> {
+    let id = gfx_state::IMAGES.with(|imgs| -> Result<usize, String> {
         let mut list = imgs.borrow_mut();
         if list.len() >= 256 {
             return Err("gfx.load_image(): maximum loaded image limit (256) exceeded".to_string());
@@ -1219,7 +1463,6 @@ fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int(id as i64))
 }
 
-#[cfg(windows)]
 fn blend_argb(src_argb: u32, dst_rgb: u32) -> u32 {
     let a = (src_argb >> 24) & 0xFF;
     let inv = 255 - a;
@@ -1235,17 +1478,32 @@ fn blend_argb(src_argb: u32, dst_rgb: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-#[cfg(windows)]
+fn blit_pixel(dst: &mut u32, color: u32, has_alpha: bool, key: Option<u32>) {
+    if has_alpha {
+        let a = (color >> 24) & 0xFF;
+        if a == 0 || key == Some(color & 0x00FF_FFFF) {
+            return;
+        }
+        if a == 255 {
+            *dst = color & 0x00FF_FFFF;
+        } else {
+            *dst = blend_argb(color, *dst);
+        }
+    } else if key != Some(color) {
+        *dst = color;
+    }
+}
+
 fn draw_image_impl(img_id: i64, dx: i32, dy: i32, key: Option<u32>) -> Result<(), String> {
     if img_id < 0 {
         return Err("Invalid image handle".to_string());
     }
-    win32_gfx::IMAGES.with(|imgs| {
+    gfx_state::IMAGES.with(|imgs| {
         let list = imgs.borrow();
         let img = list
             .get(img_id as usize)
             .ok_or_else(|| "Invalid image handle".to_string())?;
-        win32_gfx::WINDOW.with(|w| {
+        gfx_state::FRAME.with(|w| {
             let mut borrow = w.borrow_mut();
             let state = borrow
                 .as_mut()
@@ -1262,22 +1520,7 @@ fn draw_image_impl(img_id: i64, dx: i32, dy: i32, key: Option<u32>) -> Result<()
                     }
                     let color = img.pixels[(sy * img.width + sx) as usize];
                     let dst_idx = (py * state.width + px) as usize;
-                    if img.has_alpha {
-                        let a = (color >> 24) & 0xFF;
-                        if a == 0 || key == Some(color & 0x00FF_FFFF) {
-                            continue;
-                        }
-                        if a == 255 {
-                            state.buffer[dst_idx] = color & 0x00FF_FFFF;
-                        } else {
-                            state.buffer[dst_idx] = blend_argb(color, state.buffer[dst_idx]);
-                        }
-                    } else {
-                        if key == Some(color) {
-                            continue;
-                        }
-                        state.buffer[dst_idx] = color;
-                    }
+                    blit_pixel(&mut state.buffer[dst_idx], color, img.has_alpha, key);
                 }
             }
             Ok(())
@@ -1285,7 +1528,6 @@ fn draw_image_impl(img_id: i64, dx: i32, dy: i32, key: Option<u32>) -> Result<()
     })
 }
 
-#[cfg(windows)]
 fn gfx_draw_image(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err("gfx.draw_image() expects 3 arguments (img, x, y)".to_string());
@@ -1297,7 +1539,6 @@ fn gfx_draw_image(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-#[cfg(windows)]
 fn gfx_draw_image_keyed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 6 {
         return Err("gfx.draw_image_keyed() expects 6 arguments (img, x, y, r, g, b)".to_string());
@@ -1314,13 +1555,105 @@ fn gfx_draw_image_keyed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-#[cfg(windows)]
+fn gfx_draw_sprite_frame(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 6 && args.len() != 7 {
+        return Err(
+            "gfx.draw_sprite_frame() expects 6 or 7 arguments (img, frame_idx, cols, rows, x, y, [scale])"
+                .to_string(),
+        );
+    }
+    let id = as_int(&args[0], "draw_sprite_frame")?;
+    let frame_idx = as_int(&args[1], "draw_sprite_frame")?;
+    let cols = as_int(&args[2], "draw_sprite_frame")?;
+    let rows = as_int(&args[3], "draw_sprite_frame")?;
+    let dx = as_int(&args[4], "draw_sprite_frame")? as i32;
+    let dy = as_int(&args[5], "draw_sprite_frame")? as i32;
+    let scale = if args.len() == 7 {
+        match &args[6] {
+            Value::Int(i) => *i as f64,
+            Value::Float(f) => *f,
+            other => {
+                return Err(format!(
+                    "gfx.draw_sprite_frame() expects numeric scale, got '{}'",
+                    other.type_name()
+                ));
+            }
+        }
+    } else {
+        1.0
+    };
+    if !scale.is_finite() || scale <= 0.0 || scale > 64.0 {
+        return Err("gfx.draw_sprite_frame() scale must be finite and in (0, 64]".to_string());
+    }
+    if !(1..=4096).contains(&cols) || !(1..=4096).contains(&rows) {
+        return Err("gfx.draw_sprite_frame() cols and rows must be in 1..=4096".to_string());
+    }
+    let total_frames = cols
+        .checked_mul(rows)
+        .ok_or_else(|| "gfx.draw_sprite_frame(): grid dimensions overflow".to_string())?;
+    if frame_idx < 0 || frame_idx >= total_frames {
+        return Err(format!(
+            "gfx.draw_sprite_frame(): frame index {} out of bounds 0..{}",
+            frame_idx, total_frames
+        ));
+    }
+    if id < 0 {
+        return Err("Invalid image handle".to_string());
+    }
+    gfx_state::IMAGES.with(|imgs| {
+        let list = imgs.borrow();
+        let img = list
+            .get(id as usize)
+            .ok_or_else(|| "Invalid image handle".to_string())?;
+        let frame_w = img.width / (cols as i32);
+        let frame_h = img.height / (rows as i32);
+        if frame_w <= 0 || frame_h <= 0 {
+            return Err(
+                "gfx.draw_sprite_frame(): sprite grid exceeds image dimensions".to_string(),
+            );
+        }
+        let col = (frame_idx % cols) as i32;
+        let row = (frame_idx / cols) as i32;
+        let src_x0 = col * frame_w;
+        let src_y0 = row * frame_h;
+        let dest_w = ((frame_w as f64) * scale).round().max(1.0) as i32;
+        let dest_h = ((frame_h as f64) * scale).round().max(1.0) as i32;
+
+        gfx_state::FRAME.with(|w| {
+            let mut borrow = w.borrow_mut();
+            let state = borrow
+                .as_mut()
+                .ok_or_else(|| "No active gfx window".to_string())?;
+            let x0 = dx.max(0);
+            let y0 = dy.max(0);
+            let x1 = dx.saturating_add(dest_w).min(state.width);
+            let y1 = dy.saturating_add(dest_h).min(state.height);
+            for py in y0..y1 {
+                let sy = (((py - dy) as f64 / scale) as i32).clamp(0, frame_h - 1);
+                let src_row = ((src_y0 + sy) * img.width + src_x0) as usize;
+                let dst_row = (py * state.width) as usize;
+                for px in x0..x1 {
+                    let sx = (((px - dx) as f64 / scale) as i32).clamp(0, frame_w - 1);
+                    let color = img.pixels[src_row + sx as usize];
+                    blit_pixel(
+                        &mut state.buffer[dst_row + px as usize],
+                        color,
+                        img.has_alpha,
+                        None,
+                    );
+                }
+            }
+            Ok(Value::Unit)
+        })
+    })
+}
+
 fn gfx_image_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("gfx.image_width() expects 1 argument (img)".to_string());
     }
     let id = as_int(&args[0], "image_width")?;
-    win32_gfx::IMAGES.with(|imgs| {
+    gfx_state::IMAGES.with(|imgs| {
         let list = imgs.borrow();
         let img = usize::try_from(id)
             .ok()
@@ -1330,13 +1663,12 @@ fn gfx_image_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_image_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("gfx.image_height() expects 1 argument (img)".to_string());
     }
     let id = as_int(&args[0], "image_height")?;
-    win32_gfx::IMAGES.with(|imgs| {
+    gfx_state::IMAGES.with(|imgs| {
         let list = imgs.borrow();
         let img = usize::try_from(id)
             .ok()
@@ -1346,7 +1678,6 @@ fn gfx_image_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-#[cfg(windows)]
 fn gfx_set_title(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("gfx.set_title() expects 1 string argument".to_string());
@@ -1360,20 +1691,36 @@ fn gfx_set_title(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
-    win32_gfx::set_window_title(title)?;
-    Ok(Value::Unit)
+    match gfx_state::is_frame_headless() {
+        Some(true) => {
+            let _ = title;
+            Ok(Value::Unit)
+        }
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                win32_gfx::set_window_title(title)?;
+                Ok(Value::Unit)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = title;
+                Err("No active gfx window".to_string())
+            }
+        }
+        None => Err("No active gfx window".to_string()),
+    }
 }
 
-#[cfg(windows)]
 fn gfx_delta(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.delta() expects 0 arguments".to_string());
     }
     let now = std::time::Instant::now();
-    let dt = win32_gfx::LAST_FRAME.with(|lf| {
+    let dt = gfx_state::LAST_FRAME.with(|lf| {
         let mut slot = lf.borrow_mut();
         let dt = slot
-            .map(|prev| now.duration_since(prev).as_secs_f64())
+            .map(|prev| now.duration_since(prev).as_secs_f64().clamp(0.0, 0.1))
             .unwrap_or(0.0);
         *slot = Some(now);
         dt
@@ -1381,69 +1728,6 @@ fn gfx_delta(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Float(dt))
 }
 
-#[cfg(not(windows))]
-fn unsupported(_vm: &mut VM, _args: &[Value]) -> Result<Value, String> {
-    Err("gfx module is currently only supported on Windows".to_string())
-}
-
-#[cfg(not(windows))]
-use unsupported as gfx_window;
-#[cfg(not(windows))]
-use unsupported as gfx_is_open;
-#[cfg(not(windows))]
-use unsupported as gfx_clear;
-#[cfg(not(windows))]
-use unsupported as gfx_rect;
-#[cfg(not(windows))]
-use unsupported as gfx_rect_alpha;
-#[cfg(not(windows))]
-use unsupported as gfx_circle;
-#[cfg(not(windows))]
-use unsupported as gfx_circle_alpha;
-#[cfg(not(windows))]
-use unsupported as gfx_width;
-#[cfg(not(windows))]
-use unsupported as gfx_height;
-#[cfg(not(windows))]
-use unsupported as gfx_line;
-#[cfg(not(windows))]
-use unsupported as gfx_pixel;
-#[cfg(not(windows))]
-use unsupported as gfx_present;
-#[cfg(not(windows))]
-use unsupported as gfx_key_down;
-#[cfg(not(windows))]
-use unsupported as gfx_key_pressed;
-#[cfg(not(windows))]
-use unsupported as gfx_close;
-#[cfg(not(windows))]
-use unsupported as gfx_mouse_down;
-#[cfg(not(windows))]
-use unsupported as gfx_mouse_x;
-#[cfg(not(windows))]
-use unsupported as gfx_mouse_y;
-#[cfg(not(windows))]
-use unsupported as gfx_text;
-#[cfg(not(windows))]
-use unsupported as gfx_rect_outline;
-#[cfg(not(windows))]
-use unsupported as gfx_circle_outline;
-#[cfg(not(windows))]
-use unsupported as gfx_load_image;
-#[cfg(not(windows))]
-use unsupported as gfx_draw_image;
-#[cfg(not(windows))]
-use unsupported as gfx_draw_image_keyed;
-#[cfg(not(windows))]
-use unsupported as gfx_image_width;
-#[cfg(not(windows))]
-use unsupported as gfx_image_height;
-#[cfg(not(windows))]
-use unsupported as gfx_set_title;
-#[cfg(not(windows))]
-use unsupported as gfx_delta;
-
-#[cfg(any(windows, test))]
 fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     let a = a as i32;
     let b = b as i32;
@@ -1461,7 +1745,6 @@ fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-#[cfg(any(windows, test))]
 fn unfilter_png_scanlines(
     raw: &[u8],
     row_bytes: usize,
@@ -1512,7 +1795,6 @@ fn unfilter_png_scanlines(
     Ok(out)
 }
 
-#[cfg(any(windows, test))]
 fn unpack_png_sub_byte(row: &[u8], x: usize, bit_depth: u8) -> u8 {
     let bits = bit_depth as usize;
     let per_byte = 8 / bits;
@@ -1522,7 +1804,6 @@ fn unpack_png_sub_byte(row: &[u8], x: usize, bit_depth: u8) -> u8 {
     (byte >> shift) & mask
 }
 
-#[cfg(any(windows, test))]
 pub(crate) fn decode_png(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {
     const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if data.len() < 8 || &data[..8] != SIG {

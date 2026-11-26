@@ -21,7 +21,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.18.0";
+const VERSION: &str = "0.19.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -38,6 +38,37 @@ pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String,
         return Err(format!("File exceeds {} byte limit", limit));
     }
     Ok(text)
+}
+
+fn compile_source_filtered_specs(
+    source: &str,
+    spec_filter: Option<&str>,
+) -> Result<(std::rc::Rc<bytecode::FunctionProto>, usize), String> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err("Source size limit exceeded".to_string());
+    }
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize()?;
+    let mut parser = Parser::new(tokens);
+    let mut program = parser.parse_program()?;
+    let mut matched_specs = 0usize;
+    if let Some(pat) = spec_filter {
+        let pat_low = pat.to_ascii_lowercase();
+        let mut kept = Vec::with_capacity(program.stmts.len());
+        for stmt in program.stmts {
+            if let ast::Stmt::Spec { ref name, .. } = stmt {
+                if name.to_ascii_lowercase().contains(&pat_low) {
+                    matched_specs += 1;
+                    kept.push(stmt);
+                }
+            } else {
+                kept.push(stmt);
+            }
+        }
+        program.stmts = kept;
+    }
+    let proto = Compiler::compile_with_specs(&program)?;
+    Ok((proto, matched_specs))
 }
 
 fn compile_source_mode(
@@ -108,6 +139,7 @@ fn run_file_with_root(
         sandbox_root_override,
         None,
         true,
+        false,
     )
 }
 
@@ -130,6 +162,7 @@ fn print_profile_report(vm: &VM) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_file_with_script_args(
     path: &str,
     dump_bytecode: bool,
@@ -138,6 +171,7 @@ fn run_file_with_script_args(
     sandbox_root_override: Option<&std::path::Path>,
     script_args: Option<&[String]>,
     no_color: bool,
+    no_cache: bool,
 ) -> Result<(), String> {
     run_file_core_full(
         path,
@@ -150,31 +184,8 @@ fn run_file_with_script_args(
         false,
         script_args,
         no_color,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_file_core_with_test_opts(
-    path: &str,
-    dump_bytecode: bool,
-    profile: bool,
-    include_specs: bool,
-    permissions: Permissions,
-    sandbox_root_override: Option<&std::path::Path>,
-    deterministic: bool,
-    update_snapshots: bool,
-) -> Result<(), String> {
-    run_file_core_full(
-        path,
-        dump_bytecode,
-        profile,
-        include_specs,
-        permissions,
-        sandbox_root_override,
-        deterministic,
-        update_snapshots,
+        no_cache,
         None,
-        true,
     )
 }
 
@@ -190,22 +201,48 @@ fn run_file_core_full(
     update_snapshots: bool,
     script_args: Option<&[String]>,
     no_color: bool,
+    no_cache: bool,
+    spec_filter: Option<&str>,
 ) -> Result<(), String> {
     let color = use_cli_color(no_color);
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
         .map_err(|e| format!("Could not read '{}': {}", path, e))?;
-    let proto = if include_specs {
+    let use_cache = !no_cache && spec_filter.is_none();
+    let mut cache_hit = false;
+    let proto = if use_cache {
+        if let Some(cached) = bytecode::try_load_cached_proto(
+            std::path::Path::new(path),
+            &source,
+            false,
+            include_specs,
+        ) {
+            cache_hit = true;
+            cached
+        } else if include_specs {
+            compile_source_with_specs(&source)
+                .map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?
+        } else {
+            compile_source(&source)
+                .map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?
+        }
+    } else if include_specs && spec_filter.is_some() {
+        compile_source_filtered_specs(&source, spec_filter)
+            .map(|(p, _)| p)
+            .map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?
+    } else if include_specs {
         compile_source_with_specs(&source)
+            .map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?
     } else {
         compile_source(&source)
-    }
-    .map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?;
+            .map_err(|e| format_error_with_opts(Some(path), &source, &e, color))?
+    };
     if dump_bytecode {
         print!("{}", proto.chunk.disassemble(&proto.name));
         return Ok(());
     }
     let mut vm = VM::new_with_sandbox(!permissions.allow_all);
     vm.set_permissions(permissions);
+    vm.set_bytecode_cache(!no_cache);
     vm.set_script_file(path);
     vm.set_profile(profile);
     vm.set_deterministic(deterministic);
@@ -226,6 +263,15 @@ fn run_file_core_full(
     } else if let Some(ref parent) = entry_parent {
         vm.set_current_dir(parent.clone());
         vm.set_sandbox_root(parent.clone());
+    }
+    if !cache_hit && use_cache && vm.can_write_cache_for(std::path::Path::new(path)) {
+        bytecode::try_save_cached_proto(
+            std::path::Path::new(path),
+            &source,
+            false,
+            include_specs,
+            &proto,
+        );
     }
     let run_result = if sandbox_root_override.is_some() {
         vm.run_with_base_dir(proto, entry_parent)
@@ -1093,7 +1139,15 @@ fn run_tests_cmd(
     perms: Permissions,
     sandbox_root_override: Option<&std::path::Path>,
 ) -> Result<(), String> {
-    run_tests_cmd_with_opts(path, perms, sandbox_root_override, false, false)
+    run_tests_cmd_with_opts(
+        path,
+        perms,
+        sandbox_root_override,
+        false,
+        false,
+        None,
+        false,
+    )
 }
 
 fn run_tests_cmd_with_opts(
@@ -1102,17 +1156,56 @@ fn run_tests_cmd_with_opts(
     sandbox_root_override: Option<&std::path::Path>,
     deterministic: bool,
     update_snapshots: bool,
+    filter: Option<&str>,
+    no_cache: bool,
 ) -> Result<(), String> {
+    let base_root = std::path::Path::new(path);
     let mut files = Vec::new();
-    collect_ask_files(std::path::Path::new(path), &mut files)?;
+    collect_ask_files(base_root, &mut files)?;
     if files.is_empty() {
         return Err(format!("No .ask test files found in '{}'", path));
     }
+    let filter_low = filter.map(|s| s.to_ascii_lowercase());
     let mut passed = 0usize;
     let mut failed = 0usize;
+    let mut skipped = 0usize;
     for file in &files {
         let label = file.display().to_string();
-        match run_file_core_with_test_opts(
+        let rel_label = if base_root.is_dir() {
+            file.strip_prefix(base_root)
+                .unwrap_or(file.as_path())
+                .to_string_lossy()
+                .replace('\\', "/")
+        } else {
+            file.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| label.clone())
+        };
+        let mut active_spec_filter: Option<&str> = None;
+        if let Some(ref pat_low) = filter_low {
+            let source = read_text_limited(file, MAX_SOURCE_BYTES)
+                .map_err(|e| format!("Could not read '{}': {}", label, e))?;
+            match compile_source_filtered_specs(&source, filter) {
+                Ok((_, matched)) if matched > 0 => {
+                    active_spec_filter = filter;
+                }
+                Ok(_) if rel_label.to_ascii_lowercase().contains(pat_low.as_str()) => {}
+                Ok(_) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "FAIL {}\n{}",
+                        label,
+                        format_error_with_opts(Some(&label), &source, &e, false)
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+        }
+        match run_file_core_full(
             &label,
             false,
             false,
@@ -1121,6 +1214,10 @@ fn run_tests_cmd_with_opts(
             sandbox_root_override,
             deterministic,
             update_snapshots,
+            None,
+            true,
+            no_cache,
+            active_spec_filter,
         ) {
             Ok(()) => {
                 println!("PASS {}", label);
@@ -1132,8 +1229,21 @@ fn run_tests_cmd_with_opts(
             }
         }
     }
+    if filter.is_some() && passed == 0 && failed == 0 {
+        return Err(format!(
+            "No tests matched filter '{}'",
+            filter.unwrap_or("")
+        ));
+    }
     println!();
-    println!("Results: {} passed, {} failed", passed, failed);
+    if skipped > 0 {
+        println!(
+            "Results: {} passed, {} failed, {} skipped",
+            passed, failed, skipped
+        );
+    } else {
+        println!("Results: {} passed, {} failed", passed, failed);
+    }
     if failed > 0 {
         Err(format!("{} test file(s) failed", failed))
     } else {
@@ -1148,6 +1258,7 @@ struct AskaneManifest {
     max_steps: Option<u64>,
     max_mem_mb: Option<u64>,
     timeout_ms: Option<u64>,
+    fmt_indent: Option<usize>,
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -1253,6 +1364,13 @@ fn parse_askane_manifest(src: &str) -> Result<AskaneManifest, String> {
             }
             ("" | "limits", "timeout_ms") => {
                 manifest.timeout_ms = Some(parse_toml_u64(val, "timeout_ms")?);
+            }
+            ("fmt", "indent") => {
+                let n = parse_toml_u64(val, "fmt.indent")?;
+                if !(1..=8).contains(&n) {
+                    return Err("askane.toml [fmt].indent must be between 1 and 8".to_string());
+                }
+                manifest.fmt_indent = Some(n as usize);
             }
             _ => {
                 // Non-authoritative metadata or permission-like keys are intentionally ignored
@@ -1710,7 +1828,7 @@ fn print_help() {
     println!("    --no-color                        Disable ANSI color output");
     println!("  askane --explain <CODE>             Explain an error/warning code (e.g. E0401)");
     println!("  askane permissions <file>           Inspect imported capabilities (transitive)");
-    println!("  askane fmt [--check] <path>         Format an Askane file or directory");
+    println!("  askane fmt [--check|--diff] [opts]  Format Askane files or stdin (--stdin)");
     println!("  askane init [--name <name>] [dir]   Create a starter Askane project");
     println!("  askane info                         Show Askane version, host & project info");
     println!("  askane doctor                       Diagnose installation, PATH & environment");
@@ -1722,10 +1840,12 @@ fn print_help() {
         "  askane setup [opts]                 Add Askane to User PATH & .ask assoc (Windows)"
     );
     println!("  askane test [opts] [path]           Run .ask test files or project tests");
+    println!("    --filter=<pattern>                Only run test files/specs matching pattern");
     println!("    --deterministic                   Enable virtual time & fixed random seed");
     println!("    --update-snapshots                Overwrite mismatched snapshot files");
     println!("  askane -b <file.ask>                Disassemble compiled bytecode");
     println!("  askane --profile <file.ask>         Print function profiling stats");
+    println!("  askane --no-cache <file.ask>        Disable reading/writing .askc bytecode cache");
     println!("  askane -h | --help                  Show help");
     println!("  askane -v | --version               Show version");
     println!();
@@ -1943,6 +2063,13 @@ fn clean_dir_walk(
                 continue;
             }
             clean_dir_walk(&p, dry_run, include_snapshots, removed, depth + 1)?;
+            if name == "__askcache__" && !dry_run {
+                if let Ok(mut rd) = fs::read_dir(&p) {
+                    if rd.next().is_none() {
+                        let _ = fs::remove_dir(&p);
+                    }
+                }
+            }
         } else if meta.is_file() {
             let is_tmp = name.ends_with(".askc")
                 || name.starts_with("_askane_tmp_")
@@ -2510,6 +2637,11 @@ fn render_formatted_line(toks: &[FmtTok]) -> String {
 }
 
 fn format_askane_source(src: &str) -> String {
+    format_askane_source_with_indent(src, 4)
+}
+
+fn format_askane_source_with_indent(src: &str, indent_spaces: usize) -> String {
+    let indent_unit = " ".repeat(indent_spaces.clamp(1, 8));
     let mut out: Vec<String> = Vec::new();
     let mut indent: usize = 0;
     let mut in_multiline_str = false;
@@ -2551,7 +2683,11 @@ fn format_askane_source(src: &str) -> String {
             } else {
                 render_formatted_line(&format_line_tokens(trimmed))
             };
-            out.push(format!("{}{}", "    ".repeat(line_indent), formatted_body));
+            out.push(format!(
+                "{}{}",
+                indent_unit.repeat(line_indent),
+                formatted_body
+            ));
             trimmed.to_string()
         };
 
@@ -2699,8 +2835,126 @@ fn verify_askane_syntax(source: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Default)]
+struct FmtOptions {
+    check_only: bool,
+    diff: bool,
+    use_stdin: bool,
+}
+
+fn resolve_fmt_indent(target: Option<&std::path::Path>) -> usize {
+    if let Some(p) = target {
+        let start = if p.is_dir() {
+            Some(p.to_path_buf())
+        } else {
+            p.parent().map(|d| {
+                if d.as_os_str().is_empty() {
+                    std::path::PathBuf::from(".")
+                } else {
+                    d.to_path_buf()
+                }
+            })
+        };
+        if let Some(mut cur) = start {
+            cur = fs::canonicalize(&cur).unwrap_or(cur);
+            for _ in 0..16 {
+                if let Ok(Some((_, m))) = load_manifest_from_dir(&cur) {
+                    if let Some(ind) = m.fmt_indent {
+                        return ind;
+                    }
+                }
+                let Some(parent) = cur.parent() else {
+                    break;
+                };
+                cur = parent.to_path_buf();
+            }
+        }
+    }
+    if let Ok(Some((_, m))) = discover_manifest_from_cwd() {
+        if let Some(ind) = m.fmt_indent {
+            return ind;
+        }
+    }
+    4
+}
+
+fn render_fmt_unified_diff(label: &str, original: &str, formatted: &str) -> String {
+    let orig_norm = original.replace("\r\n", "\n");
+    let a: Vec<&str> = orig_norm.lines().collect();
+    let b: Vec<&str> = formatted.lines().collect();
+    let ops = modules::diff::compute_line_diff_raw(&a, &b);
+    let mut out = format!("--- {} (original)\n+++ {} (formatted)\n", label, label);
+    let mut has_changes = false;
+    for (tag, line) in ops {
+        if tag != ' ' {
+            has_changes = true;
+            out.push(tag);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !has_changes && original != formatted {
+        out.push_str("-<CRLF line endings>\n+<LF line endings>\n");
+    }
+    out
+}
+
+#[cfg(test)]
 fn run_fmt(path: &str, check_only: bool) -> Result<(), String> {
+    run_fmt_opts(
+        Some(path),
+        FmtOptions {
+            check_only,
+            diff: false,
+            use_stdin: false,
+        },
+    )
+}
+
+fn run_fmt_opts(path_opt: Option<&str>, opts: FmtOptions) -> Result<(), String> {
+    if opts.use_stdin {
+        use std::io::Read;
+        let mut source = String::new();
+        io::stdin()
+            .take(MAX_SOURCE_BYTES as u64 + 1)
+            .read_to_string(&mut source)
+            .map_err(|e| format!("Failed to read stdin: {}", e))?;
+        if source.len() > MAX_SOURCE_BYTES {
+            return Err("Stdin input exceeds 4 MiB limit".to_string());
+        }
+        verify_askane_syntax(&source).map_err(|e| {
+            format!(
+                "Syntax error in stdin:\n{}",
+                format_error_with_source(&source, &e)
+            )
+        })?;
+        let indent = resolve_fmt_indent(None);
+        let formatted = format_askane_source_with_indent(&source, indent);
+        verify_askane_syntax(&formatted)
+            .map_err(|e| format!("Internal formatter error on stdin: {}", e))?;
+        if opts.diff {
+            if formatted != source {
+                print!(
+                    "{}",
+                    render_fmt_unified_diff("<stdin>", &source, &formatted)
+                );
+                return Err("Stdin input is not formatted".to_string());
+            }
+            return Ok(());
+        }
+        if opts.check_only {
+            if formatted != source {
+                return Err("Stdin input is not formatted".to_string());
+            }
+            return Ok(());
+        }
+        print!("{}", formatted);
+        return Ok(());
+    }
+
+    let path = path_opt.ok_or_else(|| "Missing path for askane fmt".to_string())?;
     let p = std::path::Path::new(path);
+    let indent = resolve_fmt_indent(Some(p));
     let mut files = Vec::new();
     if p.is_dir() {
         collect_ask_files(p, &mut files)?;
@@ -2710,6 +2964,7 @@ fn run_fmt(path: &str, check_only: bool) -> Result<(), String> {
     } else {
         files.push(p.to_path_buf());
     }
+    let mut unformatted = 0usize;
     for file in files {
         let fstr = file.display().to_string();
         let source = read_text_limited(&file, MAX_SOURCE_BYTES)
@@ -2721,10 +2976,15 @@ fn run_fmt(path: &str, check_only: bool) -> Result<(), String> {
                 format_error_with_source(&source, &e)
             )
         })?;
-        let formatted = format_askane_source(&source);
+        let formatted = format_askane_source_with_indent(&source, indent);
         verify_askane_syntax(&formatted)
             .map_err(|e| format!("Internal formatter error on '{}': {}", fstr, e))?;
-        if check_only {
+        if opts.diff {
+            if formatted != source {
+                print!("{}", render_fmt_unified_diff(&fstr, &source, &formatted));
+                unformatted += 1;
+            }
+        } else if opts.check_only {
             if formatted != source {
                 return Err(format!("File '{}' is not formatted", fstr));
             }
@@ -2734,6 +2994,9 @@ fn run_fmt(path: &str, check_only: bool) -> Result<(), String> {
                 .map_err(|e| format!("Could not write '{}': {}", fstr, e))?;
             println!("Formatted {}", fstr);
         }
+    }
+    if opts.diff && unformatted > 0 {
+        return Err(format!("{} file(s) need formatting", unformatted));
     }
     Ok(())
 }
@@ -2753,6 +3016,8 @@ enum CliParseOutcome {
         deterministic: bool,
         update_snapshots: bool,
         no_color: bool,
+        no_cache: bool,
+        test_filter: Option<String>,
         eval_code: Option<String>,
         perms: Permissions,
         script_path: Option<String>,
@@ -2767,6 +3032,8 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
     let mut deterministic = false;
     let mut update_snapshots = false;
     let mut no_color = false;
+    let mut no_cache = false;
+    let mut test_filter: Option<String> = None;
     let mut eval_code: Option<String> = None;
     let mut perms = Permissions::sandboxed();
     let mut explicit_max_steps: Option<u64> = None;
@@ -2800,6 +3067,16 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
             update_snapshots = true;
         } else if arg == "--no-color" {
             no_color = true;
+        } else if arg == "--no-cache" {
+            no_cache = true;
+        } else if arg == "--filter" {
+            i += 1;
+            let Some(val) = args.get(i) else {
+                return Err("Missing pattern after --filter".to_string());
+            };
+            test_filter = Some(val.clone());
+        } else if let Some(val) = arg.strip_prefix("--filter=") {
+            test_filter = Some(val.to_string());
         } else if arg == "-e" || arg == "--eval" {
             i += 1;
             let Some(code) = args.get(i) else {
@@ -2890,6 +3167,8 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
         deterministic,
         update_snapshots,
         no_color,
+        no_cache,
+        test_filter,
         eval_code,
         perms,
         script_path,
@@ -3030,23 +3309,34 @@ fn main() {
     }
 
     if args[1] == "fmt" {
-        let mut check_only = false;
+        let mut opts = FmtOptions::default();
         let mut target: Option<String> = None;
         for arg in &args[2..] {
             if arg == "--check" {
-                check_only = true;
+                opts.check_only = true;
+            } else if arg == "--diff" {
+                opts.diff = true;
+            } else if arg == "--stdin" {
+                opts.use_stdin = true;
+            } else if arg.starts_with('-') {
+                eprintln!("Usage: askane fmt [--check] [--diff] [--stdin] <file_or_dir>");
+                process::exit(1);
             } else if target.is_none() {
                 target = Some(arg.clone());
             } else {
-                eprintln!("Usage: askane fmt [--check] <file.ask>");
+                eprintln!("Usage: askane fmt [--check] [--diff] [--stdin] <file_or_dir>");
                 process::exit(1);
             }
         }
-        let Some(path) = target else {
-            eprintln!("Usage: askane fmt [--check] <file.ask>");
+        if opts.use_stdin && target.is_some() {
+            eprintln!("Usage: askane fmt [--check] [--diff] --stdin");
             process::exit(1);
-        };
-        if let Err(e) = run_fmt(&path, check_only) {
+        }
+        if !opts.use_stdin && target.is_none() {
+            eprintln!("Usage: askane fmt [--check] [--diff] [--stdin] <file_or_dir>");
+            process::exit(1);
+        }
+        if let Err(e) = run_fmt_opts(target.as_deref(), opts) {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
@@ -3173,6 +3463,8 @@ fn main() {
         deterministic,
         update_snapshots,
         no_color,
+        no_cache,
+        test_filter,
         eval_code,
         mut perms,
         script_path,
@@ -3186,6 +3478,8 @@ fn main() {
             deterministic,
             update_snapshots,
             no_color,
+            no_cache,
+            test_filter,
             eval_code,
             perms,
             script_path,
@@ -3197,6 +3491,8 @@ fn main() {
             deterministic,
             update_snapshots,
             no_color,
+            no_cache,
+            test_filter,
             eval_code,
             perms,
             script_path,
@@ -3208,6 +3504,11 @@ fn main() {
             process::exit(1);
         }
     };
+
+    if !is_test_cmd && test_filter.is_some() {
+        eprintln!("Option '--filter' is only valid with 'askane test'");
+        process::exit(1);
+    }
 
     if let Some(code) = eval_code {
         if let Err(e) = run_eval(&code, profile, perms, script_args.as_deref(), no_color) {
@@ -3234,6 +3535,8 @@ fn main() {
                                         Some(&root),
                                         deterministic,
                                         update_snapshots,
+                                        test_filter.as_deref(),
+                                        no_cache,
                                     )
                                 },
                             )
@@ -3244,11 +3547,21 @@ fn main() {
                             None,
                             deterministic,
                             update_snapshots,
+                            test_filter.as_deref(),
+                            no_cache,
                         ),
                         Err(e) => Err(e),
                     }
                 } else {
-                    run_tests_cmd_with_opts(target, perms, None, deterministic, update_snapshots)
+                    run_tests_cmd_with_opts(
+                        target,
+                        perms,
+                        None,
+                        deterministic,
+                        update_snapshots,
+                        test_filter.as_deref(),
+                        no_cache,
+                    )
                 }
             }
             None => match discover_manifest_from_cwd() {
@@ -3262,12 +3575,20 @@ fn main() {
                             Some(&root),
                             deterministic,
                             update_snapshots,
+                            test_filter.as_deref(),
+                            no_cache,
                         )
                     })
                 }
-                Ok(None) => {
-                    run_tests_cmd_with_opts(".", perms, None, deterministic, update_snapshots)
-                }
+                Ok(None) => run_tests_cmd_with_opts(
+                    ".",
+                    perms,
+                    None,
+                    deterministic,
+                    update_snapshots,
+                    test_filter.as_deref(),
+                    no_cache,
+                ),
                 Err(e) => Err(e),
             },
         };
@@ -3295,6 +3616,7 @@ fn main() {
                                 Some(&root),
                                 script_args.as_deref(),
                                 no_color,
+                                no_cache,
                             )
                         })
                     }
@@ -3313,6 +3635,7 @@ fn main() {
                     None,
                     script_args.as_deref(),
                     no_color,
+                    no_cache,
                 )
             }
         }
@@ -3329,6 +3652,7 @@ fn main() {
                         Some(&root),
                         script_args.as_deref(),
                         no_color,
+                        no_cache,
                     )
                 })
             }
@@ -6775,6 +7099,7 @@ archive.extract(z, "out")
             max_steps: Some(def_steps.saturating_mul(100)),
             max_mem_mb: Some(100_000),
             timeout_ms: Some(def_ms.saturating_mul(100)),
+            fmt_indent: None,
         };
         apply_manifest_limits(&mut perms, &man, ExplicitLimits::default());
         assert_eq!(perms.max_instructions, Some(def_steps));
@@ -7925,6 +8250,430 @@ let _m2 = match 3 { 1..5 => \"a\", 3 => \"b\", 2..4 => \"c\", 1..5 => \"d\", _ =
                 );
             }
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_v0190_cache_fs_fmt_filter_and_gfx() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("askane_v0190_{}", ts));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        // 1. .askc bytecode cache codec, tamper guards, VM/CLI integration & clean
+        let sample_src = "let x = 2 + 3 * 4;\nx";
+        let proto = compile_source(sample_src).unwrap();
+        let src_hash = modules::hash::sha256_bytes(sample_src.as_bytes());
+        let encoded = bytecode::encode_cached_proto(&proto, &src_hash, false, false).unwrap();
+        assert!(encoded.starts_with(bytecode::BYTECODE_CACHE_MAGIC));
+        let decoded = bytecode::decode_cached_proto(&encoded, &src_hash, false, false).unwrap();
+        assert_eq!(
+            decoded.chunk.disassemble(&decoded.name),
+            proto.chunk.disassemble(&proto.name)
+        );
+
+        // Reject wrong mode, wrong hash, trailing bytes, or tampered payload
+        assert!(bytecode::decode_cached_proto(&encoded, &src_hash, true, false).is_err());
+        assert!(bytecode::decode_cached_proto(&encoded, &src_hash, false, true).is_err());
+        let bad_hash = [0u8; 32];
+        assert!(bytecode::decode_cached_proto(&encoded, &bad_hash, false, false).is_err());
+        let mut with_tail = encoded.clone();
+        with_tail.push(0x99);
+        assert!(bytecode::decode_cached_proto(&with_tail, &src_hash, false, false).is_err());
+        let mut tampered = encoded.clone();
+        let last_idx = tampered.len() - 1;
+        tampered[last_idx] ^= 0xFF;
+        assert!(bytecode::decode_cached_proto(&tampered, &src_hash, false, false).is_err());
+
+        // Real script + imported module cache lifecycle
+        let cache_proj = tmp_dir.join("cache_proj");
+        std::fs::create_dir_all(&cache_proj).unwrap();
+        let helper_path = cache_proj.join("helper.ask");
+        let main_path = cache_proj.join("main.ask");
+        std::fs::write(&helper_path, "pub fn answer() { 42 }\n").unwrap();
+        std::fs::write(&main_path, "import helper;\nlet v = helper.answer();\nv").unwrap();
+
+        run_file_core_full(
+            &main_path.display().to_string(),
+            false,
+            false,
+            false,
+            Permissions::sandboxed(),
+            None,
+            false,
+            false,
+            None,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        let main_cache = bytecode::cache_path_for(&main_path).unwrap();
+        let helper_cache = bytecode::cache_path_for(&helper_path).unwrap();
+        assert!(main_cache.is_file(), "expected main .askc cache");
+        assert!(helper_cache.is_file(), "expected module .askc cache");
+
+        // Second run hits cache, and corrupted cache transparently falls back to recompile
+        std::fs::write(&main_cache, b"CORRUPT").unwrap();
+        run_file_core_full(
+            &main_path.display().to_string(),
+            false,
+            false,
+            false,
+            Permissions::sandboxed(),
+            None,
+            false,
+            false,
+            None,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(std::fs::read(&main_cache).unwrap().starts_with(b"ASKC"));
+
+        // --no-cache skips writing new .askc files
+        let nocache_script = tmp_dir.join("nocache.ask");
+        std::fs::write(&nocache_script, "let z = 10;\nz").unwrap();
+        match parse_run_args(&["--no-cache".to_string(), "nocache.ask".to_string()]).unwrap() {
+            CliParseOutcome::Run { no_cache, .. } => assert!(no_cache),
+            _ => panic!("expected Run outcome for --no-cache"),
+        }
+        run_file_core_full(
+            &nocache_script.display().to_string(),
+            false,
+            false,
+            false,
+            Permissions::sandboxed(),
+            None,
+            false,
+            false,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(!bytecode::cache_path_for(&nocache_script).unwrap().exists());
+
+        // askane clean removes .askc caches and prunes empty __askcache__ directories
+        let mut dry_removed = 0usize;
+        clean_dir_walk(&cache_proj, true, false, &mut dry_removed, 0).unwrap();
+        assert_eq!(dry_removed, 2);
+        assert!(main_cache.exists());
+
+        let mut removed = 0usize;
+        clean_dir_walk(&cache_proj, false, false, &mut removed, 0).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!cache_proj.join("__askcache__").exists());
+
+        // 2. Streaming & directory fs APIs
+        let fs_dir = tmp_dir.join("fs_work");
+        std::fs::create_dir_all(&fs_dir).unwrap();
+        let fs_script = r#"
+import fs;
+import strings;
+import test;
+
+fs.write_lines("lines.txt", ["alpha", "beta", "gamma"]);
+let all_lines = fs.read_lines("lines.txt");
+test.assert_eq(len(all_lines), 3);
+test.assert_eq(all_lines[1], "beta");
+
+let limited = fs.read_lines("lines.txt", 2);
+test.assert_eq(len(limited), 2);
+test.assert_eq(limited[0], "alpha");
+
+with fs.open_writer("stream.txt") as w {
+    w.write("one-");
+    w.write_line("two");
+    w.flush();
+}
+with fs.write_stream("stream.txt", true) as w2 {
+    w2.write_line("three");
+}
+
+let collected = [];
+with fs.open_lines("stream.txt") as r {
+    loop {
+        let line = r.next();
+        if line == unit {
+            break;
+        }
+        push(collected, line);
+    }
+}
+test.assert_eq(collected, ["one-two", "three"]);
+
+let leaked_writer = fs.open_writer("closed_check.txt");
+leaked_writer.close();
+let write_after_close_err = try {
+    leaked_writer.write("nope");
+    false
+} catch e {
+    strings.contains(e, "closed")
+};
+test.assert(write_after_close_err);
+
+let tf = fs.temp_file("v019");
+test.assert(fs.exists(tf));
+fs.write(tf, "temp-payload");
+test.assert_eq(fs.read(tf), "temp-payload");
+fs.remove(tf);
+
+let bad_prefix_err = try { fs.temp_file("../bad"); false } catch e { true };
+test.assert(bad_prefix_err);
+
+fs.mkdir("tree/sub");
+fs.write("tree/a.txt", "AAA");
+fs.write("tree/sub/b.txt", "BBBB");
+let walked = fs.walk("tree");
+test.assert_eq(len(walked), 3);
+let has_sub_file = false;
+for entry in walked {
+    if entry.name == "b.txt" && !entry.is_dir && entry.size == 4 {
+        has_sub_file = true;
+    }
+}
+test.assert(has_sub_file);
+
+let copied = fs.copy_dir("tree", "tree_copy");
+test.assert_eq(copied, 2);
+test.assert_eq(fs.read("tree_copy/sub/b.txt"), "BBBB");
+
+let self_copy_err = try { fs.copy_dir("tree", "tree/nested_self"); false } catch e { true };
+test.assert(self_copy_err);
+
+let non_empty_err = try { fs.remove_dir("tree_copy"); false } catch e { true };
+test.assert(non_empty_err);
+fs.remove_dir("tree_copy", true);
+test.assert(!fs.exists("tree_copy"));
+
+let outside_err = try { fs.walk(".."); false } catch e { true };
+test.assert(outside_err);
+let outside_rm_err = try { fs.remove_dir("..", true); false } catch e { true };
+test.assert(outside_rm_err);
+"#;
+        let mut vm = VM::new_with_sandbox(true);
+        vm.set_permissions(Permissions::sandboxed());
+        vm.set_current_dir(fs_dir.clone());
+        vm.set_sandbox_root(fs_dir.clone());
+        vm.run(compile_source(fs_script).unwrap()).unwrap();
+        drop(vm);
+
+        // 3. fmt [fmt] indent, --diff, golden corpus idempotence & test --filter
+        let fmt_proj = tmp_dir.join("fmt_proj");
+        std::fs::create_dir_all(fmt_proj.join("tests")).unwrap();
+        std::fs::write(fmt_proj.join("askane.toml"), "[fmt]\nindent = 2\n").unwrap();
+        let src_to_fmt = fmt_proj.join("app.ask");
+        std::fs::write(&src_to_fmt, "fn add(a,b){\nlet x=a+b;\nx\n}\n").unwrap();
+        assert_eq!(resolve_fmt_indent(Some(&src_to_fmt)), 2);
+
+        let raw_ugly = "fn add(a,b){\nlet x=a+b;\nx\n}\n";
+        let fmt2 = format_askane_source_with_indent(raw_ugly, 2);
+        assert!(fmt2.contains("  let x = a + b;"));
+        assert_eq!(format_askane_source_with_indent(&fmt2, 2), fmt2);
+
+        let diff_txt = render_fmt_unified_diff("app.ask", raw_ugly, &fmt2);
+        assert!(diff_txt.contains("--- app.ask (original)"));
+        assert!(diff_txt.contains("+++ app.ask (formatted)"));
+        assert!(diff_txt.contains("-let x=a+b;"));
+        assert!(diff_txt.contains("+  let x = a + b;"));
+
+        let crlf_diff = render_fmt_unified_diff("crlf.ask", "let x = 1;\r\n", "let x = 1;\n");
+        assert!(crlf_diff.contains("CRLF line endings"));
+
+        // Golden corpus idempotence check
+        let corpus = [
+            "struct Vec2 {\n  x = 0,\n  y = 0,\n  fn norm2(self) { self.x * self.x + self.y * self.y }\n}\n",
+            "let xs = [1, 2, 3, 4]\n    |> filter(|n| n % 2 == 0)\n    |> map(|n| n * n);\n",
+            "match score {\n    0..50 => \"fail\",\n    50..=100 => \"pass\",\n    _ => \"other\",\n}\n",
+            "let r = r\"raw\\path\";\nlet m = \"\"\"multi\nline\"\"\";\n",
+        ];
+        for snippet in corpus {
+            let f1 = format_askane_source(snippet);
+            verify_askane_syntax(&f1).unwrap();
+            let f2 = format_askane_source(&f1);
+            assert_eq!(f1, f2, "formatter must be idempotent on:\n{}", snippet);
+        }
+
+        // CLI flag parsing & askane test --filter
+        match parse_run_args(&["--filter=alpha".to_string(), "tests".to_string()]).unwrap() {
+            CliParseOutcome::Run {
+                test_filter,
+                script_path,
+                ..
+            } => {
+                assert_eq!(test_filter.as_deref(), Some("alpha"));
+                assert_eq!(script_path.as_deref(), Some("tests"));
+            }
+            _ => panic!("expected Run outcome for --filter="),
+        }
+        match parse_run_args(&[
+            "--filter".to_string(),
+            "beta".to_string(),
+            "tests".to_string(),
+        ])
+        .unwrap()
+        {
+            CliParseOutcome::Run { test_filter, .. } => {
+                assert_eq!(test_filter.as_deref(), Some("beta"));
+            }
+            _ => panic!("expected Run outcome for --filter"),
+        }
+        assert!(parse_run_args(&["--filter".to_string()]).is_err());
+
+        let spec_file = fmt_proj.join("tests").join("multi_spec.ask");
+        std::fs::write(
+            &spec_file,
+            "import test;\nspec \"alpha works\" { test.assert_eq(2 + 2, 4); }\nspec \"beta intentionally fails\" { test.assert(false); }\n",
+        )
+        .unwrap();
+        let (filtered_proto, matched) = compile_source_filtered_specs(
+            &std::fs::read_to_string(&spec_file).unwrap(),
+            Some("alpha"),
+        )
+        .unwrap();
+        assert_eq!(matched, 1);
+        drop(filtered_proto);
+
+        // Passing --filter=alpha skips failing beta spec cleanly (even if parent dir contains "alpha")
+        let alpha_parent_dir = fmt_proj.join("tests").join("alpha_parent");
+        std::fs::create_dir_all(&alpha_parent_dir).unwrap();
+        let nested_spec = alpha_parent_dir.join("suite.ask");
+        std::fs::copy(&spec_file, &nested_spec).unwrap();
+        run_tests_cmd_with_opts(
+            &nested_spec.display().to_string(),
+            Permissions::sandboxed(),
+            Some(&fmt_proj),
+            false,
+            false,
+            Some("alpha"),
+            false,
+        )
+        .unwrap();
+        run_tests_cmd_with_opts(
+            &fmt_proj.join("tests").display().to_string(),
+            Permissions::sandboxed(),
+            Some(&fmt_proj),
+            false,
+            false,
+            Some("alpha"),
+            false,
+        )
+        .unwrap();
+        assert!(
+            run_tests_cmd_with_opts(
+                &fmt_proj.join("tests").display().to_string(),
+                Permissions::sandboxed(),
+                Some(&fmt_proj),
+                false,
+                false,
+                Some("nonexistent_spec_xyz"),
+                false,
+            )
+            .is_err()
+        );
+
+        // 4. gfx headless mode, sprite sheets, mouse_pressed, delta normalization
+        let gfx_dir = tmp_dir.join("gfx_work");
+        std::fs::create_dir_all(&gfx_dir).unwrap();
+
+        // Build valid 4x2 24-bit bottom-up BMP sprite sheet (two 2x2 frames side by side)
+        let mut bmp = vec![0u8; 54 + 24];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(&(78u32).to_le_bytes());
+        bmp[10..14].copy_from_slice(&(54u32).to_le_bytes());
+        bmp[14..18].copy_from_slice(&(40u32).to_le_bytes());
+        bmp[18..22].copy_from_slice(&(4i32).to_le_bytes());
+        bmp[22..26].copy_from_slice(&(2i32).to_le_bytes());
+        bmp[26..28].copy_from_slice(&(1u16).to_le_bytes());
+        bmp[28..30].copy_from_slice(&(24u16).to_le_bytes());
+        let write_px_bgr = |buf: &mut [u8], off: usize, r: u8, g: u8, b: u8| {
+            buf[off] = b;
+            buf[off + 1] = g;
+            buf[off + 2] = r;
+        };
+        // Bottom row (y=1): frame0=[yellow, yellow], frame1=[white, cyan]
+        write_px_bgr(&mut bmp, 54, 255, 255, 0);
+        write_px_bgr(&mut bmp, 57, 255, 255, 0);
+        write_px_bgr(&mut bmp, 60, 255, 255, 255);
+        write_px_bgr(&mut bmp, 63, 0, 255, 255);
+        // Top row (y=0): frame0=[green, green], frame1=[blue, red]
+        write_px_bgr(&mut bmp, 66, 0, 255, 0);
+        write_px_bgr(&mut bmp, 69, 0, 255, 0);
+        write_px_bgr(&mut bmp, 72, 0, 0, 255);
+        write_px_bgr(&mut bmp, 75, 255, 0, 0);
+        std::fs::write(gfx_dir.join("sheet.bmp"), &bmp).unwrap();
+
+        let mut gvm = VM::new_with_sandbox(true);
+        gvm.set_permissions(Permissions::sandboxed());
+        gvm.set_current_dir(gfx_dir.clone());
+        gvm.set_sandbox_root(gfx_dir.clone());
+
+        let no_win_err = gvm
+            .run(compile_source("import gfx; gfx.mouse_pressed(\"left\");").unwrap())
+            .unwrap_err();
+        assert!(no_win_err.contains("No active gfx window"));
+
+        let gfx_script = r#"
+import gfx;
+import test;
+
+gfx.headless(true, 32, 24);
+test.assert(gfx.is_open());
+test.assert_eq(gfx.width(), 32);
+test.assert_eq(gfx.height(), 24);
+gfx.clear(10, 20, 30);
+gfx.rect(0, 0, 4, 4, 100, 100, 100);
+gfx.rect_alpha(0, 0, 2, 2, 200, 0, 0, 128);
+gfx.text(1, 1, "SCORE: 1", 255, 255, 255);
+gfx.set_title("Headless");
+
+let d0 = gfx.delta();
+let d1 = gfx.delta();
+test.assert(d0 >= 0.0 && d0 <= 0.1);
+test.assert(d1 >= 0.0 && d1 <= 0.1);
+test.assert(!gfx.mouse_down("left"));
+test.assert(!gfx.mouse_pressed("left"));
+test.assert(!gfx.key_pressed("SPACE"));
+test.assert_eq(gfx.mouse_x(), 0);
+test.assert_eq(gfx.mouse_y(), 0);
+
+let sheet = gfx.load_image("sheet.bmp");
+test.assert_eq(gfx.image_width(sheet), 4);
+test.assert_eq(gfx.image_height(sheet), 2);
+gfx.draw_sprite_frame(sheet, 1, 2, 1, 10, 8, 2);
+gfx.present();
+"#;
+        gvm.run(compile_source(gfx_script).unwrap()).unwrap();
+        assert_eq!(modules::gfx::test_text_count(), 1);
+        assert_eq!(modules::gfx::test_peek_pixel(10, 8), Some(0x0000_00FF));
+        assert_eq!(modules::gfx::test_peek_pixel(11, 9), Some(0x0000_00FF));
+        assert_eq!(modules::gfx::test_peek_pixel(12, 8), Some(0x00FF_0000));
+        assert_eq!(modules::gfx::test_peek_pixel(10, 10), Some(0x00FF_FFFF));
+        assert_eq!(modules::gfx::test_peek_pixel(13, 11), Some(0x0000_FFFF));
+        assert_eq!(
+            modules::gfx::test_peek_pixel(30, 20),
+            Some((10 << 16) | (20 << 8) | 30)
+        );
+
+        // Verify out-of-bounds frame & unknown button error cleanly
+        let bad_frame = gvm
+            .run(compile_source("import gfx; let s = gfx.load_image(\"sheet.bmp\"); gfx.draw_sprite_frame(s, 9, 2, 1, 0, 0);").unwrap())
+            .unwrap_err();
+        assert!(bad_frame.contains("out of bounds"));
+
+        gvm.run(
+            compile_source("import gfx; import test; gfx.close(); test.assert(!gfx.is_open());")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(modules::gfx::test_peek_pixel(10, 8), None);
+        drop(gvm);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

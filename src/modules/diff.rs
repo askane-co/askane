@@ -18,20 +18,13 @@ pub fn module() -> Value {
     )
 }
 
-pub(crate) fn lcs_line_diff<'a>(
-    vm: &mut VM,
-    a: &[&'a str],
-    b: &[&'a str],
-) -> Result<Vec<(char, &'a str)>, String> {
+pub(crate) fn compute_line_diff_raw<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
     let n = a.len().min(2000);
     let m = b.len().min(2000);
     let a = &a[..n];
     let b = &b[..m];
-    let dp_bytes = (n + 1).saturating_mul(m + 1).saturating_mul(4);
-    vm.charge_alloc(dp_bytes)?;
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
     for i in (0..n).rev() {
-        vm.charge_work(((m / 32) as u64).max(1))?;
         for j in (0..m).rev() {
             dp[i][j] = if a[i] == b[j] {
                 dp[i + 1][j + 1] + 1
@@ -63,7 +56,22 @@ pub(crate) fn lcs_line_diff<'a>(
         out.push(('+', b[j]));
         j += 1;
     }
-    Ok(out)
+    out
+}
+
+pub(crate) fn lcs_line_diff<'a>(
+    vm: &mut VM,
+    a: &[&'a str],
+    b: &[&'a str],
+) -> Result<Vec<(char, &'a str)>, String> {
+    let n = a.len().min(2000);
+    let m = b.len().min(2000);
+    let dp_bytes = (n + 1).saturating_mul(m + 1).saturating_mul(4);
+    vm.charge_alloc(dp_bytes)?;
+    for _ in 0..n {
+        vm.charge_work(((m / 32) as u64).max(1))?;
+    }
+    Ok(compute_line_diff_raw(a, b))
 }
 
 fn diff_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

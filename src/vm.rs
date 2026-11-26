@@ -268,6 +268,7 @@ pub struct VM {
     deferred_error_file: Option<String>,
     execute_depth: usize,
     scheduler: GreenScheduler,
+    use_bytecode_cache: bool,
 }
 
 fn clean_display_path(p: &std::path::Path) -> String {
@@ -337,6 +338,7 @@ impl VM {
             deferred_error_file: None,
             execute_depth: 0,
             scheduler: GreenScheduler::new(),
+            use_bytecode_cache: false,
         };
         vm.register_natives();
         vm
@@ -366,6 +368,38 @@ impl VM {
 
     pub fn set_profile(&mut self, enabled: bool) {
         self.profile_enabled = enabled;
+    }
+
+    pub fn set_bytecode_cache(&mut self, enabled: bool) {
+        self.use_bytecode_cache = enabled;
+    }
+
+    pub fn can_write_cache_for(&self, source_path: &Path) -> bool {
+        if !self.use_bytecode_cache {
+            return false;
+        }
+        if self.permissions.allow_all {
+            return true;
+        }
+        let Some(cache_file) = crate::bytecode::cache_path_for(source_path) else {
+            return false;
+        };
+        let Some(cache_name) = cache_file.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let parent = match source_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => self.current_dir.as_path(),
+        };
+        let rel_cache = format!("__askcache__/{}", cache_name);
+        self.resolve_path_with_roots_from(
+            parent,
+            &rel_cache,
+            &self.permissions.allow_write,
+            self.permissions.restrict_write_to_explicit_roots,
+            false,
+        )
+        .is_ok()
     }
 
     pub fn set_script_args(&mut self, args: Vec<String>) {
@@ -4162,21 +4196,38 @@ impl VM {
             .unwrap_or(source)
             .to_string();
 
-        let proto = (|| {
-            let mut lexer = Lexer::new(&code);
-            let tokens = lexer.tokenize()?;
-            let mut parser = Parser::new(tokens);
-            let program = parser.parse_program()?;
-            Compiler::compile_module(&program, &mod_name)
-        })();
+        let proto = if self.use_bytecode_cache {
+            crate::bytecode::try_load_cached_proto(&file_path, &code, true, false)
+        } else {
+            None
+        };
         let proto = match proto {
-            Ok(p) => p,
-            Err(e) => {
-                self.loading_modules.remove(&cache_key);
-                return Err(format!(
-                    "{} (in '{}') (imported from '{}')",
-                    e, mod_disp, parent_name
-                ));
+            Some(cached_proto) => cached_proto,
+            None => {
+                let compiled = (|| {
+                    let mut lexer = Lexer::new(&code);
+                    let tokens = lexer.tokenize()?;
+                    let mut parser = Parser::new(tokens);
+                    let program = parser.parse_program()?;
+                    Compiler::compile_module(&program, &mod_name)
+                })();
+                match compiled {
+                    Ok(p) => {
+                        if self.can_write_cache_for(&file_path) {
+                            crate::bytecode::try_save_cached_proto(
+                                &file_path, &code, true, false, &p,
+                            );
+                        }
+                        p
+                    }
+                    Err(e) => {
+                        self.loading_modules.remove(&cache_key);
+                        return Err(format!(
+                            "{} (in '{}') (imported from '{}')",
+                            e, mod_disp, parent_name
+                        ));
+                    }
+                }
             }
         };
 
