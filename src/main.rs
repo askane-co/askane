@@ -264,14 +264,10 @@ fn run_file_core_full(
         vm.set_current_dir(parent.clone());
         vm.set_sandbox_root(parent.clone());
     }
-    if !cache_hit && use_cache && vm.can_write_cache_for(std::path::Path::new(path)) {
-        bytecode::try_save_cached_proto(
-            std::path::Path::new(path),
-            &source,
-            false,
-            include_specs,
-            &proto,
-        );
+    let cache_source =
+        fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    if !cache_hit && use_cache && vm.can_write_cache_for(&cache_source) {
+        bytecode::try_save_cached_proto(&cache_source, &source, false, include_specs, &proto);
     }
     let run_result = if sandbox_root_override.is_some() {
         vm.run_with_base_dir(proto, entry_parent)
@@ -8358,6 +8354,22 @@ let _m2 = match 3 { 1..5 => \"a\", 3 => \"b\", 2..4 => \"c\", 1..5 => \"d\", _ =
         )
         .unwrap();
         assert!(!bytecode::cache_path_for(&nocache_script).unwrap().exists());
+
+        // Relative subdir & non-canonical parent paths stay writable inside sandbox, escapes rejected
+        let cache_sub = cache_proj.join("sub");
+        std::fs::create_dir_all(&cache_sub).unwrap();
+        let mut cache_check_vm = VM::new_with_sandbox(true);
+        cache_check_vm.set_permissions(Permissions::sandboxed());
+        cache_check_vm.set_bytecode_cache(true);
+        cache_check_vm.set_current_dir(cache_proj.clone());
+        cache_check_vm.set_sandbox_root(cache_proj.clone());
+        assert!(cache_check_vm.can_write_cache_for(std::path::Path::new("sub/child.ask")));
+        assert!(
+            cache_check_vm.can_write_cache_for(
+                &cache_proj.join("sub").join("..").join("main.ask")
+            )
+        );
+        assert!(!cache_check_vm.can_write_cache_for(std::path::Path::new("../outside.ask")));
 
         // askane clean removes .askc caches and prunes empty __askcache__ directories
         let mut dry_removed = 0usize;

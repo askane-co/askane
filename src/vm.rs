@@ -391,9 +391,17 @@ impl VM {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => self.current_dir.as_path(),
         };
+        let abs_parent = if parent.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            self.current_dir.join(parent)
+        };
+        let Ok(canon_parent) = Self::canonicalize_existing_prefix(&abs_parent) else {
+            return false;
+        };
         let rel_cache = format!("__askcache__/{}", cache_name);
         self.resolve_path_with_roots_from(
-            parent,
+            &canon_parent,
             &rel_cache,
             &self.permissions.allow_write,
             self.permissions.restrict_write_to_explicit_roots,
