@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::budget::BudgetCore;
-use crate::modules::gfx::{decode_bmp_argb, decode_png};
+use crate::media::formats::{bmp::decode_bmp_argb, png::decode_png_argb};
 
 pub const MAX_FNT_FILE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_BMFONT_PAGES: usize = 8;
@@ -152,7 +152,7 @@ pub fn decode_page_bytes_r8(data: &[u8], path: &Path) -> Result<BmPage, String> 
         .unwrap_or("")
         .to_ascii_lowercase();
     let (w, h, pixels, has_alpha) = if ext == "png" || (data.len() >= 8 && &data[..8] == b"\x89PNG\r\n\x1a\n") {
-        let (w, h, px) = decode_png(data)?;
+        let (w, h, px) = decode_png_argb(data)?;
         (w, h, px, true)
     } else if ext == "bmp" || (data.len() >= 2 && &data[..2] == b"BM") {
         let (w, h, px) = decode_bmp_argb(data)?;

@@ -30,6 +30,13 @@ pub fn module() -> Value {
             ("draw_image", gfx_draw_image),
             ("draw_image_keyed", gfx_draw_image_keyed),
             ("draw_sprite_frame", gfx_draw_sprite_frame),
+            ("draw_sprite_ex", gfx_draw_sprite_ex),
+            ("draw_atlas", gfx_draw_atlas),
+            ("atlas_rect", gfx_atlas_rect),
+            ("make_anim", gfx_make_anim),
+            ("anim_update", gfx_anim_update),
+            ("anim_draw", gfx_anim_draw),
+            ("anim_frame", gfx_anim_frame),
             ("image_width", gfx_image_width),
             ("image_height", gfx_image_height),
             ("set_title", gfx_set_title),
@@ -115,13 +122,6 @@ mod gfx_state {
         pub color_bgr: u32,
     }
 
-    pub struct BmpImage {
-        pub width: i32,
-        pub height: i32,
-        pub pixels: Vec<u32>,
-        pub has_alpha: bool,
-    }
-
     pub struct FrameState {
         pub width: i32,
         pub height: i32,
@@ -134,7 +134,6 @@ mod gfx_state {
 
     thread_local! {
         pub static FRAME: RefCell<Option<FrameState>> = const { RefCell::new(None) };
-        pub static IMAGES: RefCell<Vec<BmpImage>> = const { RefCell::new(Vec::new()) };
         pub static SURFACES: RefCell<Vec<Option<Surface>>> = const { RefCell::new(Vec::new()) };
         pub static LAYERS: RefCell<LayerBank> = RefCell::new(LayerBank::new());
         pub static TARGET_STACK: RefCell<Vec<TargetFrame>> = const { RefCell::new(Vec::new()) };
@@ -210,7 +209,6 @@ mod gfx_state {
         super::win32_gfx::destroy_native_window();
         TARGET_STACK.with(|st| st.borrow_mut().clear());
         ROOT_CAMERA.with(|c| c.borrow_mut().reset());
-        IMAGES.with(|imgs| imgs.borrow_mut().clear());
         LAST_FRAME.with(|lf| *lf.borrow_mut() = None);
         PREV_KEYS.with(|pk| *pk.borrow_mut() = [false; 256]);
         if reset_headless {
@@ -251,88 +249,22 @@ mod gfx_state {
     pub fn text_count() -> usize {
         FRAME.with(|f| f.borrow().as_ref().map_or(0, |s| s.texts.len()))
     }
-
-    pub fn parse_bmp_safe(data: &[u8]) -> Result<BmpImage, String> {
-        if data.len() < 54 || &data[0..2] != b"BM" {
-            return Err("gfx.load_image(): invalid BMP header".to_string());
-        }
-        let offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
-        let dib_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
-        if dib_size < 40 {
-            return Err("gfx.load_image(): unsupported BMP DIB header".to_string());
-        }
-        let width = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
-        let raw_height = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
-        let bpp = u16::from_le_bytes([data[28], data[29]]);
-        let compression = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
-        if compression != 0 || (bpp != 24 && bpp != 32) {
-            return Err(
-                "gfx.load_image(): only uncompressed 24-bit or 32-bit BMP is supported".to_string(),
-            );
-        }
-        if width <= 0 || width > 4096 || raw_height == 0 || raw_height.unsigned_abs() > 4096 {
-            return Err("gfx.load_image(): BMP dimensions out of 1..=4096 bounds".to_string());
-        }
-        let height = raw_height.abs();
-        let top_down = raw_height < 0;
-        let bytes_per_pixel = (bpp / 8) as usize;
-        let row_bytes = (width as usize)
-            .checked_mul(bytes_per_pixel)
-            .ok_or_else(|| "BMP row overflow".to_string())?;
-        let stride = (row_bytes + 3) & !3;
-        let needed = offset
-            .checked_add(
-                stride
-                    .checked_mul(height as usize)
-                    .ok_or_else(|| "BMP size overflow".to_string())?,
-            )
-            .ok_or_else(|| "BMP offset overflow".to_string())?;
-        if needed > data.len() {
-            return Err("gfx.load_image(): truncated BMP pixel data".to_string());
-        }
-        let pixel_count = (width as usize)
-            .checked_mul(height as usize)
-            .ok_or_else(|| "BMP pixel count overflow".to_string())?;
-        let mut pixels = vec![0u32; pixel_count];
-        for y in 0..height as usize {
-            let src_y = if top_down {
-                y
-            } else {
-                (height as usize - 1) - y
-            };
-            let row_start = offset + src_y * stride;
-            for x in 0..width as usize {
-                let p = row_start + x * bytes_per_pixel;
-                let b = data[p] as u32;
-                let g = data[p + 1] as u32;
-                let r = data[p + 2] as u32;
-                pixels[y * width as usize + x] = (r << 16) | (g << 8) | b;
-            }
-        }
-        Ok(BmpImage {
-            width,
-            height,
-            pixels,
-            has_alpha: false,
-        })
-    }
 }
 
 const SURFACE_ID_BASE: i64 = 10_000;
 const LAYER_ID_BASE: i64 = 20_000;
 
-pub(crate) fn decode_bmp_argb(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {
-    let mut bmp = gfx_state::parse_bmp_safe(data)?;
-    for p in &mut bmp.pixels {
-        *p |= 0xFF00_0000;
+pub(crate) fn value_dims(v: &Value) -> Option<(i32, i32)> {
+    match v {
+        Value::Image(im) => Some((im.width as i32, im.height as i32)),
+        Value::Texture(t) => Some((t.image.width as i32, t.image.height as i32)),
+        Value::Int(h) => handle_dims(*h),
+        _ => None,
     }
-    Ok((bmp.width, bmp.height, bmp.pixels))
 }
 
 pub(crate) fn handle_dims(handle: i64) -> Option<(i32, i32)> {
-    if (0..SURFACE_ID_BASE).contains(&handle) {
-        gfx_state::IMAGES.with(|imgs| imgs.borrow().get(handle as usize).map(|i| (i.width, i.height)))
-    } else if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(&handle) {
+    if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(&handle) {
         let slot = (handle - SURFACE_ID_BASE) as usize;
         gfx_state::SURFACES.with(|s| {
             s.borrow()
@@ -349,20 +281,7 @@ pub(crate) fn handle_dims(handle: i64) -> Option<(i32, i32)> {
 }
 
 pub(crate) fn copy_handle_rgba(handle: i64) -> Result<(i32, i32, Vec<u32>), String> {
-    if (0..SURFACE_ID_BASE).contains(&handle) {
-        gfx_state::IMAGES.with(|imgs| {
-            let list = imgs.borrow();
-            let img = list
-                .get(handle as usize)
-                .ok_or_else(|| format!("Invalid image handle {}", handle))?;
-            let pixels = if img.has_alpha {
-                img.pixels.clone()
-            } else {
-                img.pixels.iter().map(|&p| p | 0xFF00_0000).collect()
-            };
-            Ok((img.width, img.height, pixels))
-        })
-    } else if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(&handle) {
+    if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(&handle) {
         let slot = (handle - SURFACE_ID_BASE) as usize;
         gfx_state::SURFACES.with(|surfs| {
             let list = surfs.borrow();
@@ -380,7 +299,7 @@ pub(crate) fn copy_handle_rgba(handle: i64) -> Result<(i32, i32, Vec<u32>), Stri
             Ok((lay.surface.width, lay.surface.height, lay.surface.pixels.clone()))
         })
     } else {
-        Err(format!("Invalid handle {}", handle))
+        Err(format!("Invalid surface or layer handle {}", handle))
     }
 }
 
@@ -1798,9 +1717,8 @@ fn gfx_circle_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
-    use std::io::Read;
-    if args.len() != 1 {
-        return Err("gfx.load_image() expects 1 string argument (bmp/png path)".to_string());
+    if args.is_empty() || args.len() > 2 {
+        return Err("gfx.load_image() expects (path, [opts])".to_string());
     }
     let path = match &args[0] {
         Value::Str(s) => s.as_str(),
@@ -1811,118 +1729,153 @@ fn gfx_load_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
-    let resolved = vm.resolve_read_path(path)?;
-    let file =
-        std::fs::File::open(&resolved).map_err(|e| format!("gfx.load_image('{}'): {}", path, e))?;
-    let mut bytes = Vec::new();
-    const LIMIT: usize = 32 * 1024 * 1024;
-    file.take(LIMIT as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("gfx.load_image('{}'): {}", path, e))?;
-    if bytes.len() > LIMIT {
-        return Err("gfx.load_image(): image file exceeds 32 MiB limit".to_string());
-    }
-    let img = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        let (width, height, pixels) = decode_png(&bytes)?;
-        gfx_state::BmpImage {
-            width,
-            height,
-            pixels,
-            has_alpha: true,
-        }
-    } else {
-        gfx_state::parse_bmp_safe(&bytes)?
-    };
-    let id = gfx_state::IMAGES.with(|imgs| -> Result<usize, String> {
-        let mut list = imgs.borrow_mut();
-        if list.len() >= 256 {
-            return Err("gfx.load_image(): maximum loaded image limit (256) exceeded".to_string());
-        }
-        list.push(img);
-        Ok(list.len() - 1)
-    })?;
-    Ok(Value::Int(id as i64))
+    let opts = crate::media::image::parse_decode_opts(args.get(1), "gfx.load_image()")?;
+    let (img, _) = crate::media::cache::load_image_cached(vm, path, &opts, false)?;
+    Ok(Value::Image(img))
 }
 
-fn blend_argb(src_argb: u32, dst_rgb: u32) -> u32 {
-    let a = (src_argb >> 24) & 0xFF;
-    let inv = 255 - a;
-    let sr = (src_argb >> 16) & 0xFF;
-    let sg = (src_argb >> 8) & 0xFF;
-    let sb = src_argb & 0xFF;
-    let dr = (dst_rgb >> 16) & 0xFF;
-    let dg = (dst_rgb >> 8) & 0xFF;
-    let db = dst_rgb & 0xFF;
-    let r = (sr * a + dr * inv + 127) / 255;
-    let g = (sg * a + dg * inv + 127) / 255;
-    let b = (sb * a + db * inv + 127) / 255;
-    (r << 16) | (g << 8) | b
-}
-
-fn blit_pixel(dst: &mut u32, color: u32, has_alpha: bool, key: Option<u32>) {
-    if has_alpha {
-        let a = (color >> 24) & 0xFF;
-        if a == 0 || key == Some(color & 0x00FF_FFFF) {
-            return;
-        }
-        if a == 255 {
-            *dst = color & 0x00FF_FFFF;
+fn blit_to_active_target(
+    img: &crate::media::image::MediaImage,
+    world_x: f64,
+    world_y: f64,
+    mut opts: crate::media::compose::BlitOpts,
+) -> Result<(), String> {
+    with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+        if cam.is_identity_rect() {
+            opts.dst_x = world_x;
+            opts.dst_y = world_y;
         } else {
-            *dst = blend_argb(color, *dst);
+            let (sx, sy) = cam.world_to_screen(world_x, world_y, w, h);
+            opts.dst_x = sx;
+            opts.dst_y = sy;
+            opts.scale_x *= cam.zoom;
+            opts.scale_y *= cam.zoom;
         }
-    } else if key != Some(color) {
-        *dst = color;
+        let mut target = crate::media::compose::BlitTarget {
+            pixels: buf,
+            width: w,
+            height: h,
+            clip: Some(clip),
+            is_offscreen,
+        };
+        crate::media::compose::blit_image(&mut target, img, &opts);
+        Ok(())
+    })
+}
+
+fn parse_tint_rgb(v: &Value, ctx: &str) -> Result<u32, String> {
+    match v {
+        Value::Int(n) => Ok((*n as u32) & 0x00FF_FFFF),
+        Value::Str(s) => {
+            let rgb = crate::modules::ui::parse_color_str(
+                s,
+                &crate::modules::ui::Theme::light(),
+            )?;
+            Ok(rgb & 0x00FF_FFFF)
+        }
+        Value::List(l) => {
+            let b = l.borrow();
+            if b.len() < 3 || b.len() > 4 {
+                return Err(crate::media::err_bad_opt(format!("{} tint list must have 3 or 4 items", ctx)));
+            }
+            let ch = |idx: usize| -> Result<u32, String> {
+                match b[idx] {
+                    Value::Int(i) if (0..=255).contains(&i) => Ok(i as u32),
+                    _ => Err(crate::media::err_bad_opt("tint channel must be int 0..=255")),
+                }
+            };
+            Ok((ch(0)? << 16) | (ch(1)? << 8) | ch(2)?)
+        }
+        other => Err(crate::media::err_bad_opt(format!(
+            "{} tint expects int/str/[r,g,b], got '{}'",
+            ctx,
+            other.type_name()
+        ))),
     }
 }
 
-fn draw_image_impl(img_id: i64, dx: i32, dy: i32, key: Option<u32>) -> Result<(), String> {
-    if img_id < 0 {
-        return Err("Invalid image handle".to_string());
+fn apply_sprite_ex_opts(
+    opts_val: Option<&Value>,
+    opts: &mut crate::media::compose::BlitOpts,
+    ctx: &str,
+) -> Result<(), String> {
+    let Some(v) = opts_val else {
+        return Ok(());
+    };
+    if matches!(v, Value::Unit) {
+        return Ok(());
     }
-    gfx_state::IMAGES.with(|imgs| {
-        let list = imgs.borrow();
-        let img = list
-            .get(img_id as usize)
-            .ok_or_else(|| "Invalid image handle".to_string())?;
-        with_active_target_mut(|buf, w, _h, clip, is_offscreen, cam| {
-            let (ox, oy) = if cam.is_identity_rect() {
-                (dx, dy)
-            } else {
-                let (sx, sy) = cam.world_to_screen(dx as f64, dy as f64, w, _h);
-                (sx.round() as i32, sy.round() as i32)
-            };
-            for sy in 0..img.height {
-                let py = oy.saturating_add(sy);
-                if py < clip.y0 || py >= clip.y1 {
-                    continue;
-                }
-                for sx in 0..img.width {
-                    let px = ox.saturating_add(sx);
-                    if px < clip.x0 || px >= clip.x1 {
-                        continue;
-                    }
-                    let color = img.pixels[(sy * img.width + sx) as usize];
-                    let dst_idx = (py * w + px) as usize;
-                    if is_offscreen && !img.has_alpha {
-                        blit_pixel(&mut buf[dst_idx], 0xFF00_0000 | color, true, key);
-                    } else {
-                        blit_pixel(&mut buf[dst_idx], color, img.has_alpha, key);
-                    }
-                }
+    let Value::Dict(dict) = v else {
+        return Err(crate::media::err_bad_opt(format!(
+            "{} opts must be a dict, got '{}'",
+            ctx,
+            v.type_name()
+        )));
+    };
+    for (k, fv) in dict.borrow().iter() {
+        match k.as_str() {
+            "scale" => {
+                let s = as_f64_gfx(fv, ctx)?;
+                opts.scale_x = s;
+                opts.scale_y = s;
             }
-            Ok(())
-        })
-    })
+            "scale_x" => opts.scale_x = as_f64_gfx(fv, ctx)?,
+            "scale_y" => opts.scale_y = as_f64_gfx(fv, ctx)?,
+            "rotation" | "angle" => opts.rotation_deg = as_f64_gfx(fv, ctx)?,
+            "origin_x" => opts.origin_x = as_f64_gfx(fv, ctx)?,
+            "origin_y" => opts.origin_y = as_f64_gfx(fv, ctx)?,
+            "flip_x" => match fv {
+                Value::Bool(b) => opts.flip_x = *b,
+                _ => return Err(crate::media::err_bad_opt("flip_x must be bool")),
+            },
+            "flip_y" => match fv {
+                Value::Bool(b) => opts.flip_y = *b,
+                _ => return Err(crate::media::err_bad_opt("flip_y must be bool")),
+            },
+            "tint" => opts.tint = parse_tint_rgb(fv, ctx)?,
+            "opacity" | "alpha" => match fv {
+                Value::Int(i) if (0..=255).contains(i) => opts.opacity = *i as u8,
+                Value::Float(f) if f.is_finite() && (0.0..=1.0).contains(f) => {
+                    opts.opacity = (f * 255.0).round() as u8;
+                }
+                _ => {
+                    return Err(crate::media::err_bad_opt(
+                        "opacity/alpha must be int 0..=255 or float 0.0..=1.0",
+                    ));
+                }
+            },
+            "src_x" => opts.src_x = as_int(fv, ctx)?.clamp(0, i32::MAX as i64) as i32,
+            "src_y" => opts.src_y = as_int(fv, ctx)?.clamp(0, i32::MAX as i64) as i32,
+            "src_w" => opts.src_w = Some(as_int(fv, ctx)?.clamp(1, i32::MAX as i64) as i32),
+            "src_h" => opts.src_h = Some(as_int(fv, ctx)?.clamp(1, i32::MAX as i64) as i32),
+            "w" | "dst_w" => opts.dst_w = Some(as_f64_gfx(fv, ctx)?),
+            "h" | "dst_h" => opts.dst_h = Some(as_f64_gfx(fv, ctx)?),
+            "filter" => {
+                let s = fv
+                    .as_str()
+                    .ok_or_else(|| crate::media::err_bad_opt("filter must be str"))?;
+                opts.filter = crate::media::image::Filter::from_name(s)?;
+            }
+            "color_key" => opts.color_key = Some(parse_tint_rgb(fv, ctx)?),
+            unknown => {
+                return Err(crate::media::err_bad_opt(format!(
+                    "{}: unknown option '{}'",
+                    ctx, unknown
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn gfx_draw_image(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err("gfx.draw_image() expects 3 arguments (img, x, y)".to_string());
     }
-    let id = as_int(&args[0], "draw_image")?;
-    let x = as_int(&args[1], "draw_image")? as i32;
-    let y = as_int(&args[2], "draw_image")? as i32;
-    draw_image_impl(id, x, y, None)?;
+    let im = crate::modules::image::extract_image(&args[0], "gfx.draw_image()")?;
+    let x = as_f64_gfx(&args[1], "draw_image")?;
+    let y = as_f64_gfx(&args[2], "draw_image")?;
+    blit_to_active_target(&im, x, y, crate::media::compose::BlitOpts::default())?;
     Ok(Value::Unit)
 }
 
@@ -1930,15 +1883,19 @@ fn gfx_draw_image_keyed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 6 {
         return Err("gfx.draw_image_keyed() expects 6 arguments (img, x, y, r, g, b)".to_string());
     }
-    let id = as_int(&args[0], "draw_image_keyed")?;
-    let x = as_int(&args[1], "draw_image_keyed")? as i32;
-    let y = as_int(&args[2], "draw_image_keyed")? as i32;
+    let im = crate::modules::image::extract_image(&args[0], "gfx.draw_image_keyed()")?;
+    let x = as_f64_gfx(&args[1], "draw_image_keyed")?;
+    let y = as_f64_gfx(&args[2], "draw_image_keyed")?;
     let key = rgb(
         as_int(&args[3], "draw_image_keyed")?,
         as_int(&args[4], "draw_image_keyed")?,
         as_int(&args[5], "draw_image_keyed")?,
     );
-    draw_image_impl(id, x, y, Some(key))?;
+    let opts = crate::media::compose::BlitOpts {
+        color_key: Some(key & 0x00FF_FFFF),
+        ..crate::media::compose::BlitOpts::default()
+    };
+    blit_to_active_target(&im, x, y, opts)?;
     Ok(Value::Unit)
 }
 
@@ -1949,23 +1906,14 @@ fn gfx_draw_sprite_frame(_vm: &mut VM, args: &[Value]) -> Result<Value, String> 
                 .to_string(),
         );
     }
-    let id = as_int(&args[0], "draw_sprite_frame")?;
+    let im = crate::modules::image::extract_image(&args[0], "gfx.draw_sprite_frame()")?;
     let frame_idx = as_int(&args[1], "draw_sprite_frame")?;
     let cols = as_int(&args[2], "draw_sprite_frame")?;
     let rows = as_int(&args[3], "draw_sprite_frame")?;
-    let dx = as_int(&args[4], "draw_sprite_frame")? as i32;
-    let dy = as_int(&args[5], "draw_sprite_frame")? as i32;
+    let dx = as_f64_gfx(&args[4], "draw_sprite_frame")?;
+    let dy = as_f64_gfx(&args[5], "draw_sprite_frame")?;
     let scale = if args.len() == 7 {
-        match &args[6] {
-            Value::Int(i) => *i as f64,
-            Value::Float(f) => *f,
-            other => {
-                return Err(format!(
-                    "gfx.draw_sprite_frame() expects numeric scale, got '{}'",
-                    other.type_name()
-                ));
-            }
-        }
+        as_f64_gfx(&args[6], "draw_sprite_frame")?
     } else {
         1.0
     };
@@ -1984,87 +1932,350 @@ fn gfx_draw_sprite_frame(_vm: &mut VM, args: &[Value]) -> Result<Value, String> 
             frame_idx, total_frames
         ));
     }
-    if id < 0 {
-        return Err("Invalid image handle".to_string());
+    let frame_w = (im.width as i32) / (cols as i32);
+    let frame_h = (im.height as i32) / (rows as i32);
+    if frame_w <= 0 || frame_h <= 0 {
+        return Err("gfx.draw_sprite_frame(): sprite grid exceeds image dimensions".to_string());
     }
-    gfx_state::IMAGES.with(|imgs| {
-        let list = imgs.borrow();
-        let img = list
-            .get(id as usize)
-            .ok_or_else(|| "Invalid image handle".to_string())?;
-        let frame_w = img.width / (cols as i32);
-        let frame_h = img.height / (rows as i32);
-        if frame_w <= 0 || frame_h <= 0 {
-            return Err(
-                "gfx.draw_sprite_frame(): sprite grid exceeds image dimensions".to_string(),
-            );
-        }
-        let col = (frame_idx % cols) as i32;
-        let row = (frame_idx / cols) as i32;
-        let src_x0 = col * frame_w;
-        let src_y0 = row * frame_h;
-        let dest_w = ((frame_w as f64) * scale).round().max(1.0) as i32;
-        let dest_h = ((frame_h as f64) * scale).round().max(1.0) as i32;
+    let col = (frame_idx % cols) as i32;
+    let row = (frame_idx / cols) as i32;
+    let opts = crate::media::compose::BlitOpts {
+        src_x: col * frame_w,
+        src_y: row * frame_h,
+        src_w: Some(frame_w),
+        src_h: Some(frame_h),
+        scale_x: scale,
+        scale_y: scale,
+        ..crate::media::compose::BlitOpts::default()
+    };
+    blit_to_active_target(&im, dx, dy, opts)?;
+    Ok(Value::Unit)
+}
 
-        with_active_target_mut(|buf, w, _h, clip, _is_offscreen, cam| {
-            let (ox, oy) = if cam.is_identity_rect() {
-                (dx, dy)
-            } else {
-                let (sx, sy) = cam.world_to_screen(dx as f64, dy as f64, w, _h);
-                (sx.round() as i32, sy.round() as i32)
-            };
-            let x0 = ox.max(clip.x0);
-            let y0 = oy.max(clip.y0);
-            let x1 = ox.saturating_add(dest_w).min(clip.x1);
-            let y1 = oy.saturating_add(dest_h).min(clip.y1);
-            for py in y0..y1 {
-                let sy = (((py - oy) as f64 / scale) as i32).clamp(0, frame_h - 1);
-                let src_row = ((src_y0 + sy) * img.width + src_x0) as usize;
-                let dst_row = (py * w) as usize;
-                for px in x0..x1 {
-                    let sx = (((px - ox) as f64 / scale) as i32).clamp(0, frame_w - 1);
-                    let color = img.pixels[src_row + sx as usize];
-                    blit_pixel(
-                        &mut buf[dst_row + px as usize],
-                        color,
-                        img.has_alpha,
-                        None,
-                    );
+fn gfx_draw_sprite_ex(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err("gfx.draw_sprite_ex() expects (img_or_tex, x, y, [opts])".to_string());
+    }
+    let mut opts = crate::media::compose::BlitOpts::default();
+    let im = match &args[0] {
+        Value::Image(im) => im.clone(),
+        Value::Texture(t) => {
+            opts.filter = t.filter;
+            t.image.clone()
+        }
+        other => {
+            return Err(crate::media::err_bad_opt(format!(
+                "gfx.draw_sprite_ex() expects image or texture, got '{}'",
+                other.type_name()
+            )));
+        }
+    };
+    let x = as_f64_gfx(&args[1], "draw_sprite_ex")?;
+    let y = as_f64_gfx(&args[2], "draw_sprite_ex")?;
+    apply_sprite_ex_opts(args.get(3), &mut opts, "gfx.draw_sprite_ex()")?;
+    blit_to_active_target(&im, x, y, opts)?;
+    Ok(Value::Unit)
+}
+
+fn gfx_atlas_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.atlas_rect() expects (atlas, name_or_index)".to_string());
+    }
+    let (_, frame) = crate::media::atlas::resolve_atlas_frame(&args[0], &args[1])?;
+    let mut map = crate::value::new_dict_with_capacity(6);
+    map.insert("name".to_string(), Value::from_str(frame.name));
+    map.insert("x".to_string(), Value::Int(frame.x as i64));
+    map.insert("y".to_string(), Value::Int(frame.y as i64));
+    map.insert("w".to_string(), Value::Int(frame.w as i64));
+    map.insert("h".to_string(), Value::Int(frame.h as i64));
+    map.insert("index".to_string(), Value::Int(frame.index as i64));
+    Ok(Value::dict(map))
+}
+
+fn gfx_draw_atlas(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 4 || args.len() > 5 {
+        return Err("gfx.draw_atlas() expects (atlas, name_or_index, x, y, [opts])".to_string());
+    }
+    let (im, frame) = crate::media::atlas::resolve_atlas_frame(&args[0], &args[1])?;
+    let x = as_f64_gfx(&args[2], "draw_atlas")?;
+    let y = as_f64_gfx(&args[3], "draw_atlas")?;
+    let mut opts = crate::media::compose::BlitOpts {
+        src_x: frame.x as i32,
+        src_y: frame.y as i32,
+        src_w: Some(frame.w as i32),
+        src_h: Some(frame.h as i32),
+        ..crate::media::compose::BlitOpts::default()
+    };
+    apply_sprite_ex_opts(args.get(4), &mut opts, "gfx.draw_atlas()")?;
+    blit_to_active_target(&im, x, y, opts)?;
+    Ok(Value::Unit)
+}
+
+fn gfx_make_anim(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err("gfx.make_anim() expects (frames_or_atlas_or_sheet, [opts_or_fps])".to_string());
+    }
+    let mut frame_ms = 100u32;
+    let mut durations_opt: Option<Vec<u32>> = None;
+    let mut mode = crate::media::anim::AnimMode::Loop;
+    let mut cols: Option<u32> = None;
+    let mut rows: Option<u32> = None;
+    let mut subset_frames: Option<Vec<Value>> = None;
+
+    if let Some(opt_val) = args.get(1) {
+        match opt_val {
+            Value::Unit => {}
+            Value::Int(fps) if *fps >= 1 && *fps <= 1000 => {
+                frame_ms = (1000 / (*fps as u32)).max(1);
+            }
+            Value::Float(fps) if fps.is_finite() && *fps > 0.0 && *fps <= 1000.0 => {
+                frame_ms = (1000.0 / *fps).round().max(1.0) as u32;
+            }
+            Value::Dict(d) => {
+                for (k, fv) in d.borrow().iter() {
+                    match k.as_str() {
+                        "fps" => {
+                            let fps = as_f64_gfx(fv, "gfx.make_anim()")?;
+                            if !(0.001..=1000.0).contains(&fps) {
+                                return Err(crate::media::err_bad_opt("anim fps out of range"));
+                            }
+                            frame_ms = (1000.0 / fps).round().max(1.0) as u32;
+                        }
+                        "frame_ms" => {
+                            let ms = as_int(fv, "make_anim frame_ms")?;
+                            if !(1..=600_000).contains(&ms) {
+                                return Err(crate::media::err_bad_opt("frame_ms out of 1..=600000"));
+                            }
+                            frame_ms = ms as u32;
+                        }
+                        "durations" => {
+                            let Value::List(l) = fv else {
+                                return Err(crate::media::err_bad_opt("durations must be list of ints"));
+                            };
+                            let mut durs = Vec::with_capacity(l.borrow().len());
+                            for item in l.borrow().iter() {
+                                let ms = as_int(item, "make_anim duration")?;
+                                if !(1..=600_000).contains(&ms) {
+                                    return Err(crate::media::err_bad_opt("duration must be > 0 ms"));
+                                }
+                                durs.push(ms as u32);
+                            }
+                            durations_opt = Some(durs);
+                        }
+                        "mode" => {
+                            let s = fv.as_str().ok_or_else(|| {
+                                crate::media::err_bad_opt("anim mode must be str")
+                            })?;
+                            mode = crate::media::anim::AnimMode::from_name(s)?;
+                        }
+                        "loop" => match fv {
+                            Value::Bool(true) => mode = crate::media::anim::AnimMode::Loop,
+                            Value::Bool(false) => mode = crate::media::anim::AnimMode::Once,
+                            _ => return Err(crate::media::err_bad_opt("anim loop must be bool")),
+                        },
+                        "cols" => {
+                            let c = as_int(fv, "make_anim cols")?;
+                            if !(1..=4096).contains(&c) {
+                                return Err(crate::media::err_bad_opt("anim cols must be 1..=4096"));
+                            }
+                            cols = Some(c as u32);
+                        }
+                        "rows" => {
+                            let r = as_int(fv, "make_anim rows")?;
+                            if !(1..=4096).contains(&r) {
+                                return Err(crate::media::err_bad_opt("anim rows must be 1..=4096"));
+                            }
+                            rows = Some(r as u32);
+                        }
+                        "frames" => {
+                            let Value::List(l) = fv else {
+                                return Err(crate::media::err_bad_opt("anim frames must be list"));
+                            };
+                            subset_frames = Some(l.borrow().clone());
+                        }
+                        unknown => {
+                            return Err(crate::media::err_bad_opt(format!(
+                                "gfx.make_anim(): unknown option '{}'",
+                                unknown
+                            )));
+                        }
+                    }
                 }
             }
-            Ok(Value::Unit)
-        })
-    })
+            other => {
+                return Err(crate::media::err_bad_opt(format!(
+                    "gfx.make_anim() 2nd arg must be fps or opts dict, got '{}'",
+                    other.type_name()
+                )));
+            }
+        }
+    }
+
+    let source = match &args[0] {
+        Value::List(l) => {
+            let mut frames = Vec::with_capacity(l.borrow().len());
+            for item in l.borrow().iter() {
+                frames.push(crate::modules::image::extract_image(item, "gfx.make_anim()")?);
+            }
+            crate::media::anim::AnimSource::Frames(frames)
+        }
+        Value::Image(_) | Value::Texture(_) => {
+            let im = crate::modules::image::extract_image(&args[0], "gfx.make_anim()")?;
+            if cols.is_none() && rows.is_none() && im.frame_count() > 1 {
+                let count = im.frame_count();
+                let mut frames = Vec::with_capacity(count);
+                for i in 0..count {
+                    let bytes = im.frame_data(i).unwrap_or(&[]).to_vec();
+                    let fi = crate::media::image::MediaImage::from_vec(
+                        im.width,
+                        im.height,
+                        im.format,
+                        im.color_space,
+                        crate::media::image::SourceFormat::Derived,
+                        bytes,
+                        Some(im.has_alpha),
+                        None,
+                        None,
+                    )?;
+                    frames.push(fi);
+                }
+                if durations_opt.is_none() && im.delays_ms.len() == count {
+                    durations_opt = Some(im.delays_ms.iter().map(|&d| (d as u32).max(1)).collect());
+                }
+                crate::media::anim::AnimSource::Frames(frames)
+            } else {
+                let c = cols.ok_or_else(|| {
+                    crate::media::err_bad_opt("gfx.make_anim() spritesheet requires 'cols' option")
+                })?;
+                let r = rows.ok_or_else(|| {
+                    crate::media::err_bad_opt("gfx.make_anim() spritesheet requires 'rows' option")
+                })?;
+                if im.width / c == 0 || im.height / r == 0 {
+                    return Err(crate::media::err_bad_opt(
+                        "gfx.make_anim() cols/rows exceed image dimensions",
+                    ));
+                }
+                let total = c * r;
+                let indices = if let Some(ref sub) = subset_frames {
+                    let mut idxs = Vec::with_capacity(sub.len());
+                    for item in sub {
+                        let i = as_int(item, "make_anim frame index")?;
+                        if i < 0 || (i as u32) >= total {
+                            return Err(crate::media::err_bad_opt("anim frame index out of bounds"));
+                        }
+                        idxs.push(i as u32);
+                    }
+                    idxs
+                } else {
+                    (0..total).collect()
+                };
+                crate::media::anim::AnimSource::Sheet {
+                    image: im,
+                    cols: c,
+                    rows: r,
+                    indices,
+                }
+            }
+        }
+        Value::Dict(_) => {
+            let keys: Vec<Value> = if let Some(ref sub) = subset_frames {
+                sub.clone()
+            } else if let Value::Dict(root) = &args[0] {
+                if let Some(Value::List(ord)) = root.borrow().get("order") {
+                    ord.borrow().clone()
+                } else {
+                    return Err(crate::media::err_bad_opt(
+                        "gfx.make_anim() atlas missing 'order' or 'frames' option",
+                    ));
+                }
+            } else {
+                unreachable!();
+            };
+            if keys.is_empty() {
+                return Err(crate::media::err_bad_opt("anim frames list cannot be empty"));
+            }
+            let (first_img, _) = crate::media::atlas::resolve_atlas_frame(&args[0], &keys[0])?;
+            let mut rects = Vec::with_capacity(keys.len());
+            for k in &keys {
+                let (_, fr) = crate::media::atlas::resolve_atlas_frame(&args[0], k)?;
+                rects.push([fr.x, fr.y, fr.w, fr.h]);
+            }
+            crate::media::anim::AnimSource::Atlas {
+                image: first_img,
+                rects,
+            }
+        }
+        other => {
+            return Err(crate::media::err_bad_opt(format!(
+                "gfx.make_anim() unsupported source '{}'",
+                other.type_name()
+            )));
+        }
+    };
+
+    let count = source.len();
+    let durations = durations_opt.unwrap_or_else(|| vec![frame_ms; count]);
+    let anim = crate::media::anim::SpriteAnim::new(source, durations, mode)?;
+    let handle = crate::media::anim::insert_anim(anim)?;
+    Ok(Value::Int(handle))
+}
+
+fn gfx_anim_update(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.anim_update() expects (anim, dt_ms)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "anim_update")?;
+    let dt_ms = match &args[1] {
+        Value::Int(ms) if *ms >= 0 => *ms as u64,
+        Value::Float(ms) if ms.is_finite() && *ms >= 0.0 => ms.round() as u64,
+        _ => return Err(crate::media::err_bad_opt("gfx.anim_update() dt_ms must be >= 0")),
+    };
+    let idx = crate::media::anim::update_anim(handle, dt_ms)?;
+    Ok(Value::Int(idx))
+}
+
+fn gfx_anim_frame(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.anim_frame() expects (anim)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "anim_frame")?;
+    Ok(Value::Int(crate::media::anim::get_anim_frame_idx(handle)?))
+}
+
+fn gfx_anim_draw(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err("gfx.anim_draw() expects (anim, x, y, [opts])".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "anim_draw")?;
+    let x = as_f64_gfx(&args[1], "anim_draw")?;
+    let y = as_f64_gfx(&args[2], "anim_draw")?;
+    let (im, [sx, sy, sw, sh]) = crate::media::anim::get_anim_current_draw(handle)?;
+    let mut opts = crate::media::compose::BlitOpts {
+        src_x: sx,
+        src_y: sy,
+        src_w: Some(sw),
+        src_h: Some(sh),
+        ..crate::media::compose::BlitOpts::default()
+    };
+    apply_sprite_ex_opts(args.get(3), &mut opts, "gfx.anim_draw()")?;
+    blit_to_active_target(&im, x, y, opts)?;
+    Ok(Value::Unit)
 }
 
 fn gfx_image_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("gfx.image_width() expects 1 argument (img)".to_string());
     }
-    let id = as_int(&args[0], "image_width")?;
-    gfx_state::IMAGES.with(|imgs| {
-        let list = imgs.borrow();
-        let img = usize::try_from(id)
-            .ok()
-            .and_then(|idx| list.get(idx))
-            .ok_or_else(|| "Invalid image handle".to_string())?;
-        Ok(Value::Int(img.width as i64))
-    })
+    let im = crate::modules::image::extract_image(&args[0], "gfx.image_width()")?;
+    Ok(Value::Int(im.width as i64))
 }
 
 fn gfx_image_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("gfx.image_height() expects 1 argument (img)".to_string());
     }
-    let id = as_int(&args[0], "image_height")?;
-    gfx_state::IMAGES.with(|imgs| {
-        let list = imgs.borrow();
-        let img = usize::try_from(id)
-            .ok()
-            .and_then(|idx| list.get(idx))
-            .ok_or_else(|| "Invalid image handle".to_string())?;
-        Ok(Value::Int(img.height as i64))
-    })
+    let im = crate::modules::image::extract_image(&args[0], "gfx.image_height()")?;
+    Ok(Value::Int(im.height as i64))
 }
 
 fn gfx_set_title(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -2117,278 +2328,7 @@ fn gfx_delta(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Float(dt))
 }
 
-fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
-    let a = a as i32;
-    let b = b as i32;
-    let c = c as i32;
-    let p = a + b - c;
-    let pa = (p - a).abs();
-    let pb = (p - b).abs();
-    let pc = (p - c).abs();
-    if pa <= pb && pa <= pc {
-        a as u8
-    } else if pb <= pc {
-        b as u8
-    } else {
-        c as u8
-    }
-}
 
-fn unfilter_png_scanlines(
-    raw: &[u8],
-    row_bytes: usize,
-    height: usize,
-    bpp: usize,
-) -> Result<Vec<u8>, String> {
-    let stride = 1 + row_bytes;
-    if raw.len() != stride * height {
-        return Err(format!(
-            "Invalid decompressed PNG size: expected {} bytes, got {}",
-            stride * height,
-            raw.len()
-        ));
-    }
-    let mut out = vec![0u8; row_bytes * height];
-    for y in 0..height {
-        let src_row = &raw[y * stride..(y + 1) * stride];
-        let filter = src_row[0];
-        let src = &src_row[1..];
-        let dst_offset = y * row_bytes;
-        for x in 0..row_bytes {
-            let left = if x >= bpp {
-                out[dst_offset + x - bpp]
-            } else {
-                0
-            };
-            let up = if y > 0 {
-                out[(y - 1) * row_bytes + x]
-            } else {
-                0
-            };
-            let up_left = if y > 0 && x >= bpp {
-                out[(y - 1) * row_bytes + x - bpp]
-            } else {
-                0
-            };
-            let val = match filter {
-                0 => src[x],
-                1 => src[x].wrapping_add(left),
-                2 => src[x].wrapping_add(up),
-                3 => src[x].wrapping_add((((left as u16) + (up as u16)) / 2) as u8),
-                4 => src[x].wrapping_add(paeth_predictor(left, up, up_left)),
-                other => return Err(format!("Unsupported PNG scanline filter: {}", other)),
-            };
-            out[dst_offset + x] = val;
-        }
-    }
-    Ok(out)
-}
-
-fn unpack_png_sub_byte(row: &[u8], x: usize, bit_depth: u8) -> u8 {
-    let bits = bit_depth as usize;
-    let per_byte = 8 / bits;
-    let byte = row[x / per_byte];
-    let shift = 8 - bits * (1 + (x % per_byte));
-    let mask = (1u8 << bits) - 1;
-    (byte >> shift) & mask
-}
-
-pub(crate) fn decode_png(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {
-    const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    if data.len() < 8 || &data[..8] != SIG {
-        return Err("Invalid PNG signature".to_string());
-    }
-    let mut pos = 8usize;
-    let mut saw_ihdr = false;
-    let mut saw_iend = false;
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut bit_depth = 0u8;
-    let mut color_type = 0u8;
-    let mut palette: Vec<[u8; 3]> = Vec::new();
-    let mut trns: Vec<u8> = Vec::new();
-    let mut idat = Vec::new();
-
-    while pos + 12 <= data.len() {
-        let len =
-            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        let ctype = &data[pos + 4..pos + 8];
-        let body_start = pos + 8;
-        let body_end = body_start
-            .checked_add(len)
-            .ok_or_else(|| "PNG chunk size overflow".to_string())?;
-        let crc_end = body_end
-            .checked_add(4)
-            .ok_or_else(|| "PNG chunk CRC overflow".to_string())?;
-        if crc_end > data.len() {
-            return Err("Truncated PNG chunk".to_string());
-        }
-        let body = &data[body_start..body_end];
-        let expected_crc = u32::from_be_bytes([
-            data[body_end],
-            data[body_end + 1],
-            data[body_end + 2],
-            data[body_end + 3],
-        ]);
-        let actual_crc = crate::modules::compress::crc32_bytes(&data[pos + 4..body_end]);
-        if expected_crc != actual_crc {
-            return Err("Corrupt PNG chunk CRC".to_string());
-        }
-
-        match ctype {
-            b"IHDR" => {
-                if saw_ihdr || body.len() != 13 {
-                    return Err("Invalid PNG IHDR chunk".to_string());
-                }
-                saw_ihdr = true;
-                width = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-                height = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
-                bit_depth = body[8];
-                color_type = body[9];
-                if body[10] != 0 || body[11] != 0 {
-                    return Err("Unsupported PNG compression or filter method".to_string());
-                }
-                if body[12] != 0 {
-                    return Err("Interlaced PNG images are not supported".to_string());
-                }
-                if width == 0
-                    || height == 0
-                    || width > 4096
-                    || height > 4096
-                    || (width as u64) * (height as u64) > 16_777_216
-                {
-                    return Err("Invalid or oversized PNG dimensions".to_string());
-                }
-            }
-            b"PLTE" => {
-                if body.len() % 3 != 0 || body.len() > 256 * 3 {
-                    return Err("Invalid PNG PLTE chunk".to_string());
-                }
-                palette.clear();
-                for chunk in body.chunks_exact(3) {
-                    palette.push([chunk[0], chunk[1], chunk[2]]);
-                }
-            }
-            b"tRNS" => {
-                trns = body.to_vec();
-            }
-            b"IDAT" => {
-                if !saw_ihdr {
-                    return Err("PNG IDAT before IHDR".to_string());
-                }
-                if idat.len() + body.len() > 64 * 1024 * 1024 {
-                    return Err("PNG IDAT exceeds 64 MiB limit".to_string());
-                }
-                idat.extend_from_slice(body);
-            }
-            b"IEND" => {
-                saw_iend = true;
-                break;
-            }
-            _ => {}
-        }
-        pos = crc_end;
-    }
-
-    if !saw_ihdr || !saw_iend || idat.is_empty() {
-        return Err("Incomplete PNG stream".to_string());
-    }
-
-    let channels = match color_type {
-        0 => 1usize,
-        2 => 3usize,
-        3 => 1usize,
-        4 => 2usize,
-        6 => 4usize,
-        other => return Err(format!("Unsupported PNG color type: {}", other)),
-    };
-    let valid_depth = match color_type {
-        0 | 3 => matches!(bit_depth, 1 | 2 | 4 | 8),
-        2 | 4 | 6 => bit_depth == 8,
-        _ => false,
-    };
-    if !valid_depth {
-        return Err(format!(
-            "Unsupported PNG bit depth {} for color type {}",
-            bit_depth, color_type
-        ));
-    }
-
-    let w = width as usize;
-    let h = height as usize;
-    let bits_per_pixel = channels * (bit_depth as usize);
-    let row_bytes = (w * bits_per_pixel).div_ceil(8);
-    let bpp = bits_per_pixel.div_ceil(8).max(1);
-    let expected_raw = (1 + row_bytes)
-        .checked_mul(h)
-        .ok_or_else(|| "PNG buffer overflow".to_string())?;
-
-    let raw = crate::modules::compress::inflate_zlib(&idat, expected_raw, None)?;
-    let unfiltered = unfilter_png_scanlines(&raw, row_bytes, h, bpp)?;
-
-    let trns_gray = if color_type == 0 && trns.len() >= 2 {
-        Some(u16::from_be_bytes([trns[0], trns[1]]) as u8)
-    } else {
-        None
-    };
-    let trns_rgb = if color_type == 2 && trns.len() >= 6 {
-        Some([trns[1], trns[3], trns[5]])
-    } else {
-        None
-    };
-
-    let mut pixels = vec![0u32; w * h];
-    for y in 0..h {
-        let row = &unfiltered[y * row_bytes..(y + 1) * row_bytes];
-        for x in 0..w {
-            let (a, r, g, b) = match color_type {
-                0 => {
-                    let gval = if bit_depth == 8 {
-                        row[x]
-                    } else {
-                        let sample = unpack_png_sub_byte(row, x, bit_depth);
-                        let max_v = ((1u16 << bit_depth) - 1) as u16;
-                        ((sample as u16 * 255) / max_v) as u8
-                    };
-                    let a = if trns_gray == Some(gval) { 0 } else { 255 };
-                    (a, gval, gval, gval)
-                }
-                2 => {
-                    let p = x * 3;
-                    let rgb = [row[p], row[p + 1], row[p + 2]];
-                    let a = if trns_rgb == Some(rgb) { 0 } else { 255 };
-                    (a, rgb[0], rgb[1], rgb[2])
-                }
-                3 => {
-                    let idx = if bit_depth == 8 {
-                        row[x] as usize
-                    } else {
-                        unpack_png_sub_byte(row, x, bit_depth) as usize
-                    };
-                    let c = *palette
-                        .get(idx)
-                        .ok_or_else(|| "PNG palette index out of bounds".to_string())?;
-                    let a = *trns.get(idx).unwrap_or(&255);
-                    (a, c[0], c[1], c[2])
-                }
-                4 => {
-                    let p = x * 2;
-                    let gval = row[p];
-                    (row[p + 1], gval, gval, gval)
-                }
-                6 => {
-                    let p = x * 4;
-                    (row[p + 3], row[p], row[p + 1], row[p + 2])
-                }
-                _ => unreachable!(),
-            };
-            pixels[y * w + x] =
-                ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-        }
-    }
-
-    Ok((width as i32, height as i32, pixels))
-}
 
 fn as_f64_gfx(v: &Value, fn_name: &str) -> Result<f64, String> {
     match v {
@@ -2594,22 +2534,10 @@ fn gfx_surface_from_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> 
     if args.len() != 1 {
         return Err("gfx.surface_from_image() expects 1 argument (img)".to_string());
     }
-    let img_id = as_handle_raw(&args[0], "surface_from_image")?;
-    if !(0..SURFACE_ID_BASE).contains(&img_id) {
-        return Err(format!("Invalid image handle {}", img_id));
-    }
-    let (w, h, pixels) = gfx_state::IMAGES.with(|imgs| {
-        let list = imgs.borrow();
-        let img = list
-            .get(img_id as usize)
-            .ok_or_else(|| format!("Invalid image handle {}", img_id))?;
-        let px = if img.has_alpha {
-            img.pixels.clone()
-        } else {
-            img.pixels.iter().map(|&p| p | 0xFF00_0000).collect()
-        };
-        Ok::<_, String>((img.width, img.height, px))
-    })?;
+    let im = crate::modules::image::extract_image(&args[0], "gfx.surface_from_image()")?;
+    let w = im.width as i32;
+    let h = im.height as i32;
+    let pixels = im.to_argb_u32_vec();
     gfx_state::bind_budget(vm.budget_core());
     gfx_state::SURFACES.with(|surfs| {
         let mut list = surfs.borrow_mut();

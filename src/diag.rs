@@ -6,7 +6,7 @@ use crate::ast::{AssignTarget, Expr, MatchArm, Pattern, Program, Stmt};
 #[allow(dead_code)]
 pub const ALL_CODES: &[&str] = &[
     "E0101", "E0201", "E0202", "E0301", "E0302", "E0401", "E0402", "E0403", "E0404", "E0405",
-    "W0101", "W0102",
+    "E0501", "E0502", "E0503", "E0504", "E0505", "W0101", "W0102",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +102,7 @@ fn parse_location_tag(err: &str) -> (Option<usize>, Option<usize>, &str) {
     (None, None, trimmed)
 }
 
-fn classify_code(msg: &str) -> &'static str {
+pub(crate) fn classify_code(msg: &str) -> &'static str {
     let low = msg.to_ascii_lowercase();
     if low.contains("unterminated ")
         || low.contains("unexpected character")
@@ -183,6 +183,16 @@ fn classify_code(msg: &str) -> &'static str {
         || low.contains("cannot index ")
     {
         "E0403"
+    } else if msg.contains("E_MEDIA_LIMIT") {
+        "E0501"
+    } else if msg.contains("E_MEDIA_UNSUPPORTED") {
+        "E0502"
+    } else if msg.contains("E_MEDIA_CORRUPT") {
+        "E0503"
+    } else if msg.contains("E_MEDIA_BAD_OPT") {
+        "E0504"
+    } else if msg.contains("E_MEDIA_NONDET") {
+        "E0505"
     } else {
         "E0404"
     }

@@ -458,6 +458,10 @@ fn has_closing_delim_overlap(buf: &str, added_len: usize, delim: &str) -> bool {
     buf[scan_from..].contains(delim)
 }
 
+pub(crate) fn parse_toml_str(vm: &mut VM, text: &str) -> Result<Value, String> {
+    toml_parse(vm, &[Value::from_str(text)])
+}
+
 fn toml_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("toml.parse() expects 1 string argument".to_string());

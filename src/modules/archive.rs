@@ -151,16 +151,17 @@ fn build_zip_bytes(vm: &mut VM, entries: &DictMap) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-struct ZipEntryMeta {
-    name: String,
-    method: u16,
+#[derive(Clone)]
+pub(crate) struct ZipEntryMeta {
+    pub(crate) name: String,
+    pub(crate) method: u16,
     crc: u32,
-    comp_size: usize,
-    uncomp_size: usize,
+    pub(crate) comp_size: usize,
+    pub(crate) uncomp_size: usize,
     local_header_off: usize,
 }
 
-fn parse_zip_cd(vm: &mut VM, data: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
+pub(crate) fn parse_zip_cd(vm: &mut VM, data: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
     if data.len() < 22 {
         return Err("Not a valid ZIP archive (too short)".to_string());
     }
@@ -229,7 +230,7 @@ fn parse_zip_cd(vm: &mut VM, data: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
     Ok(out)
 }
 
-fn read_zip_entry_bytes(
+pub(crate) fn read_zip_entry_bytes(
     vm: &mut VM,
     data: &[u8],
     meta: &ZipEntryMeta,

@@ -292,6 +292,8 @@ pub enum Value {
     Set(Rc<RefCell<AskaneSet>>),
     Range(Rc<RangeData>),
     Buffer(Rc<RefCell<BufData>>),
+    Image(Rc<crate::media::image::MediaImage>),
+    Texture(Rc<crate::media::image::TextureData>),
     Closure(Rc<Closure>),
     NativeFn(Rc<NativeFunction>),
     BoundMethod(Rc<BoundMethod>),
@@ -382,6 +384,8 @@ impl Value {
             Value::Set(_) => "set",
             Value::Range(_) => "range",
             Value::Buffer(_) => "buffer",
+            Value::Image(_) => "image",
+            Value::Texture(_) => "texture",
             Value::Unit => "unit",
             Value::Closure(_) | Value::NativeFn(_) | Value::BoundMethod(_) => "fn",
             Value::StructDef(_) => "struct",
@@ -441,6 +445,8 @@ impl Value {
             (Value::Range(a), Value::Range(b)) => a.start == b.start && a.end == b.end,
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
             (Value::Buffer(a), Value::Buffer(b)) => Rc::ptr_eq(a, b),
+            (Value::Image(a), Value::Image(b)) => Rc::ptr_eq(a, b),
+            (Value::Texture(a), Value::Texture(b)) => Rc::ptr_eq(a, b),
             (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b),
             (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b),
             (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
@@ -535,6 +541,15 @@ impl Value {
             (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b) || **a == **b,
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b) || **a == **b,
             (Value::Buffer(a), Value::Buffer(b)) => Rc::ptr_eq(a, b) || *a.borrow() == *b.borrow(),
+            (Value::Image(a), Value::Image(b)) => {
+                Rc::ptr_eq(a, b)
+                    || (a.width == b.width
+                        && a.height == b.height
+                        && a.format == b.format
+                        && a.color_space == b.color_space
+                        && a.digest == b.digest)
+            }
+            (Value::Texture(a), Value::Texture(b)) => Rc::ptr_eq(a, b) || a.digest == b.digest,
             (Value::Unit, Value::Unit) => true,
             (Value::List(a), Value::List(b)) => {
                 if Rc::ptr_eq(a, b) {
@@ -836,6 +851,29 @@ impl Value {
                 let buf = b.borrow();
                 budget.consume(24);
                 write!(f, "<buffer {}[{}]>", buf.elem.name(), buf.len)
+            }
+            Value::Image(im) => {
+                budget.consume(40);
+                write!(
+                    f,
+                    "<image {}x{} {} {}>",
+                    im.width,
+                    im.height,
+                    im.format.name(),
+                    im.color_space.name()
+                )
+            }
+            Value::Texture(tex) => {
+                budget.consume(48);
+                write!(
+                    f,
+                    "<texture {}x{} {} {}/{}>",
+                    tex.image.width,
+                    tex.image.height,
+                    tex.image.format.name(),
+                    tex.wrap_u.name(),
+                    tex.filter.name()
+                )
             }
             Value::Unit => {
                 budget.consume(4);

@@ -126,7 +126,7 @@ fn stringify_value(val: &Value, out: &mut String, seen: &mut HashSet<usize>) -> 
         }
         other => {
             return Err(format!(
-                "json.stringify() cannot serialize type '{}'",
+                "E_TYPE: json.stringify() cannot serialize type '{}'",
                 other.type_name()
             ));
         }

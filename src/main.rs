@@ -22,9 +22,12 @@ mod font_bitmap;
 mod font_bmfont;
 mod gui;
 #[forbid(unsafe_code)]
+#[forbid(unsafe_code)]
 mod layers;
 #[forbid(unsafe_code)]
 mod lexer;
+#[forbid(unsafe_code)]
+mod media;
 mod modules;
 #[forbid(unsafe_code)]
 mod parser;
@@ -6562,14 +6565,14 @@ archive.extract(bad, "extracted");
     fn test_v016_stage5_png_input_and_ui() {
         // 1. Pure-Rust PNG decoding verification (RGBA 2x1: opaque red + semi-transparent green)
         let png_bytes = build_test_rgba_png(2, 1, &[255, 0, 0, 255, 0, 255, 0, 128]);
-        let (pw, ph, pixels) = modules::gfx::decode_png(&png_bytes).unwrap();
+        let (pw, ph, pixels) = crate::media::formats::png::decode_png_argb(&png_bytes).unwrap();
         assert_eq!((pw, ph), (2, 1));
         assert_eq!(pixels, vec![0xFF_FF_00_00, 0x80_00_FF_00]);
 
         let mut bad_crc = png_bytes.clone();
         let last_idx = bad_crc.len() - 1;
         bad_crc[last_idx] ^= 0xFF;
-        assert!(modules::gfx::decode_png(&bad_crc).is_err());
+        assert!(crate::media::formats::png::decode_png_argb(&bad_crc).is_err());
 
         // 2. input sandbox security: vk_code works everywhere, global input denied without --allow-input
         let safe_input = VM::new()
@@ -7658,7 +7661,7 @@ sum_tail(5000, 0)
         let tco_res = VM::new().run(compile_source(tco_src).unwrap()).unwrap();
         assert!(tco_res.equals(&Value::Int(5000)));
 
-        assert_eq!(modules::BUILTIN_MODULE_NAMES.len(), 51);
+        assert_eq!(modules::BUILTIN_MODULE_NAMES.len(), 54);
         for &m in modules::BUILTIN_MODULE_NAMES {
             assert!(
                 modules::get_builtin_module(m).is_some(),
@@ -9500,5 +9503,911 @@ test.assert_eq(evs[0].id, "ib");
         drop(uvm);
         modules::reset_runtime_state();
         let _ = std::fs::remove_dir_all(&ui_dir);
+    }
+
+    fn build_png_chunked(
+        w: u32,
+        h: u32,
+        depth: u8,
+        ctype: u8,
+        interlace: u8,
+        plte: Option<&[u8]>,
+        trns: Option<&[u8]>,
+        scanlines: &[u8],
+    ) -> Vec<u8> {
+        let mut png = Vec::from(*b"\x89PNG\r\n\x1a\n");
+        let append = |out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]| {
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend_from_slice(tag);
+            out.extend_from_slice(body);
+            let crc = modules::compress::crc32_bytes(&out[start..]);
+            out.extend_from_slice(&crc.to_be_bytes());
+        };
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.push(depth);
+        ihdr.push(ctype);
+        ihdr.push(0);
+        ihdr.push(0);
+        ihdr.push(interlace);
+        append(&mut png, b"IHDR", &ihdr);
+        if let Some(p) = plte {
+            append(&mut png, b"PLTE", p);
+        }
+        if let Some(t) = trns {
+            append(&mut png, b"tRNS", t);
+        }
+        let deflated = modules::compress::deflate_raw(scanlines);
+        let mut zlib = Vec::with_capacity(deflated.len() + 6);
+        zlib.push(0x78);
+        zlib.push(0x01);
+        zlib.extend_from_slice(&deflated);
+        zlib.extend_from_slice(&modules::compress::adler32_bytes(scanlines).to_be_bytes());
+        append(&mut png, b"IDAT", &zlib);
+        append(&mut png, b"IEND", &[]);
+        png
+    }
+
+    fn build_bmp_raw(w: i32, h: i32, bpp: u16, palette_bgra: &[[u8; 4]], raw_rows: &[Vec<u8>]) -> Vec<u8> {
+        let pal_bytes = palette_bgra.len() * 4;
+        let offset = 14 + 40 + pal_bytes;
+        let stride = raw_rows.first().map(|r| r.len()).unwrap_or(0);
+        let img_size = stride * raw_rows.len();
+        let file_size = offset + img_size;
+        let mut out = Vec::with_capacity(file_size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(file_size as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&h.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&bpp.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(img_size as u32).to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&(palette_bgra.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for c in palette_bgra {
+            out.extend_from_slice(c);
+        }
+        for row in raw_rows {
+            out.extend_from_slice(row);
+        }
+        out
+    }
+
+    fn build_qoi_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut out = Vec::from(*b"qoif");
+        out.extend_from_slice(&w.to_be_bytes());
+        out.extend_from_slice(&h.to_be_bytes());
+        out.push(4);
+        out.push(0);
+        let mut index = [[0u8; 4]; 64];
+        let mut prev = [0u8, 0u8, 0u8, 255u8];
+        let mut run = 0usize;
+        let total = (w as usize) * (h as usize);
+        for (i, ch) in rgba.chunks_exact(4).enumerate() {
+            let px = [ch[0], ch[1], ch[2], ch[3]];
+            if px == prev {
+                run += 1;
+                if run == 62 || i + 1 == total {
+                    out.push(0xC0 | ((run as u8) - 1));
+                    run = 0;
+                }
+                continue;
+            }
+            if run > 0 {
+                out.push(0xC0 | ((run as u8) - 1));
+                run = 0;
+            }
+            let hidx = ((px[0] as usize) * 3
+                + (px[1] as usize) * 5
+                + (px[2] as usize) * 7
+                + (px[3] as usize) * 11)
+                % 64;
+            if index[hidx] == px {
+                out.push(hidx as u8);
+            } else {
+                index[hidx] = px;
+                out.push(0xFF);
+                out.extend_from_slice(&px);
+            }
+            prev = px;
+        }
+        out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        out
+    }
+
+    fn build_gif_lzw_stream(min_code_size: u8, indices: &[u8]) -> Vec<u8> {
+        let clear = 1u16 << min_code_size;
+        let eoi = clear + 1;
+        let width = (min_code_size + 1) as usize;
+        let mut bits: u64 = 0;
+        let mut bit_count: usize = 0;
+        let mut payload = Vec::new();
+        let mut push_code = |code: u16| {
+            bits |= (code as u64) << bit_count;
+            bit_count += width;
+            while bit_count >= 8 {
+                payload.push((bits & 0xFF) as u8);
+                bits >>= 8;
+                bit_count -= 8;
+            }
+        };
+        push_code(clear);
+        for (idx, &v) in indices.iter().enumerate() {
+            push_code(v as u16);
+            // Reset table periodically before bit width expands.
+            if (idx + 1) % (clear as usize - 2).max(1) == 0 && idx + 1 < indices.len() {
+                push_code(clear);
+            }
+        }
+        push_code(eoi);
+        if bit_count > 0 {
+            payload.push((bits & 0xFF) as u8);
+        }
+        let mut out = vec![min_code_size];
+        for chunk in payload.chunks(250) {
+            out.push(chunk.len() as u8);
+            out.extend_from_slice(chunk);
+        }
+        out.push(0);
+        out
+    }
+
+    fn build_test_jpeg_8x8(sof_marker: u8, color: bool) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8]; // SOI
+        // DQT table 0: all ones for predictable coefficients
+        out.extend_from_slice(&[0xFF, 0xDB, 0x00, 67, 0x00]);
+        out.extend(std::iter::repeat_n(1u8, 64));
+
+        // DHT DC table 0 & 1: length 2 -> codes 00 (diff=0), 01 (cat 4)
+        for cls_id in if color { &[0x00u8, 0x01u8][..] } else { &[0x00u8][..] } {
+            out.extend_from_slice(&[0xFF, 0xC4, 0x00, 21, *cls_id]);
+            let mut bits = [0u8; 16];
+            bits[1] = 2;
+            out.extend_from_slice(&bits);
+            out.extend_from_slice(&[0x00, 0x04]);
+        }
+        // DHT AC table 0 & 1: length 1 -> code 0 (EOB 0x00)
+        for cls_id in if color { &[0x10u8, 0x11u8][..] } else { &[0x10u8][..] } {
+            out.extend_from_slice(&[0xFF, 0xC4, 0x00, 20, *cls_id]);
+            let mut bits = [0u8; 16];
+            bits[0] = 1;
+            out.extend_from_slice(&bits);
+            out.push(0x00);
+        }
+
+        // SOF
+        let nc = if color { 3u8 } else { 1u8 };
+        let sof_len = 8 + 3 * (nc as u16);
+        out.extend_from_slice(&[0xFF, sof_marker]);
+        out.extend_from_slice(&sof_len.to_be_bytes());
+        out.push(8);
+        out.extend_from_slice(&8u16.to_be_bytes());
+        out.extend_from_slice(&8u16.to_be_bytes());
+        out.push(nc);
+        for c in 1..=nc {
+            out.push(c);
+            out.push(0x11);
+            out.push(0);
+        }
+
+        // SOS
+        let sos_len = 6 + 2 * (nc as u16);
+        out.extend_from_slice(&[0xFF, 0xDA]);
+        out.extend_from_slice(&sos_len.to_be_bytes());
+        out.push(nc);
+        out.push(1);
+        out.push(0x00);
+        if color {
+            out.push(2);
+            out.push(0x11);
+            out.push(3);
+            out.push(0x11);
+        }
+        out.extend_from_slice(&[0x00, 0x3F, 0x00]);
+
+        if color {
+            // Y: DC cat 4 +15 ('01' + '1111'), AC EOB ('0') -> 0111110
+            // Cb: DC 0 ('00'), AC EOB ('0') -> 000
+            // Cr: DC cat 4 -15 ('01' + '0000'), AC EOB ('0') -> 0100000
+            // Concatenated + 1-bit padding = 0111_1100 0001_0000 0111_1111
+            out.extend_from_slice(&[0x7C, 0x10, 0x7F]);
+        } else {
+            // Gray Y: DC cat 4 +15 ('01' + '1111'), AC EOB ('0') + 1 -> 0111_1101
+            out.push(0x7D);
+        }
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
+    #[test]
+    fn test_v020_stage3_media_formats_ops_atlas_cache_and_procgen() {
+        use crate::media::image::{DecodeOpts, PixelFormat, decode_image_bytes};
+        use crate::modules::hash::sha256_bytes;
+        modules::reset_runtime_state();
+
+        // 1. Value size, diag ALL_CODES parity, E0501..=E0505 mapping & json E_TYPE
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        for code in ["E0501", "E0502", "E0503", "E0504", "E0505"] {
+            assert!(diag::ALL_CODES.contains(&code));
+        }
+        assert_eq!(diag::classify_code("E_MEDIA_LIMIT: cap"), "E0501");
+        assert_eq!(diag::classify_code("E_MEDIA_UNSUPPORTED: sof2"), "E0502");
+        assert_eq!(diag::classify_code("E_MEDIA_CORRUPT: crc"), "E0503");
+        assert_eq!(diag::classify_code("E_MEDIA_BAD_OPT: nope"), "E0504");
+        assert_eq!(diag::classify_code("E_MEDIA_NONDET: drift"), "E0505");
+
+        // 2. PNG 16-bit -> 8-bit & Adam7 vs sequential golden digest
+        let rgba_4x4 = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 128,
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 0,
+            200, 10, 20, 255, 210, 20, 30, 255, 220, 30, 40, 255, 230, 40, 50, 200,
+            15, 25, 35, 255, 45, 55, 65, 255, 75, 85, 95, 255, 105, 115, 125, 255,
+        ];
+        let png_seq = build_test_rgba_png(4, 4, &rgba_4x4);
+        // Adam7 passes for 4x4: pass1=(0,0) step 8; pass3=(0,4); pass4=(2,0); pass5=(0,2); pass6=(1,0); pass7=(0,1)
+        let mut a7_scan = Vec::new();
+        let a7_passes: &[&[(usize, usize)]] = &[
+            &[(0, 0)],
+            &[],
+            &[],
+            &[(2, 0)],
+            &[(0, 2), (2, 2)],
+            &[(1, 0), (3, 0), (1, 2), (3, 2)],
+            &[(0, 1), (1, 1), (2, 1), (3, 1), (0, 3), (1, 3), (2, 3), (3, 3)],
+        ];
+        // Build explicit Adam7 pass scanlines row by row
+        let a7_spec: [(usize, usize, usize, usize); 7] = [
+            (0, 8, 0, 8),
+            (4, 8, 0, 8),
+            (0, 4, 4, 8),
+            (2, 4, 0, 4),
+            (0, 2, 2, 4),
+            (1, 2, 0, 2),
+            (0, 1, 1, 2),
+        ];
+        let _ = a7_passes;
+        for (x0, x_step, y0, y_step) in a7_spec {
+            if x0 >= 4 || y0 >= 4 {
+                continue;
+            }
+            let mut y = y0;
+            while y < 4 {
+                a7_scan.push(0);
+                let mut x = x0;
+                while x < 4 {
+                    let i = (y * 4 + x) * 4;
+                    a7_scan.extend_from_slice(&rgba_4x4[i..i + 4]);
+                    x += x_step;
+                }
+                y += y_step;
+            }
+        }
+        let png_adam7 = build_png_chunked(4, 4, 8, 6, 1, None, None, &a7_scan);
+        let im_seq = decode_image_bytes(&png_seq, &DecodeOpts::strict_default(), None, None).unwrap();
+        let im_a7 = decode_image_bytes(&png_adam7, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(im_seq.digest, im_a7.digest);
+        assert_eq!(&*im_seq.data, &rgba_4x4[..]);
+
+        // 16-bit PNG (2x1 RGBA16 -> 0xFF00, 0x8000, 0x0100, 0xFFFF -> FF, 80, 01, FF)
+        let mut s16 = vec![0u8];
+        s16.extend_from_slice(&[0xFF, 0x00, 0x80, 0x00, 0x01, 0x00, 0xFF, 0xFF]);
+        s16.extend_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]);
+        let png16 = build_png_chunked(2, 1, 16, 6, 0, None, None, &s16);
+        let im16 = decode_image_bytes(&png16, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(im16.format, PixelFormat::Rgba8);
+        assert_eq!(&*im16.data, &[0xFF, 0x80, 0x01, 0xFF, 0x12, 0x56, 0x9B, 0xDF]);
+
+        // Indexed PLTE + tRNS PNG
+        let plte = [10u8, 20, 30, 200, 210, 220];
+        let trns = [0u8, 255];
+        let png_pal = build_png_chunked(2, 1, 8, 3, 0, Some(&plte), Some(&trns), &[0, 0, 1]);
+        let im_pal = decode_image_bytes(&png_pal, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(&*im_pal.data, &[10, 20, 30, 0, 200, 210, 220, 255]);
+
+        // 3. BMP (1-bit indexed, BI_BITFIELDS 16-bit RGB565, 32-bit BGRA, reject RLE)
+        let bmp1 = build_bmp_raw(
+            2,
+            1,
+            1,
+            &[[0, 0, 255, 0], [0, 255, 0, 0]], // BGR: red, green
+            &[vec![0b10_000000, 0, 0, 0]],
+        );
+        let im_b1 = decode_image_bytes(&bmp1, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(im_b1.format, PixelFormat::Rgb8);
+        assert_eq!(&*im_b1.data, &[0, 255, 0, 255, 0, 0]);
+
+        // 16-bit BI_BITFIELDS RGB565 BMP
+        let mut bmp_bf = vec![0u8; 14 + 40 + 12 + 4];
+        bmp_bf[0..2].copy_from_slice(b"BM");
+        let bf_len = bmp_bf.len() as u32;
+        bmp_bf[2..6].copy_from_slice(&bf_len.to_le_bytes());
+        bmp_bf[10..14].copy_from_slice(&(66u32).to_le_bytes());
+        bmp_bf[14..18].copy_from_slice(&(40u32).to_le_bytes());
+        bmp_bf[18..22].copy_from_slice(&(2i32).to_le_bytes());
+        bmp_bf[22..26].copy_from_slice(&(-1i32).to_le_bytes()); // top-down 2x1
+        bmp_bf[26..28].copy_from_slice(&(1u16).to_le_bytes());
+        bmp_bf[28..30].copy_from_slice(&(16u16).to_le_bytes());
+        bmp_bf[30..34].copy_from_slice(&(3u32).to_le_bytes()); // BI_BITFIELDS
+        bmp_bf[54..58].copy_from_slice(&0xF800u32.to_le_bytes());
+        bmp_bf[58..62].copy_from_slice(&0x07E0u32.to_le_bytes());
+        bmp_bf[62..66].copy_from_slice(&0x001Fu32.to_le_bytes());
+        bmp_bf[66..68].copy_from_slice(&0xF800u16.to_le_bytes()); // pure red
+        bmp_bf[68..70].copy_from_slice(&0x001Fu16.to_le_bytes()); // pure blue
+        let im_bf = decode_image_bytes(&bmp_bf, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(&*im_bf.data, &[255, 0, 0, 0, 0, 255]);
+
+        // 4. TGA (type 2 uncompressed & type 10 RLE match) + QOI
+        let mut tga2 = vec![0u8; 18 + 6];
+        tga2[2] = 2;
+        tga2[12..14].copy_from_slice(&2u16.to_le_bytes());
+        tga2[14..16].copy_from_slice(&1u16.to_le_bytes());
+        tga2[16] = 24;
+        tga2[17] = 0x20; // top-down
+        tga2[18..24].copy_from_slice(&[10, 20, 200, 10, 20, 200]); // BGR * 2
+        let mut tga10 = tga2[..18].to_vec();
+        tga10[2] = 10;
+        tga10.push(0x81); // RLE run of 2
+        tga10.extend_from_slice(&[10, 20, 200]);
+        tga10.extend_from_slice(&[0u8; 8]);
+        tga10.extend_from_slice(b"TRUEVISION-XFILE.\0");
+        let im_t2 = decode_image_bytes(&tga2, &DecodeOpts::strict_default(), None, None).unwrap();
+        let im_t10 = decode_image_bytes(&tga10, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(im_t2.digest, im_t10.digest);
+        assert_eq!(&*im_t2.data, &[200, 20, 10, 200, 20, 10]);
+
+        let qoi_bytes = build_qoi_rgba(4, 4, &rgba_4x4);
+        let im_qoi = decode_image_bytes(&qoi_bytes, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(im_qoi.digest, im_seq.digest);
+
+        // 5. GIF89a 2-frame disposal (frame 0 red, frame 1 disposal=2 restores transparent bg + green pixel)
+        let mut gif = Vec::from(*b"GIF89a");
+        gif.extend_from_slice(&2u16.to_le_bytes()); // w=2
+        gif.extend_from_slice(&1u16.to_le_bytes()); // h=1
+        gif.push(0b1000_0001); // GCT=1, size=4 colors (n=1 -> 2^(1+1)=4)
+        gif.push(0); // bg
+        gif.push(0); // aspect
+        gif.extend_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0]);
+        // GCE frame 0: disposal=2 (restore bg), delay=5 (50ms), transparent=3
+        gif.extend_from_slice(&[0x21, 0xF9, 4, 0x09, 5, 0, 3, 0]);
+        gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 2, 0, 1, 0, 0]);
+        gif.extend_from_slice(&build_gif_lzw_stream(2, &[0, 0]));
+        // GCE frame 1: disposal=0, delay=10 (100ms), transparent=3
+        gif.extend_from_slice(&[0x21, 0xF9, 4, 0x01, 10, 0, 3, 0]);
+        gif.extend_from_slice(&[0x2C, 1, 0, 0, 0, 1, 0, 1, 0, 0]); // x=1,w=1 -> left px bg/transparent!
+        gif.extend_from_slice(&build_gif_lzw_stream(2, &[1]));
+        gif.push(0x3B);
+        let im_gif = decode_image_bytes(&gif, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(im_gif.frame_count(), 2);
+        assert_eq!(im_gif.delays_ms, vec![50, 100]);
+        assert_eq!(im_gif.frame_data(0).unwrap(), &[255, 0, 0, 255, 255, 0, 0, 255]);
+        // Left pixel was cleared by disposal=2 to transparent black, right pixel drawn green:
+        assert_eq!(im_gif.frame_data(1).unwrap(), &[0, 0, 0, 0, 0, 255, 0, 255]);
+
+        // 6. JPEG baseline SOF0 (gray & YCbCr 4:4:4) + SOF2 progressive rejection E0502
+        let jpg_gray = build_test_jpeg_8x8(0xC0, false);
+        let jpg_ycbcr = build_test_jpeg_8x8(0xC0, true);
+        let jpg_sof2 = build_test_jpeg_8x8(0xC2, true);
+        let im_jg = decode_image_bytes(&jpg_gray, &DecodeOpts::strict_default(), None, None).unwrap();
+        let im_jc = decode_image_bytes(&jpg_ycbcr, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(im_jg.width, 8);
+        assert_eq!(im_jg.format, PixelFormat::R8);
+        assert_eq!(im_jc.width, 8);
+        assert_eq!(im_jc.format, PixelFormat::Rgb8);
+        let err_sof2 = decode_image_bytes(&jpg_sof2, &DecodeOpts::strict_default(), None, None).unwrap_err();
+        assert_eq!(diag::classify_code(&err_sof2), "E0502", "err: {}", err_sof2);
+        // Pin deterministic cross-platform JPEG hash check:
+        let jg_re = decode_image_bytes(&jpg_gray, &DecodeOpts::strict_default(), None, None).unwrap();
+        let jc_re = decode_image_bytes(&jpg_ycbcr, &DecodeOpts::strict_default(), None, None).unwrap();
+        assert_eq!(sha256_bytes(&im_jg.data), sha256_bytes(&jg_re.data));
+        assert_eq!(sha256_bytes(&im_jc.data), sha256_bytes(&jc_re.data));
+
+        // 7. Full end-to-end Askane VM script: image ops, NPOT mipmaps, textures/sampling,
+        // atlas, anim, gfx.draw_sprite_ex, ui.image/nine_slice with Value::Image,
+        // assets VFS bundle + manifest.toml + LRU eviction, and procgen determinism!
+        let mut norm_src = vec![0u8; 4 * 4 * 4];
+        for i in 0..16 {
+            norm_src[i * 4] = (i * 16) as u8;
+            norm_src[i * 4 + 1] = 128;
+            norm_src[i * 4 + 2] = 255;
+            norm_src[i * 4 + 3] = 255;
+        }
+        let norm_png = build_test_rgba_png(4, 4, &norm_src);
+
+        // Two-frame opaque tile PNG & transparent/red fringe image for mip & sprite tests
+        let sprite_a = build_test_rgba_png(4, 4, &rgba_4x4);
+        let tile2x2 = build_test_rgba_png(
+            2,
+            2,
+            &[
+                255, 0, 0, 255, 0, 255, 0, 255,
+                0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        );
+
+        let work_dir =
+            std::env::temp_dir().join(format!("askane_v020_stage3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_dir);
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("sprite.png"), &sprite_a).unwrap();
+        std::fs::write(work_dir.join("norm.png"), &norm_png).unwrap();
+        std::fs::write(work_dir.join("tile.png"), &tile2x2).unwrap();
+        std::fs::write(work_dir.join("hero.gif"), &gif).unwrap();
+        std::fs::write(work_dir.join("shot.jpg"), &jpg_ycbcr).unwrap();
+        std::fs::write(work_dir.join("icon.tga"), &tga10).unwrap();
+
+        let script = r##"
+import image;
+import assets;
+import procgen;
+import archive;
+import gfx;
+import ui;
+import json;
+import test;
+
+// Display, json E_TYPE, bad_opt checks
+let base = image.load("sprite.png");
+test.assert_eq(type_of(base), "image");
+let disp = str(base);
+test.assert(disp == "<image 4x4 rgba8 srgb>");
+let json_err = false;
+try { json.stringify(base); } catch e { json_err = true; }
+test.assert(json_err);
+
+let bad_opt = false;
+try { image.load("sprite.png", #{unknown_key: 1}); } catch e { bad_opt = true; }
+test.assert(bad_opt);
+
+let bad_rot = false;
+try { image.rotate(base, 45); } catch e { bad_rot = true; }
+test.assert(bad_rot);
+
+// Color space & format conversions & ops
+let r8 = image.convert(base, "r8");
+test.assert_eq(image.format(r8), "r8");
+let back_rgba = image.convert(r8, "rgba8");
+test.assert_eq(image.format(back_rgba), "rgba8");
+let lin = image.to_linear(base);
+test.assert_eq(image.color_space(lin), "linear");
+let srgb = image.to_srgb(lin);
+test.assert_eq(image.color_space(srgb), "srgb");
+
+// Premultiply check
+let raw_px = image.from_bytes([200, 100, 50, 128], 1, 1, "rgba8");
+let pm = image.premultiply(raw_px);
+let p0 = image.get_pixel(pm, 0, 0);
+test.assert_eq(p0[0], 100);
+test.assert_eq(p0[1], 50);
+test.assert_eq(p0[2], 25);
+test.assert_eq(p0[3], 128);
+
+// Crop, flip, rotate, resize
+let cr = image.crop(base, 1, 0, 2, 2);
+test.assert_eq(image.width(cr), 2);
+test.assert_eq(image.height(cr), 2);
+let fl = image.flip(base, true, false);
+test.assert_eq(image.get_pixel(fl, 0, 0), image.get_pixel(base, 3, 0));
+let rt = image.rotate(image.crop(base, 0, 0, 3, 2), 90);
+test.assert_eq(image.width(rt), 2);
+test.assert_eq(image.height(rt), 3);
+let rs = image.resize(base, 8, 8, "bilinear");
+test.assert_eq(image.width(rs), 8);
+test.assert_eq(image.digest(rs), image.digest(image.resize(base, 8, 8, "bilinear")));
+
+// NPOT 100x37 mipmaps (sRGB premul vs transparent edge, Linear data, 1x1 edge)
+let npot = image.new(100, 37, "rgba8", [255, 0, 0, 0]);
+test.assert_eq(image.mipmaps(npot), 7);
+test.assert_eq(image.mip_count(npot), 7);
+let m1 = image.mip_level(npot, 1);
+let m6 = image.mip_level(npot, 6);
+test.assert_eq(image.width(m1), 50);
+test.assert_eq(image.height(m1), 18);
+test.assert_eq(image.width(m6), 1);
+test.assert_eq(image.height(m6), 1);
+test.assert_eq(image.mipmaps(image.new(1, 1, "rgba8")), 1);
+let rg_lin = image.new(100, 37, #{format: "rg8", color_space: "linear", fill: [100, 200]});
+test.assert_eq(image.mipmaps(rg_lin), 7);
+let rg_last = image.mip_level(rg_lin, 6);
+test.assert_eq(image.get_pixel(rg_last, 0, 0)[0], 100);
+test.assert_eq(image.get_pixel(rg_last, 0, 0)[1], 200);
+
+// Texture sampling & wrap modes
+let tile = image.load("tile.png");
+let tex = image.texture(tile, #{wrap: "repeat", filter: "mip_nearest"});
+test.assert_eq(type_of(tex), "texture");
+test.assert_eq(image.sample(tex, 1.25, 0.25)[0], 255); // Repeat wraps U=1.25 -> texel (0,0) red
+test.assert_eq(image.sample(tex, 0.75, 0.25)[1], 255); // texel (1,0) green
+
+// Atlas + gfx.draw_sprite_ex + draw_atlas + anim + ui.image(Image)
+let atlas = image.atlas(#{ a: tile, b: cr }, #{padding: 1, max_size: 64});
+test.assert_eq(atlas.count, 2);
+let rect_a = gfx.atlas_rect(atlas, "a");
+test.assert_eq(rect_a.w, 2);
+let cropped_a = image.sprite_frame(atlas, "a");
+test.assert_eq(image.to_bytes(cropped_a), image.to_bytes(tile));
+test.assert_eq(image.digest(cropped_a), image.digest(image.sprite_frame(atlas, "a")));
+
+gfx.headless(true, 32, 32);
+gfx.clear(0, 0, 0);
+gfx.draw_sprite_ex(tile, 4, 4, #{flip_x: true});
+// Flipped horizontally: top-left pixel (4,4) was top-right green (0,255,0)!
+test.assert_eq(gfx.read_pixel(4, 4), 65280);
+gfx.draw_atlas(atlas, "a", 10, 10);
+test.assert_eq(gfx.read_pixel(10, 10), 16711680);
+
+// Anim modes: loop & once on 2 frames + GIF
+let gif_img = assets.load_image("hero.gif");
+test.assert_eq(image.frame_count(gif_img), 2);
+let an = gfx.make_anim([tile, fl], #{frame_ms: 50, mode: "loop"});
+test.assert_eq(gfx.anim_frame(an), 0);
+test.assert_eq(gfx.anim_update(an, 60), 1);
+test.assert_eq(gfx.anim_update(an, 60), 0);
+gfx.anim_draw(an, 20, 20);
+test.assert_eq(gfx.read_pixel(20, 20), 16711680);
+
+let an_once = gfx.make_anim(gif_img, #{mode: "once"});
+test.assert_eq(gfx.anim_update(an_once, 500), 1); // stays on last frame
+
+// UI accepts Value::Image & Value::Texture directly
+ui.window("UI", 80, 60, #{headless: true});
+let uroot = ui.row([ui.image(tile, #{width: 16, height: 16}), ui.icon_button(tex, "Go")]);
+ui.render(uroot);
+
+// Asset cache hits, LRU eviction with pinned handle & explicit GC
+let base_hit = assets.load_image("sprite.png");
+test.assert_eq(image.digest(base_hit), image.digest(base));
+let st_prev = assets.stats();
+test.assert(st_prev.hits >= 1);
+assets.clear();
+assets.set_budget(256);
+let keep = assets.load_image("shot.jpg"); // 192 bytes (pinned by `keep`)
+assets.load_image("norm.png"); // 64 bytes (unpinned, total 256)
+let before_ev = assets.stats();
+test.assert_eq(before_ev.used_bytes, 256);
+assets.set_budget(200); // forces LRU eviction of unpinned norm.png, keeps pinned shot.jpg
+let after_ev = assets.stats();
+test.assert(after_ev.evictions >= 1);
+test.assert_eq(after_ev.used_bytes, 192);
+assets.load_image("icon.tga"); // 6 bytes (unpinned, total 198)
+let evicted = assets.gc();
+test.assert_eq(evicted, 1);
+test.assert_eq(assets.stats().used_bytes, 192);
+test.assert(image.width(keep) == 8);
+
+// Bundle mount with __askane__/manifest.toml hints
+let zbytes = archive.pack(#{
+    "__askane__/manifest.toml": "[assets.\"packed/norm.png\"]\ncolor_space = \"linear\"\nfilter = \"mip_linear\"\nwrap = \"repeat\"\nmipmaps = true\n",
+    "packed/norm.png": assets.read_bytes("norm.png")
+});
+let bid = assets.mount_bytes(zbytes, "vfs");
+test.assert(assets.exists("vfs/packed/norm.png"));
+let vtex = assets.load_texture("vfs/packed/norm.png");
+test.assert_eq(image.color_space(vtex), "linear");
+test.assert(image.mip_count(vtex) > 1);
+test.assert(assets.unmount(bid));
+
+// Procgen determinism + height_to_normal
+let hm1 = procgen.heightmap(16, 16, #{seed: 42, octaves: 3, scale: 0.2});
+let hm2 = procgen.heightmap(16, 16, #{seed: 42, octaves: 3, scale: 0.2});
+test.assert_eq(image.digest(hm1), image.digest(hm2));
+test.assert_eq(image.format(hm1), "r8");
+test.assert_eq(image.color_space(hm1), "linear");
+let nm1 = procgen.normal_map(hm1, 2.5);
+let nm2 = image.height_to_normal(hm1, 2.5);
+test.assert_eq(image.digest(nm1), image.digest(nm2));
+test.assert_eq(image.format(nm1), "rg8");
+let chk = procgen.checker(8, 8, 4);
+test.assert_eq(image.get_pixel(chk, 0, 0), [255, 255, 255, 255]);
+test.assert_eq(image.get_pixel(chk, 4, 0), [40, 40, 40, 255]);
+true
+"##;
+
+        let mut vm = VM::new_with_sandbox(true);
+        vm.set_permissions(Permissions::sandboxed());
+        vm.set_current_dir(work_dir.clone());
+        vm.set_sandbox_root(work_dir.clone());
+        let budget = std::sync::Arc::clone(vm.budget_core());
+        let res = vm.run(compile_source(script).unwrap()).unwrap();
+        assert!(res.equals(&Value::Bool(true)));
+        let before_reset = budget.used_bytes();
+        drop(vm);
+        modules::reset_runtime_state();
+        // Reset refunds all RAII media/mips/bundle/surface guards; cache state is empty.
+        assert!(budget.used_bytes() < before_reset);
+        assert_eq!(crate::media::cache::cache_stats().0, 0);
+        assert_eq!(crate::media::cache::cache_stats().2, 0);
+
+        // Pure media RAII MediaBudgetGuard lifecycle on dedicated BudgetCore must refund to exact 0
+        {
+            let mcore = std::sync::Arc::new(budget::BudgetCore::new(
+                Some(4 * 1024 * 1024),
+                Some(4 * 1024 * 1024),
+            ));
+            let decoded =
+                decode_image_bytes(&png_seq, &DecodeOpts::strict_default(), Some(&mcore), None)
+                    .unwrap();
+            assert!(mcore.used_bytes() > 0);
+            let conv = crate::media::ops::convert_format(&decoded, PixelFormat::Rgb8, Some(&mcore)).unwrap();
+            let lin = crate::media::ops::to_linear(&conv, Some(&mcore)).unwrap();
+            let crp = crate::media::ops::crop(&lin, 0, 0, 2, 2, Some(&mcore)).unwrap();
+            let rsz = crate::media::ops::resize(&crp, 8, 8, "bilinear", Some(&mcore), None).unwrap();
+            let mips = rsz.ensure_mipmaps(Some(&mcore), None).unwrap();
+            assert_eq!(mips.level_count(), 4);
+            let nrm = crate::media::ops::height_to_normal(&rsz, 2.0, Some(&mcore)).unwrap();
+            let atl = crate::media::atlas::pack_atlas(
+                vec![("a".to_string(), rsz.clone()), ("b".to_string(), nrm.clone())],
+                1,
+                64,
+                Some(&mcore),
+                None,
+            )
+            .unwrap();
+            let tex = crate::media::image::TextureData::new(
+                atl.image.clone(),
+                crate::media::image::WrapMode::Repeat,
+                crate::media::image::WrapMode::Repeat,
+                crate::media::image::Filter::MipLinear,
+                false,
+                Some(&mcore),
+                None,
+            )
+            .unwrap();
+            assert!(mcore.used_bytes() > decoded.byte_len() as u64);
+            drop((decoded, conv, lin, crp, rsz, mips, nrm, atl, tex));
+            assert_eq!(mcore.used_bytes(), 0);
+        }
+
+        // Pure media VM run must refund exact media/mipmap/atlas bytes on drop + reset_runtime_state()
+        let pure_script = r#"
+import image;
+import assets;
+import procgen;
+import gfx;
+import ui;
+import test;
+
+let im = assets.load_image("sprite.png");
+let rs = image.resize(im, 16, 16, "bilinear");
+image.mipmaps(rs);
+let hm = procgen.heightmap(16, 16, 7);
+let nm = procgen.normal_map(hm, 2.0);
+let tex = image.texture(nm, #{filter: "mip_linear", wrap: "repeat"});
+let atl = image.atlas(#{a: im, b: rs, c: nm});
+gfx.headless(true, 32, 32);
+gfx.draw_atlas(atl, "a", 1, 1);
+ui.window("P", 64, 64, #{headless: true});
+ui.render(ui.image(tex));
+// Expected live media bytes:
+// im (64) + rs (1024 + mips 1364) + hm (256) + nm (512 + mips 682) + atl (21*16*4=1344)
+let mip_n = image.mipmaps(nm);
+test.assert_eq(mip_n, 5);
+true
+"#;
+        let mut pvm = VM::new_with_sandbox(true);
+        pvm.set_permissions(Permissions::sandboxed());
+        pvm.set_current_dir(work_dir.clone());
+        pvm.set_sandbox_root(work_dir.clone());
+        let pbudget = std::sync::Arc::clone(pvm.budget_core());
+        let pres = pvm.run(compile_source(pure_script).unwrap()).unwrap();
+        assert!(pres.equals(&Value::Bool(true)));
+        let live_used = pbudget.used_bytes();
+        let cached_bytes = crate::media::cache::cache_stats().0 as u64;
+        assert!(cached_bytes > 0);
+        drop(pvm);
+        modules::reset_runtime_state();
+        let after_reset = pbudget.used_bytes();
+        assert!(live_used > after_reset);
+        assert!(live_used - after_reset >= cached_bytes);
+        assert_eq!(crate::media::cache::cache_stats().0, 0);
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    #[test]
+    fn test_v020_stage3_media_fuzz_and_bombs() {
+        use crate::media::image::{DecodeOpts, decode_image_bytes};
+        use crate::modules::compress::{adler32_bytes, crc32_bytes, deflate_raw};
+        modules::reset_runtime_state();
+
+        let make_bad_png = |w: u32, h: u32, idat_len_override: Option<u32>, tag: &[u8; 4], bad_crc: bool| -> Vec<u8> {
+            let mut png = Vec::from(*b"\x89PNG\r\n\x1a\n");
+            let mut ihdr = Vec::new();
+            ihdr.extend_from_slice(&w.to_be_bytes());
+            ihdr.extend_from_slice(&h.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+            png.extend_from_slice(&(13u32).to_be_bytes());
+            let s = png.len();
+            png.extend_from_slice(b"IHDR");
+            png.extend_from_slice(&ihdr);
+            let crc = crc32_bytes(&png[s..]) ^ u32::from(bad_crc);
+            png.extend_from_slice(&crc.to_be_bytes());
+
+            let raw = vec![0u8; 64];
+            let def = deflate_raw(&raw);
+            let mut zlib = vec![0x78, 0x01];
+            zlib.extend_from_slice(&def);
+            zlib.extend_from_slice(&adler32_bytes(&raw).to_be_bytes());
+            let clen = idat_len_override.unwrap_or(zlib.len() as u32);
+            png.extend_from_slice(&clen.to_be_bytes());
+            let s2 = png.len();
+            png.extend_from_slice(tag);
+            png.extend_from_slice(&zlib);
+            let c2 = crc32_bytes(&png[s2..]);
+            png.extend_from_slice(&c2.to_be_bytes());
+            png
+        };
+
+        let opts = DecodeOpts::strict_default();
+        // 1. Targeted structural bombs across all 6 codecs
+        let mut bombs: Vec<Vec<u8>> = Vec::new();
+        // PNG bombs
+        bombs.push(make_bad_png(0, 1, None, b"IDAT", false));
+        bombs.push(make_bad_png(8193, 1, None, b"IDAT", false));
+        bombs.push(make_bad_png(6000, 6000, None, b"IDAT", false)); // > 33.5M pixel bomb
+        bombs.push(make_bad_png(2, 2, Some(0xFFFF_FFFF), b"IDAT", false)); // 0xFFFFFFFF length
+        bombs.push(make_bad_png(2, 2, None, b"IDAT", true)); // corrupt CRC
+        bombs.push(make_bad_png(2, 2, None, b"CRIT", false)); // unknown critical chunk!
+        bombs.push(b"\x89PNG\r\n\x1a\n".to_vec()); // EOF
+
+        // BMP bombs
+        bombs.push(b"BM".to_vec());
+        let mut bmp_rle = vec![0u8; 54];
+        bmp_rle[0..2].copy_from_slice(b"BM");
+        bmp_rle[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp_rle[18..22].copy_from_slice(&4i32.to_le_bytes());
+        bmp_rle[22..26].copy_from_slice(&4i32.to_le_bytes());
+        bmp_rle[28..30].copy_from_slice(&8u16.to_le_bytes());
+        bmp_rle[30..34].copy_from_slice(&1u32.to_le_bytes()); // RLE8
+        bombs.push(bmp_rle);
+        let mut bmp_ovf = vec![0u8; 54];
+        bmp_ovf[0..2].copy_from_slice(b"BM");
+        bmp_ovf[10..14].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        bmp_ovf[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp_ovf[18..22].copy_from_slice(&4097i32.to_le_bytes()); // > MAX_BMP_DIM
+        bmp_ovf[22..26].copy_from_slice(&1i32.to_le_bytes());
+        bmp_ovf[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bombs.push(bmp_ovf);
+
+        // JPEG bombs (SOF2, oversubscribed DHT, hv > 10, truncated SOS, bad DQT)
+        bombs.push(build_test_jpeg_8x8(0xC2, true)); // SOF2 progressive reject
+        bombs.push(build_test_jpeg_8x8(0xC9, false)); // arithmetic SOF9 reject
+        // Oversubscribed DHT Kraft > 65536
+        let mut bad_dht = vec![0xFF, 0xD8, 0xFF, 0xC4, 0x00, 22, 0x00, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 0xFF, 0xD9];
+        bombs.push(bad_dht.split_off(0));
+        // JPEG hv_sum > 10
+        let mut bad_mcu = build_test_jpeg_8x8(0xC0, true);
+        let sof_idx = bad_mcu.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        bad_mcu[sof_idx + 11] = 0x44; // 4*4 = 16 MCU blocks
+        bombs.push(bad_mcu);
+
+        // GIF bombs (LZW bad min_code_size, truncated GCT, self-ref/corrupt LZW)
+        let mut bad_gif = Vec::from(*b"GIF89a");
+        bad_gif.extend_from_slice(&[1, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 255, 255, 255, 0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 99, 0, 0x3B]);
+        bombs.push(bad_gif);
+        bombs.push(b"GIF89a\x10\x00\x10\x00\x87".to_vec());
+
+        // TGA bombs (id_len past EOF, RLE overrun)
+        let mut bad_tga_id = vec![0u8; 18];
+        bad_tga_id[0] = 200; // past EOF
+        bad_tga_id[2] = 2;
+        bad_tga_id[12] = 1;
+        bad_tga_id[14] = 1;
+        bad_tga_id[16] = 24;
+        bombs.push(bad_tga_id);
+        let mut bad_tga_rle = vec![0u8; 24];
+        bad_tga_rle[2] = 10;
+        bad_tga_rle[12] = 1;
+        bad_tga_rle[14] = 1;
+        bad_tga_rle[16] = 24;
+        bad_tga_rle[18] = 0xFF; // run=64 on 1x1!
+        bombs.push(bad_tga_rle);
+
+        // QOI bombs (oversized dims, wrong channels, missing end marker)
+        let mut bad_qoi = Vec::from(*b"qoif");
+        bad_qoi.extend_from_slice(&10000u32.to_be_bytes());
+        bad_qoi.extend_from_slice(&10000u32.to_be_bytes());
+        bad_qoi.extend_from_slice(&[4, 0, 0xFE, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0]);
+        bombs.push(bad_qoi);
+        bombs.push(vec![]);
+        bombs.push(b"WEBP\x00\x00\x00\x00VP8 ".to_vec());
+
+        for (i, payload) in bombs.iter().enumerate() {
+            assert!(
+                decode_image_bytes(payload, &opts, None, None).is_err(),
+                "targeted bomb #{} unexpectedly succeeded",
+                i
+            );
+        }
+
+        // Tight BudgetCore aborts cleanly without leaving leaked bytes
+        let tight = std::sync::Arc::new(budget::BudgetCore::new(Some(32), Some(1024)));
+        let big_png = build_test_rgba_png(8, 8, &vec![255u8; 8 * 8 * 4]);
+        assert!(decode_image_bytes(&big_png, &opts, Some(&tight), None).is_err());
+        assert_eq!(tight.used_bytes(), 0);
+
+        // 2. Deterministic PRNG 160-vector mutation fuzz suite (>= 180 total test vectors!)
+        let png_seed = build_test_rgba_png(4, 4, &[42u8; 64]);
+        let bmp_seed = build_bmp_raw(2, 2, 24, &[], &[vec![1, 2, 3, 4, 5, 6, 0, 0], vec![7, 8, 9, 10, 11, 12, 0, 0]]);
+        let qoi_seed = build_qoi_rgba(
+            2,
+            2,
+            &[1, 2, 3, 255, 1, 2, 3, 255, 1, 2, 3, 255, 1, 2, 3, 255],
+        );
+        let jpg_seed = build_test_jpeg_8x8(0xC0, true);
+        let gif_seed = {
+            let mut g = Vec::from(*b"GIF87a\x02\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff");
+            g.extend_from_slice(&[0x2C, 0, 0, 0, 0, 2, 0, 1, 0, 0]);
+            g.extend_from_slice(&build_gif_lzw_stream(2, &[0, 1]));
+            g.push(0x3B);
+            g
+        };
+        let tga_seed = {
+            let mut t = vec![0u8; 18 + 6];
+            t[2] = 2;
+            t[12] = 2;
+            t[14] = 1;
+            t[16] = 24;
+            t
+        };
+        let seeds: [&[u8]; 6] = [&png_seed, &bmp_seed, &qoi_seed, &jpg_seed, &gif_seed, &tga_seed];
+        let mut rng: u64 = 0x5A17_F020_3000_0001;
+        let next_u64 = |st: &mut u64| -> u64 {
+            *st = st.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *st;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+
+        let mut fuzz_budget = std::sync::Arc::new(budget::BudgetCore::new(
+            Some(4 * 1024 * 1024),
+            Some(8 * 1024 * 1024),
+        ));
+        for case_idx in 0..160usize {
+            let mut sample = seeds[case_idx % seeds.len()].to_vec();
+            let op = (next_u64(&mut rng) % 4) as usize;
+            if !sample.is_empty() {
+                match op {
+                    0 => {
+                        let new_len = (next_u64(&mut rng) as usize) % (sample.len() + 1);
+                        sample.truncate(new_len);
+                    }
+                    1 => {
+                        let idx = (next_u64(&mut rng) as usize) % sample.len();
+                        sample[idx] ^= ((next_u64(&mut rng) & 0xFF) as u8).max(1);
+                    }
+                    2 => {
+                        for _ in 0..3 {
+                            let idx = (next_u64(&mut rng) as usize) % sample.len();
+                            sample[idx] = (next_u64(&mut rng) & 0xFF) as u8;
+                        }
+                    }
+                    _ => {
+                        let extra = (next_u64(&mut rng) as usize) % 32;
+                        for _ in 0..extra {
+                            sample.push((next_u64(&mut rng) & 0xFF) as u8);
+                        }
+                    }
+                }
+            }
+            let _ = decode_image_bytes(&sample, &opts, Some(&fuzz_budget), None);
+            assert_eq!(
+                fuzz_budget.used_bytes(),
+                0,
+                "budget leak at fuzz case {}",
+                case_idx
+            );
+        }
+        fuzz_budget = std::sync::Arc::new(budget::BudgetCore::default());
+        assert_eq!(fuzz_budget.used_bytes(), 0);
+        modules::reset_runtime_state();
     }
 }

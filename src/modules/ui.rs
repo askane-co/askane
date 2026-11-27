@@ -108,7 +108,7 @@ struct WidgetNode {
     step_num: f64,
     options: Vec<String>,
     selected_idx: usize,
-    image_id: Option<i64>,
+    image_val: Option<Value>,
     slice: [i32; 4],
     width_hint: Option<i32>,
     height_hint: Option<i32>,
@@ -614,13 +614,24 @@ fn mod_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     make_node_dict("rect", args.first(), fields)
 }
 
+fn validate_ui_image_val(v: &Value, ctx: &str) -> Result<Value, String> {
+    match v {
+        Value::Image(_) | Value::Texture(_) | Value::Int(_) => Ok(v.clone()),
+        other => Err(format!(
+            "{} expects image, texture, or surface handle int, got '{}'",
+            ctx,
+            other.type_name()
+        )),
+    }
+}
+
 fn mod_image(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("ui.image() expects (handle, [opts])".to_string());
     }
-    let handle = as_i32(&args[0], "ui.image handle")? as i64;
+    let img = validate_ui_image_val(&args[0], "ui.image handle")?;
     let mut fields = crate::value::new_dict_with_capacity(2);
-    fields.insert("image".to_string(), Value::Int(handle));
+    fields.insert("image".to_string(), img);
     make_node_dict("image", args.get(1), fields)
 }
 
@@ -628,13 +639,13 @@ fn mod_nine_slice(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 5 || args.len() > 6 {
         return Err("ui.nine_slice() expects (handle, left, top, right, bottom, [opts])".to_string());
     }
-    let handle = as_i32(&args[0], "ui.nine_slice handle")? as i64;
+    let img = validate_ui_image_val(&args[0], "ui.nine_slice handle")?;
     let left = as_i32(&args[1], "ui.nine_slice left")?.max(0);
     let top = as_i32(&args[2], "ui.nine_slice top")?.max(0);
     let right = as_i32(&args[3], "ui.nine_slice right")?.max(0);
     let bottom = as_i32(&args[4], "ui.nine_slice bottom")?.max(0);
     let mut fields = crate::value::new_dict_with_capacity(6);
-    fields.insert("image".to_string(), Value::Int(handle));
+    fields.insert("image".to_string(), img);
     fields.insert("slice_l".to_string(), Value::Int(left as i64));
     fields.insert("slice_t".to_string(), Value::Int(top as i64));
     fields.insert("slice_r".to_string(), Value::Int(right as i64));
@@ -646,9 +657,9 @@ fn mod_icon_button(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err("ui.icon_button() expects (handle, text, [opts])".to_string());
     }
-    let handle = as_i32(&args[0], "ui.icon_button handle")? as i64;
+    let img = validate_ui_image_val(&args[0], "ui.icon_button handle")?;
     let mut fields = crate::value::new_dict_with_capacity(3);
-    fields.insert("image".to_string(), Value::Int(handle));
+    fields.insert("image".to_string(), img);
     fields.insert("text".to_string(), Value::from_str(args[1].to_string()));
     make_node_dict("icon_button", args.get(2), fields)
 }
@@ -787,8 +798,8 @@ fn parse_widget_node(
     };
     let disabled = matches!(map.get("disabled"), Some(Value::Bool(true)));
     let password = matches!(map.get("password"), Some(Value::Bool(true)));
-    let image_id = match map.get("image") {
-        Some(v) => Some(as_i32(v, "widget.image")? as i64),
+    let image_val = match map.get("image") {
+        Some(v) => Some(validate_ui_image_val(v, "widget.image")?),
         None => None,
     };
     let slice = [
@@ -841,7 +852,7 @@ fn parse_widget_node(
         step_num,
         options,
         selected_idx,
-        image_id,
+        image_val,
         slice,
         width_hint,
         height_hint,
@@ -917,8 +928,9 @@ fn measure_node(node: &WidgetNode, theme: &Theme) -> (i32, i32) {
         ),
         WidgetKind::Image | WidgetKind::NineSlice => {
             let (iw, ih) = node
-                .image_id
-                .and_then(|id| crate::modules::gfx::handle_dims(id))
+                .image_val
+                .as_ref()
+                .and_then(crate::modules::gfx::value_dims)
                 .unwrap_or((32, 32));
             (
                 node.width_hint.unwrap_or(iw.max(1)),
@@ -1300,6 +1312,74 @@ fn snap_slider(raw: f64, min: f64, max: f64, step: f64) -> f64 {
     }
 }
 
+fn blit_ui_media(
+    buf: &mut [u32],
+    bw: i32,
+    bh: i32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    media: &Value,
+    slice: Option<[i32; 4]>,
+) {
+    match media {
+        Value::Image(im) => {
+            let mut target = crate::media::compose::BlitTarget {
+                pixels: buf,
+                width: bw,
+                height: bh,
+                clip: None,
+                is_offscreen: false,
+            };
+            if let Some(sl) = slice {
+                crate::media::compose::blit_nine_slice(&mut target, im, dx, dy, dw, dh, sl);
+            } else {
+                let opts = crate::media::compose::BlitOpts {
+                    dst_x: dx as f64,
+                    dst_y: dy as f64,
+                    dst_w: Some(dw as f64),
+                    dst_h: Some(dh as f64),
+                    ..crate::media::compose::BlitOpts::default()
+                };
+                crate::media::compose::blit_image(&mut target, im, &opts);
+            }
+        }
+        Value::Texture(tex) => {
+            let mut target = crate::media::compose::BlitTarget {
+                pixels: buf,
+                width: bw,
+                height: bh,
+                clip: None,
+                is_offscreen: false,
+            };
+            if let Some(sl) = slice {
+                crate::media::compose::blit_nine_slice(&mut target, &tex.image, dx, dy, dw, dh, sl);
+            } else {
+                let opts = crate::media::compose::BlitOpts {
+                    dst_x: dx as f64,
+                    dst_y: dy as f64,
+                    dst_w: Some(dw as f64),
+                    dst_h: Some(dh as f64),
+                    filter: tex.filter,
+                    ..crate::media::compose::BlitOpts::default()
+                };
+                crate::media::compose::blit_image(&mut target, &tex.image, &opts);
+            }
+        }
+        Value::Int(id) => {
+            if let Ok((sw, sh, src)) = crate::modules::gfx::copy_handle_rgba(*id) {
+                if let Some(sl) = slice {
+                    blit_nine_slice_ui(buf, bw, bh, dx, dy, dw, dh, &src, sw, sh, sl);
+                } else {
+                    blit_scaled_ui(buf, bw, bh, dx, dy, dw, dh, &src, sw, sh, 0, 0, sw, sh);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_and_interact_node(
     node: &WidgetNode,
@@ -1352,32 +1432,16 @@ fn render_and_interact_node(
             }
         }
         WidgetKind::Image => {
-            if let Some(id) = node.image_id {
-                if let Ok((sw, sh, src)) = crate::modules::gfx::copy_handle_rgba(id) {
-                    blit_scaled_ui(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, &src, sw, sh, 0, 0, sw, sh);
-                }
+            if let Some(ref media) = node.image_val {
+                blit_ui_media(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, media, None);
             }
             if let Some(bc) = node.border_color {
                 stroke_rect(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, bc);
             }
         }
         WidgetKind::NineSlice => {
-            if let Some(id) = node.image_id {
-                if let Ok((sw, sh, src)) = crate::modules::gfx::copy_handle_rgba(id) {
-                    blit_nine_slice_ui(
-                        &mut sess.buffer,
-                        bw,
-                        bh,
-                        rect.x,
-                        rect.y,
-                        rect.w,
-                        rect.h,
-                        &src,
-                        sw,
-                        sh,
-                        node.slice,
-                    );
-                }
+            if let Some(ref media) = node.image_val {
+                blit_ui_media(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, media, Some(node.slice));
             }
             if let Some(bc) = node.border_color {
                 stroke_rect(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, bc);
@@ -1412,10 +1476,8 @@ fn render_and_interact_node(
             let icon_side = (rect.h - 8).clamp(8, rect.w - 8).max(8);
             let icon_x = rect.x + 6;
             let icon_y = rect.y + (rect.h - icon_side) / 2;
-            if let Some(id) = node.image_id {
-                if let Ok((sw, sh, src)) = crate::modules::gfx::copy_handle_rgba(id) {
-                    blit_scaled_ui(&mut sess.buffer, bw, bh, icon_x, icon_y, icon_side, icon_side, &src, sw, sh, 0, 0, sw, sh);
-                }
+            if let Some(ref media) = node.image_val {
+                blit_ui_media(&mut sess.buffer, bw, bh, icon_x, icon_y, icon_side, icon_side, media, None);
             }
             if !node.text.is_empty() {
                 sess.texts.push(TextDrawCmd {

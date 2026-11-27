@@ -1,4 +1,5 @@
-mod archive;
+pub(crate) mod archive;
+mod assets;
 mod audio;
 mod base64;
 mod binary;
@@ -20,6 +21,7 @@ pub(crate) mod hash;
 mod hex;
 mod html;
 mod http;
+mod image;
 mod ini;
 mod input;
 mod json;
@@ -33,6 +35,7 @@ mod os;
 mod path;
 mod pprint;
 mod process;
+mod procgen;
 pub(crate) mod random;
 mod regex;
 mod signal;
@@ -42,7 +45,7 @@ mod task;
 mod term;
 mod test;
 mod time;
-mod toml;
+pub(crate) mod toml;
 pub(crate) mod ui;
 mod url;
 mod uuid;
@@ -86,6 +89,7 @@ pub fn build_module(
 pub fn reset_runtime_state() {
     fs::reset_state();
     gfx::reset_state();
+    crate::media::reset_media_state();
     input::reset_state();
     ui::reset_state();
     kv::reset_state();
@@ -102,6 +106,9 @@ pub const BUILTIN_MODULE_NAMES: &[&str] = &[
     "json",
     "http",
     "gfx",
+    "image",
+    "assets",
+    "procgen",
     "strings",
     "path",
     "time",
@@ -183,6 +190,21 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
             "gui",
             "all",
             "2D framebuffer graphics (Win32 window & headless mode, sprite sheets, shapes, input & text)",
+        ),
+        "image" => (
+            "media",
+            "all",
+            "Safe image decoding, pixel formats, color ops, mipmaps, atlases & textures",
+        ),
+        "assets" => (
+            "media",
+            "all",
+            "Unified budget-aware asset cache, VFS ZIP bundles & manifest hints",
+        ),
+        "procgen" => (
+            "media",
+            "all",
+            "Deterministic fixed-point 2D noise, FBM heightmaps, normal maps & procedural patterns",
         ),
         "strings" => (
             "stdlib",
@@ -362,6 +384,9 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "json" => Some(json::module()),
         "http" => Some(http::module()),
         "gfx" => Some(gfx::module()),
+        "image" => Some(image::module()),
+        "assets" => Some(assets::module()),
+        "procgen" => Some(procgen::module()),
         "strings" => Some(strings::module()),
         "path" => Some(path::module()),
         "time" => Some(time::module()),
