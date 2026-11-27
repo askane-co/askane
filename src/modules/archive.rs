@@ -1,12 +1,11 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::modules::build_module;
 use crate::modules::compress::{DEFAULT_MAX_DECOMPRESS, crc32_bytes, deflate_raw, inflate_raw};
-use crate::value::Value;
+use crate::value::{DictMap, Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -48,7 +47,7 @@ fn validate_entry_name(name: &str) -> Result<String, String> {
     Ok(norm)
 }
 
-fn build_zip_bytes(vm: &mut VM, entries: &HashMap<String, Value>) -> Result<Vec<u8>, String> {
+fn build_zip_bytes(vm: &mut VM, entries: &DictMap) -> Result<Vec<u8>, String> {
     if entries.len() > u16::MAX as usize {
         return Err("archive.pack() entry count exceeds ZIP limit (65535)".to_string());
     }
@@ -365,15 +364,15 @@ fn archive_list(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let out: Vec<Value> = metas
         .into_iter()
         .map(|m| {
-            let mut map = HashMap::new();
-            map.insert("name".to_string(), Value::Str(m.name));
+            let mut map = new_dict_with_capacity(4);
+            map.insert("name".to_string(), Value::from_str(m.name));
             map.insert("size".to_string(), Value::Int(m.uncomp_size as i64));
             map.insert(
                 "compressed_size".to_string(),
                 Value::Int(m.comp_size as i64),
             );
             map.insert("method".to_string(), Value::Int(m.method as i64));
-            Value::Dict(Rc::new(RefCell::new(map)))
+            Value::dict(map)
         })
         .collect();
     Ok(Value::List(Rc::new(RefCell::new(out))))
@@ -448,7 +447,7 @@ fn archive_extract(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         if meta.name.ends_with('/') {
             continue;
         }
-        let joined = PathBuf::from(dest_dir).join(&meta.name);
+        let joined = PathBuf::from(dest_dir.as_str()).join(&meta.name);
         let joined_str = joined.to_string_lossy().to_string();
         let target_path = vm.resolve_write_path(&joined_str)?;
         crate::modules::fs::check_safe_write_target(vm, &target_path, &meta.name)?;

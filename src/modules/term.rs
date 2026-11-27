@@ -23,7 +23,7 @@ fn wrap_ansi(code: &str, args: &[Value], fn_name: &str) -> Result<Value, String>
     if args.len() != 1 {
         return Err(format!("term.{}() expects 1 argument", fn_name));
     }
-    Ok(Value::Str(format!("\x1b[{}m{}\x1b[0m", code, args[0])))
+    Ok(Value::from_str(format!("\x1b[{}m{}\x1b[0m", code, args[0])))
 }
 
 fn term_red(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {

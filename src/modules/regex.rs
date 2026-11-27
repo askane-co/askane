@@ -321,7 +321,7 @@ fn rx_find(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         Some((s, e)) => {
             let matched: String = chars[s..e].iter().collect();
             vm.charge_alloc(matched.len())?;
-            Ok(Value::Str(matched))
+            Ok(Value::from_str(matched))
         }
         None => Ok(Value::Unit),
     }
@@ -352,7 +352,7 @@ fn rx_find_all(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                     return Err("regex.find_all() output exceeds 64 MiB limit".to_string());
                 }
                 vm.charge_alloc(cost)?;
-                out.push(Value::Str(matched));
+                out.push(Value::from_str(matched));
                 pos = if e > s { e } else { s + 1 };
             }
             None => break,
@@ -421,5 +421,5 @@ fn rx_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             out.push(c);
         }
     }
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }

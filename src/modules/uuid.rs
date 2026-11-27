@@ -48,7 +48,7 @@ fn uuid_v4(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     fill_random(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
-    Ok(Value::Str(format!(
+    Ok(Value::from_str(format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         b[0],
         b[1],

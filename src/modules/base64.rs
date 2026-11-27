@@ -129,7 +129,7 @@ fn b64_encode_with(
     };
     vm.charge_alloc(raw.len().div_ceil(3).saturating_mul(4))?;
     vm.charge_work((raw.len() as u64) / 32 + 1)?;
-    Ok(Value::Str(encode_bytes(raw, alphabet, pad)))
+    Ok(Value::from_str(encode_bytes(raw, alphabet, pad)))
 }
 
 fn b64_encode(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -168,7 +168,7 @@ fn b64_decode(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let bytes = b64_decode_impl(vm, args, "decode", false)?;
     let text = String::from_utf8(bytes)
         .map_err(|_| "base64.decode(): decoded bytes are not valid UTF-8".to_string())?;
-    Ok(Value::Str(text))
+    Ok(Value::from_str(text))
 }
 
 fn b64_decode_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -180,7 +180,7 @@ fn b64_decode_url(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let bytes = b64_decode_impl(vm, args, "decode_url", true)?;
     let text = String::from_utf8(bytes)
         .map_err(|_| "base64.decode_url(): decoded bytes are not valid UTF-8".to_string())?;
-    Ok(Value::Str(text))
+    Ok(Value::from_str(text))
 }
 
 fn b64_decode_url_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

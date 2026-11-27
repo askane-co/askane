@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::modules::base64::{STD_ALPHABET, encode_bytes};
 use crate::modules::random::os_random_bytes;
 use crate::modules::{NativeFnPtr, build_module};
-use crate::value::{NativeFunction, StructDef, StructInstance, Value};
+use crate::value::{FastMap, StructDef, StructInstance, Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -53,14 +53,11 @@ thread_local! {
 
 fn make_def(name: &str, methods_spec: &[(&'static str, NativeFnPtr)]) -> Rc<StructDef> {
     let field_names = vec!["__id".to_string()];
-    let mut field_index = HashMap::new();
+    let mut field_index = FastMap::default();
     field_index.insert("__id".to_string(), 0);
-    let mut methods = HashMap::new();
+    let mut methods = new_dict_with_capacity(methods_spec.len());
     for &(mname, func) in methods_spec {
-        methods.insert(
-            mname.to_string(),
-            Value::NativeFn(NativeFunction { name: mname, func }),
-        );
+        methods.insert(mname.to_string(), Value::native_fn(mname, func));
     }
     Rc::new(StructDef {
         ic_id: crate::bytecode::next_ic_id(),
@@ -625,7 +622,7 @@ fn ws_recv(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                                     .map_err(|_| {
                                         "ws.recv(): invalid UTF-8 text frame".to_string()
                                     })?;
-                                Value::Str(text)
+                                Value::from_str(text)
                             }
                             _ => Value::Bytes(Rc::new(std::mem::take(&mut msg_buf))),
                         };
@@ -655,7 +652,7 @@ fn ws_local_addr(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             Some(WsHandle::Conn(c)) => c.stream.local_addr().map_err(|e| e.to_string())?,
             None => return Err("ws.local_addr(): handle is closed".to_string()),
         };
-        Ok(Value::Str(addr.to_string()))
+        Ok(Value::from_str(addr.to_string()))
     })
 }
 

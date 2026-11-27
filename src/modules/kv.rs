@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use crate::modules::compress::crc32_bytes;
 use crate::modules::{NativeFnPtr, build_module};
-use crate::value::{NativeFunction, StructDef, StructInstance, Value};
+use crate::value::{FastMap, StructDef, StructInstance, Value, new_dict_map, new_dict_with_capacity};
 use crate::vm::VM;
 
 const KV_MAGIC: &[u8; 8] = b"ASKV01\0\0";
@@ -52,14 +52,11 @@ fn make_kv_struct_def() -> Rc<StructDef> {
         ("close", kv_close),
     ];
     let field_names = vec!["__id".to_string()];
-    let mut field_index = HashMap::new();
+    let mut field_index = FastMap::default();
     field_index.insert("__id".to_string(), 0);
-    let mut methods = HashMap::new();
+    let mut methods = new_dict_with_capacity(methods_spec.len());
     for &(name, func) in methods_spec {
-        methods.insert(
-            name.to_string(),
-            Value::NativeFn(NativeFunction { name, func }),
-        );
+        methods.insert(name.to_string(), Value::native_fn(name, func));
     }
     Rc::new(StructDef {
         ic_id: crate::bytecode::next_ic_id(),
@@ -255,7 +252,7 @@ fn decode_value(data: &[u8], pos: &mut usize, depth: usize) -> Result<Value, Str
                 .map_err(|_| "kv: invalid UTF-8 string in store".to_string())?
                 .to_string();
             *pos += len;
-            Ok(Value::Str(s))
+            Ok(Value::from_str(s))
         }
         5 => {
             let len = read_u32_le(data, pos)? as usize;
@@ -282,7 +279,7 @@ fn decode_value(data: &[u8], pos: &mut usize, depth: usize) -> Result<Value, Str
             if count > 1_000_000 {
                 return Err("kv: dict count exceeds limit".to_string());
             }
-            let mut map = HashMap::new();
+            let mut map = new_dict_with_capacity(count.min(1024));
             for _ in 0..count {
                 let klen = read_u32_le(data, pos)? as usize;
                 if *pos + klen > data.len() {
@@ -295,7 +292,7 @@ fn decode_value(data: &[u8], pos: &mut usize, depth: usize) -> Result<Value, Str
                 let val = decode_value(data, pos, depth + 1)?;
                 map.insert(k, val);
             }
-            Ok(Value::Dict(Rc::new(RefCell::new(map))))
+            Ok(Value::dict(map))
         }
         _ => Err(format!("kv: unknown value tag {}", tag)),
     }
@@ -541,7 +538,7 @@ fn kv_keys(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 .len()
                 .saturating_mul(std::mem::size_of::<Value>() + 24),
         )?;
-        let keys: Vec<Value> = store.map.keys().cloned().map(Value::Str).collect();
+        let keys: Vec<Value> = store.map.keys().cloned().map(Value::from_str).collect();
         Ok(Value::List(Rc::new(RefCell::new(keys))))
     })
 }
@@ -553,7 +550,7 @@ fn kv_prefix(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let id = extract_store_id(&args[0], "kv.prefix()")?;
     let pfx = expect_str(&args[1], "kv.prefix()")?.to_string();
     with_store_mut(id, "kv.prefix()", |store| {
-        let mut out = HashMap::new();
+        let mut out = new_dict_map();
         for (k, v) in store.map.range(pfx.clone()..) {
             if !k.starts_with(&pfx) {
                 break;
@@ -564,7 +561,7 @@ fn kv_prefix(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             out.len()
                 .saturating_mul(std::mem::size_of::<Value>() * 2 + 24),
         )?;
-        Ok(Value::Dict(Rc::new(RefCell::new(out))))
+        Ok(Value::dict(out))
     })
 }
 

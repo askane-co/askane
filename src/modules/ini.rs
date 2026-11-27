@@ -1,9 +1,5 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{DictMap, Value, new_dict_map};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -28,7 +24,7 @@ fn ini_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    let mut root: HashMap<String, Value> = HashMap::new();
+    let mut root: DictMap = new_dict_map();
     let mut current_section: Option<String> = None;
 
     for (idx, raw_line) in text.lines().enumerate() {
@@ -45,7 +41,7 @@ fn ini_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 ));
             }
             root.entry(section.clone())
-                .or_insert_with(|| Value::Dict(Rc::new(RefCell::new(HashMap::new()))));
+                .or_insert_with(|| Value::dict(new_dict_map()));
             current_section = Some(section);
             continue;
         }
@@ -64,14 +60,14 @@ fn ini_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             };
         if let Some(sec) = &current_section {
             if let Some(Value::Dict(d)) = root.get(sec) {
-                d.borrow_mut().insert(key, Value::Str(val_clean));
+                d.borrow_mut().insert(key, Value::from_str(val_clean));
             }
         } else {
-            root.insert(key, Value::Str(val_clean));
+            root.insert(key, Value::from_str(val_clean));
         }
     }
 
-    Ok(Value::Dict(Rc::new(RefCell::new(root))))
+    Ok(Value::dict(root))
 }
 
 fn ini_stringify(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -114,5 +110,5 @@ fn ini_stringify(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             }
         }
     }
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }

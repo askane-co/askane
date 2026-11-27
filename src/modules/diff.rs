@@ -1,9 +1,9 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -94,7 +94,7 @@ fn diff_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     vm.charge_alloc(total_bytes)?;
     let out: Vec<Value> = ops
         .into_iter()
-        .map(|(tag, line)| Value::Str(format!("{} {}", tag, line)))
+        .map(|(tag, line)| Value::from_str(format!("{} {}", tag, line)))
         .collect();
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
@@ -125,16 +125,16 @@ fn diff_format(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         out.push(' ');
         out.push_str(line);
     }
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 fn record_entry(out: &mut Vec<Value>, path: &str, kind: &str, left: Value, right: Value) {
-    let mut map = HashMap::new();
-    map.insert("path".to_string(), Value::Str(path.to_string()));
-    map.insert("kind".to_string(), Value::Str(kind.to_string()));
+    let mut map = new_dict_with_capacity(4);
+    map.insert("path".to_string(), Value::from_str(path.to_string()));
+    map.insert("kind".to_string(), Value::from_str(kind.to_string()));
     map.insert("left".to_string(), left);
     map.insert("right".to_string(), right);
-    out.push(Value::Dict(Rc::new(RefCell::new(map))));
+    out.push(Value::dict(map));
 }
 
 fn collect_val_diffs(

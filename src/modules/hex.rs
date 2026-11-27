@@ -24,7 +24,7 @@ fn hex_encode(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     for &b in bytes.iter() {
         out.push_str(&format!("{:02x}", b));
     }
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 fn hex_decode(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

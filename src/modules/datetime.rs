@@ -1,10 +1,7 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -82,7 +79,7 @@ fn dt_utc_now(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs() as i64;
-    Ok(Value::Str(format_iso(ts)))
+    Ok(Value::from_str(format_iso(ts)))
 }
 
 fn dt_from_timestamp(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -94,15 +91,15 @@ fn dt_from_timestamp(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         _ => return Err("datetime.from_timestamp() expects an integer".to_string()),
     };
     let (y, m, d, hh, mm, ss) = decompose_unix(ts);
-    let mut map = HashMap::new();
+    let mut map = new_dict_with_capacity(7);
     map.insert("year".to_string(), Value::Int(y));
     map.insert("month".to_string(), Value::Int(m as i64));
     map.insert("day".to_string(), Value::Int(d as i64));
     map.insert("hour".to_string(), Value::Int(hh as i64));
     map.insert("minute".to_string(), Value::Int(mm as i64));
     map.insert("second".to_string(), Value::Int(ss as i64));
-    map.insert("iso".to_string(), Value::Str(format_iso(ts)));
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    map.insert("iso".to_string(), Value::from_str(format_iso(ts)));
+    Ok(Value::dict(map))
 }
 
 fn dt_format(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -125,7 +122,7 @@ fn dt_format(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         .replace("%H", &format!("{:02}", hh))
         .replace("%M", &format!("{:02}", mm))
         .replace("%S", &format!("{:02}", ss));
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 fn dt_parse_iso(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {

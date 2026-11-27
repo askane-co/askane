@@ -2,6 +2,13 @@ use std::collections::HashSet;
 
 use crate::ast::{AssignTarget, Expr, MatchArm, Pattern, Program, Stmt};
 
+/// Centralized list of all active diagnostic codes; codes 0500..056F are reserved for 0.20+ media, asset, map, and bundle diagnostics.
+#[allow(dead_code)]
+pub const ALL_CODES: &[&str] = &[
+    "E0101", "E0201", "E0202", "E0301", "E0302", "E0401", "E0402", "E0403", "E0404", "E0405",
+    "W0101", "W0102",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub code: &'static str,

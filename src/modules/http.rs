@@ -8,12 +8,9 @@ pub fn module() -> Value {
 
 #[cfg(windows)]
 mod winhttp {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::ffi::c_void;
-    use std::rc::Rc;
 
-    use crate::value::Value;
+    use crate::value::{Value, new_dict_with_capacity};
 
     pub type HInternet = *mut c_void;
 
@@ -274,10 +271,10 @@ mod winhttp {
             WinHttpCloseHandle(session);
 
             let body_str = String::from_utf8_lossy(&resp_bytes).to_string();
-            let mut map = HashMap::new();
+            let mut map = new_dict_with_capacity(2);
             map.insert("status".to_string(), Value::Int(status_code as i64));
-            map.insert("body".to_string(), Value::Str(body_str));
-            Ok(Value::Dict(Rc::new(RefCell::new(map))))
+            map.insert("body".to_string(), Value::from_str(body_str));
+            Ok(Value::dict(map))
         }
     }
 }

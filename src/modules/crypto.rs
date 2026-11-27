@@ -378,7 +378,7 @@ fn crypto_hmac_sha256_hex(vm: &mut VM, args: &[Value]) -> Result<Value, String> 
     for b in mac {
         hex.push_str(&format!("{:02x}", b));
     }
-    Ok(Value::Str(hex))
+    Ok(Value::from_str(hex))
 }
 
 fn crypto_constant_time_eq(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

@@ -1,9 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -105,7 +104,7 @@ fn csv_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let out: Vec<Value> = rows
         .into_iter()
         .map(|r| {
-            let cells = r.into_iter().map(Value::Str).collect();
+            let cells = r.into_iter().map(Value::from_str).collect();
             Value::List(Rc::new(RefCell::new(cells)))
         })
         .collect();
@@ -133,12 +132,12 @@ fn csv_parse_dicts(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let headers = rows.remove(0);
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut map = HashMap::new();
+        let mut map = new_dict_with_capacity(headers.len());
         for (idx, h) in headers.iter().enumerate() {
             let val = row.get(idx).cloned().unwrap_or_default();
-            map.insert(h.clone(), Value::Str(val));
+            map.insert(h.clone(), Value::from_str(val));
         }
-        out.push(Value::Dict(Rc::new(RefCell::new(map))));
+        out.push(Value::dict(map));
     }
     Ok(Value::List(Rc::new(RefCell::new(out))))
 }
@@ -179,5 +178,5 @@ fn csv_stringify(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
         lines.push(cells.join(&delim.to_string()));
     }
-    Ok(Value::Str(lines.join("\n")))
+    Ok(Value::from_str(lines.join("\n")))
 }

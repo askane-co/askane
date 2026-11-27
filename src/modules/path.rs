@@ -39,7 +39,7 @@ fn path_join(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     for arg in args {
         buf.push(expect_str(arg, "join")?);
     }
-    Ok(Value::Str(buf.to_string_lossy().to_string()))
+    Ok(Value::from_str(buf.to_string_lossy().to_string()))
 }
 
 fn path_parent(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -48,7 +48,7 @@ fn path_parent(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let p = Path::new(expect_str(&args[0], "parent")?);
     match p.parent() {
-        Some(parent) => Ok(Value::Str(parent.to_string_lossy().to_string())),
+        Some(parent) => Ok(Value::from_str(parent.to_string_lossy().to_string())),
         None => Ok(Value::Unit),
     }
 }
@@ -59,7 +59,7 @@ fn path_name(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let p = Path::new(expect_str(&args[0], "name")?);
     match p.file_name() {
-        Some(name) => Ok(Value::Str(name.to_string_lossy().to_string())),
+        Some(name) => Ok(Value::from_str(name.to_string_lossy().to_string())),
         None => Ok(Value::Unit),
     }
 }
@@ -70,7 +70,7 @@ fn path_stem(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let p = Path::new(expect_str(&args[0], "stem")?);
     match p.file_stem() {
-        Some(stem) => Ok(Value::Str(stem.to_string_lossy().to_string())),
+        Some(stem) => Ok(Value::from_str(stem.to_string_lossy().to_string())),
         None => Ok(Value::Unit),
     }
 }
@@ -81,7 +81,7 @@ fn path_extension(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let p = Path::new(expect_str(&args[0], "extension")?);
     match p.extension() {
-        Some(ext) => Ok(Value::Str(ext.to_string_lossy().to_string())),
+        Some(ext) => Ok(Value::from_str(ext.to_string_lossy().to_string())),
         None => Ok(Value::Unit),
     }
 }
@@ -111,5 +111,5 @@ fn path_normalize(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             other => out.push(other),
         }
     }
-    Ok(Value::Str(out.to_string_lossy().to_string()))
+    Ok(Value::from_str(out.to_string_lossy().to_string()))
 }

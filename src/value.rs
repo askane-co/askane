@@ -2,11 +2,114 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::buffer::BufData;
 use crate::bytecode::FunctionProto;
 use crate::vm::VM;
+
+#[inline]
+fn f32_slice_bits_eq(a: &[f32], b: &[f32]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits())
+}
+
+/// Fast zero-crate FxHash-style hasher for VM dictionaries, sets, struct fields, and module maps.
+#[derive(Default, Clone, Copy)]
+pub struct FxBuildHasher;
+
+pub struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    const K: u64 = 0x517cc1b727220a95;
+
+    #[inline(always)]
+    fn add_word(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(Self::K);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let w = u64::from_le_bytes(chunk.try_into().unwrap());
+            self.add_word(w);
+        }
+        let mut rem = chunks.remainder();
+        if rem.len() >= 4 {
+            let w = u32::from_le_bytes(rem[..4].try_into().unwrap()) as u64;
+            self.add_word(w);
+            rem = &rem[4..];
+        }
+        if rem.len() >= 2 {
+            let w = u16::from_le_bytes(rem[..2].try_into().unwrap()) as u64;
+            self.add_word(w);
+            rem = &rem[2..];
+        }
+        if let Some(&last) = rem.first() {
+            self.add_word(last as u64);
+        }
+    }
+
+    #[inline(always)]
+    fn write_u8(&mut self, i: u8) {
+        self.add_word(i as u64);
+    }
+
+    #[inline(always)]
+    fn write_u16(&mut self, i: u16) {
+        self.add_word(i as u64);
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.add_word(i as u64);
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.add_word(i);
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, i: usize) {
+        self.add_word(i as u64);
+    }
+}
+
+impl BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher { hash: 0 }
+    }
+}
+
+pub type FastMap<K, V> = HashMap<K, V, FxBuildHasher>;
+pub type DictMap = FastMap<String, Value>;
+
+#[inline]
+pub fn new_dict_map() -> DictMap {
+    HashMap::with_hasher(FxBuildHasher)
+}
+
+#[inline]
+pub fn new_dict_with_capacity(cap: usize) -> DictMap {
+    HashMap::with_capacity_and_hasher(cap, FxBuildHasher)
+}
 
 #[derive(Clone)]
 pub struct Closure {
@@ -28,13 +131,19 @@ pub struct NativeFunction {
     pub func: fn(&mut VM, &[Value]) -> Result<Value, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeData {
+    pub start: i64,
+    pub end: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SetKey {
     Int(i64),
     FloatBits(u64),
     Bool(bool),
-    Str(String),
-    Bytes(Vec<u8>),
+    Str(Rc<String>),
+    Bytes(Rc<Vec<u8>>),
     Unit,
 }
 
@@ -89,8 +198,8 @@ impl SetKey {
                 Ok(SetKey::FloatBits(normalized.to_bits()))
             }
             Value::Bool(b) => Ok(SetKey::Bool(*b)),
-            Value::Str(s) => Ok(SetKey::Str(s.clone())),
-            Value::Bytes(b) => Ok(SetKey::Bytes((**b).clone())),
+            Value::Str(s) => Ok(SetKey::Str(Rc::clone(s))),
+            Value::Bytes(b) => Ok(SetKey::Bytes(Rc::clone(b))),
             Value::Unit => Ok(SetKey::Unit),
             other => Err(format!(
                 "Type '{}' is not hashable and cannot be stored in a set",
@@ -103,7 +212,7 @@ impl SetKey {
 #[derive(Default, Clone)]
 pub struct AskaneSet {
     pub items: Vec<Value>,
-    pub index: HashMap<SetKey, usize>,
+    pub index: FastMap<SetKey, usize>,
 }
 
 impl AskaneSet {
@@ -142,9 +251,9 @@ pub struct StructDef {
     pub ic_id: u64,
     pub name: String,
     pub field_names: Vec<String>,
-    pub field_index: HashMap<String, usize>,
+    pub field_index: FastMap<String, usize>,
     pub field_defaults: Vec<Option<Value>>,
-    pub methods: HashMap<String, Value>,
+    pub methods: FastMap<String, Value>,
 }
 
 pub struct StructInstance {
@@ -161,7 +270,7 @@ pub struct BoundMethod {
 pub struct ModuleData {
     pub ic_id: u64,
     pub name: String,
-    pub exports: Rc<RefCell<HashMap<String, Value>>>,
+    pub exports: Rc<RefCell<FastMap<String, Value>>>,
 }
 
 #[derive(Clone)]
@@ -169,34 +278,89 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(String),
+    Unit,
+    #[allow(dead_code)]
+    Vec2(f32, f32),
+    Vec3(Rc<[f32; 3]>),
+    Vec4(Rc<[f32; 4]>),
+    Quat(Rc<[f32; 4]>),
+    Mat4(Rc<[f32; 16]>),
+    Str(Rc<String>),
     Bytes(Rc<Vec<u8>>),
     List(Rc<RefCell<Vec<Value>>>),
-    Dict(Rc<RefCell<HashMap<String, Value>>>),
+    Dict(Rc<RefCell<DictMap>>),
     Set(Rc<RefCell<AskaneSet>>),
-    Range { start: i64, end: i64 },
-    Unit,
+    Range(Rc<RangeData>),
+    Buffer(Rc<RefCell<BufData>>),
     Closure(Rc<Closure>),
-    NativeFn(NativeFunction),
+    NativeFn(Rc<NativeFunction>),
     BoundMethod(Rc<BoundMethod>),
     StructDef(Rc<StructDef>),
     StructInstance(Rc<StructInstance>),
     Module(Rc<ModuleData>),
 }
 
+// Compile-time guarantee required by Contract E1: Value stays 16 bytes in 100% safe Rust.
+const _: () = assert!(std::mem::size_of::<Value>() == 16);
+
 impl Value {
+    #[inline]
+    pub fn from_str(s: impl Into<String>) -> Self {
+        Value::Str(Rc::new(s.into()))
+    }
+
+    #[inline]
+    pub fn range(start: i64, end: i64) -> Self {
+        Value::Range(Rc::new(RangeData { start, end }))
+    }
+
+    #[inline]
+    pub fn native_fn(
+        name: &'static str,
+        func: fn(&mut VM, &[Value]) -> Result<Value, String>,
+    ) -> Self {
+        Value::NativeFn(Rc::new(NativeFunction { name, func }))
+    }
+
+    #[inline]
+    pub fn dict(map: DictMap) -> Self {
+        Value::Dict(Rc::new(RefCell::new(map)))
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn as_range(&self) -> Option<(i64, i64)> {
+        match self {
+            Value::Range(r) => Some((r.start, r.end)),
+            _ => None,
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Bool(b) => *b,
             Value::Unit => false,
             Value::Int(0) => false,
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
+            Value::Vec2(x, y) => *x != 0.0 || *y != 0.0,
+            Value::Vec3(v) => v.iter().any(|&c| c != 0.0 && !c.is_nan()),
+            Value::Vec4(v) => v.iter().any(|&c| c != 0.0 && !c.is_nan()),
+            Value::Quat(_) | Value::Mat4(_) => true,
             Value::Str(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
             Value::Dict(d) => !d.borrow().is_empty(),
             Value::Set(s) => !s.borrow().items.is_empty(),
-            Value::Range { start, end } => end > start,
+            Value::Range(r) => r.end > r.start,
+            Value::Buffer(b) => b.borrow().len > 0,
             _ => true,
         }
     }
@@ -206,12 +370,18 @@ impl Value {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
             Value::Bool(_) => "bool",
+            Value::Vec2(_, _) => "vec2",
+            Value::Vec3(_) => "vec3",
+            Value::Vec4(_) => "vec4",
+            Value::Quat(_) => "quat",
+            Value::Mat4(_) => "mat4",
             Value::Str(_) => "str",
             Value::Bytes(_) => "bytes",
             Value::List(_) => "list",
             Value::Dict(_) => "dict",
             Value::Set(_) => "set",
-            Value::Range { .. } => "range",
+            Value::Range(_) => "range",
+            Value::Buffer(_) => "buffer",
             Value::Unit => "unit",
             Value::Closure(_) | Value::NativeFn(_) | Value::BoundMethod(_) => "fn",
             Value::StructDef(_) => "struct",
@@ -224,6 +394,7 @@ impl Value {
         match self {
             Value::Bytes(b) => Ok(Cow::Borrowed(b.as_slice())),
             Value::Str(s) => Ok(Cow::Borrowed(s.as_bytes())),
+            Value::Buffer(b) => Ok(Cow::Owned(b.borrow().raw.clone())),
             Value::List(l) => {
                 let items = l.borrow();
                 let mut out = Vec::with_capacity(items.len());
@@ -238,7 +409,7 @@ impl Value {
                 Ok(Cow::Owned(out))
             }
             other => Err(format!(
-                "{} expects bytes, str, or byte list, got '{}'",
+                "{} expects bytes, str, buffer, or byte list, got '{}'",
                 ctx,
                 other.type_name()
             )),
@@ -252,12 +423,24 @@ impl Value {
                 (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
             }
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (Value::Unit, Value::Unit) => true,
-            (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
-                s1 == s2 && e1 == e2
+            (Value::Vec2(x1, y1), Value::Vec2(x2, y2)) => {
+                ((x1.is_nan() && x2.is_nan()) || x1.to_bits() == x2.to_bits())
+                    && ((y1.is_nan() && y2.is_nan()) || y1.to_bits() == y2.to_bits())
             }
+            (Value::Vec3(a), Value::Vec3(b)) => {
+                Rc::ptr_eq(a, b) || f32_slice_bits_eq(a.as_slice(), b.as_slice())
+            }
+            (Value::Vec4(a), Value::Vec4(b)) | (Value::Quat(a), Value::Quat(b)) => {
+                Rc::ptr_eq(a, b) || f32_slice_bits_eq(a.as_slice(), b.as_slice())
+            }
+            (Value::Mat4(a), Value::Mat4(b)) => {
+                Rc::ptr_eq(a, b) || f32_slice_bits_eq(a.as_slice(), b.as_slice())
+            }
+            (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b) || **a == **b,
+            (Value::Unit, Value::Unit) => true,
+            (Value::Range(a), Value::Range(b)) => a.start == b.start && a.end == b.end,
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
+            (Value::Buffer(a), Value::Buffer(b)) => Rc::ptr_eq(a, b),
             (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b),
             (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b),
             (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
@@ -277,7 +460,7 @@ impl Value {
 
     pub fn repr_string(&self) -> String {
         match self {
-            Value::Str(s) => format!("{:?}", s),
+            Value::Str(s) => format!("{:?}", s.as_str()),
             Value::Float(v) if v.is_nan() => "NaN".to_string(),
             Value::Float(v) if v.is_infinite() => {
                 if v.is_sign_positive() {
@@ -301,8 +484,8 @@ impl Value {
     fn equals_inner(&self, other: &Value, vm: Option<&mut VM>) -> Result<bool, String> {
         let mut budget = 1_000_005usize;
         let mut work_since_check = 0usize;
-        let mut visiting: HashMap<(usize, usize), usize> = HashMap::new();
-        let mut memo: HashMap<(usize, usize), bool> = HashMap::new();
+        let mut visiting: FastMap<(usize, usize), usize> = HashMap::with_hasher(FxBuildHasher);
+        let mut memo: FastMap<(usize, usize), bool> = HashMap::with_hasher(FxBuildHasher);
         let mut vm = vm;
         let (eq, _) = self.equals_depth(
             other,
@@ -323,8 +506,8 @@ impl Value {
         depth: usize,
         budget: &mut usize,
         work_since_check: &mut usize,
-        visiting: &mut HashMap<(usize, usize), usize>,
-        memo: &mut HashMap<(usize, usize), bool>,
+        visiting: &mut FastMap<(usize, usize), usize>,
+        memo: &mut FastMap<(usize, usize), bool>,
         vm: &mut Option<&mut VM>,
     ) -> Result<(bool, usize), String> {
         if depth > 256 || *budget == 0 {
@@ -343,8 +526,15 @@ impl Value {
             (Value::Int(a), Value::Float(b)) => int_eq_float(*a, *b),
             (Value::Float(a), Value::Int(b)) => int_eq_float(*b, *a),
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Vec2(x1, y1), Value::Vec2(x2, y2)) => x1 == x2 && y1 == y2,
+            (Value::Vec3(a), Value::Vec3(b)) => Rc::ptr_eq(a, b) || a.as_slice() == b.as_slice(),
+            (Value::Vec4(a), Value::Vec4(b)) | (Value::Quat(a), Value::Quat(b)) => {
+                Rc::ptr_eq(a, b) || a.as_slice() == b.as_slice()
+            }
+            (Value::Mat4(a), Value::Mat4(b)) => Rc::ptr_eq(a, b) || a.as_slice() == b.as_slice(),
+            (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b) || **a == **b,
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b) || **a == **b,
+            (Value::Buffer(a), Value::Buffer(b)) => Rc::ptr_eq(a, b) || *a.borrow() == *b.borrow(),
             (Value::Unit, Value::Unit) => true,
             (Value::List(a), Value::List(b)) => {
                 if Rc::ptr_eq(a, b) {
@@ -522,9 +712,7 @@ impl Value {
                 a_ref.items.len() == b_ref.items.len()
                     && a_ref.index.keys().all(|k| b_ref.index.contains_key(k))
             }
-            (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
-                s1 == s2 && e1 == e2
-            }
+            (Value::Range(a), Value::Range(b)) => a.start == b.start && a.end == b.end,
             (Value::Module(a), Value::Module(b)) => Rc::ptr_eq(&a.exports, &b.exports),
             _ => false,
         };
@@ -594,6 +782,26 @@ impl Value {
                     write!(f, "{}", v)
                 }
             }
+            Value::Vec2(x, y) => {
+                budget.consume(16);
+                write!(f, "vec2({}, {})", x, y)
+            }
+            Value::Vec3(v) => {
+                budget.consume(24);
+                write!(f, "vec3({}, {}, {})", v[0], v[1], v[2])
+            }
+            Value::Vec4(v) => {
+                budget.consume(32);
+                write!(f, "vec4({}, {}, {}, {})", v[0], v[1], v[2], v[3])
+            }
+            Value::Quat(q) => {
+                budget.consume(32);
+                write!(f, "quat({}, {}, {}, {})", q[0], q[1], q[2], q[3])
+            }
+            Value::Mat4(m) => {
+                budget.consume(64);
+                write!(f, "mat4({:?})", m.as_slice())
+            }
             Value::Bool(b) => {
                 budget.consume(5);
                 write!(f, "{}", b)
@@ -624,6 +832,11 @@ impl Value {
                 }
                 write!(f, "\"")
             }
+            Value::Buffer(b) => {
+                let buf = b.borrow();
+                budget.consume(24);
+                write!(f, "<buffer {}[{}]>", buf.elem.name(), buf.len)
+            }
             Value::Unit => {
                 budget.consume(4);
                 write!(f, "unit")
@@ -651,7 +864,7 @@ impl Value {
                     match item {
                         Value::Str(s) => {
                             budget.consume(s.len() + 2);
-                            write!(f, "{:?}", s)?;
+                            write!(f, "{:?}", s.as_str())?;
                         }
                         other => other.fmt_with_seen(f, seen, budget)?,
                     }
@@ -704,7 +917,7 @@ impl Value {
                     match val {
                         Value::Str(s) => {
                             budget.consume(s.len() + 2);
-                            write!(f, "{:?}", s)?;
+                            write!(f, "{:?}", s.as_str())?;
                         }
                         other => other.fmt_with_seen(f, seen, budget)?,
                     }
@@ -734,7 +947,7 @@ impl Value {
                     match item {
                         Value::Str(st) => {
                             budget.consume(st.len() + 2);
-                            write!(f, "{:?}", st)?;
+                            write!(f, "{:?}", st.as_str())?;
                         }
                         other => other.fmt_with_seen(f, seen, budget)?,
                     }
@@ -766,7 +979,7 @@ impl Value {
                     match v {
                         Value::Str(s) => {
                             budget.consume(k.len() + s.len() + 6);
-                            write!(f, "{:?}: {:?}", k, s)?;
+                            write!(f, "{:?}: {:?}", k, s.as_str())?;
                         }
                         other => {
                             budget.approx_bytes = budget.approx_bytes.saturating_add(k.len() + 4);
@@ -782,9 +995,9 @@ impl Value {
                 budget.consume(m.name.len() + 10);
                 write!(f, "<module {}>", m.name)
             }
-            Value::Range { start, end } => {
+            Value::Range(r) => {
                 budget.consume(20);
-                write!(f, "range({}, {})", start, end)
+                write!(f, "range({}, {})", r.start, r.end)
             }
         }
     }

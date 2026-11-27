@@ -1,9 +1,10 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{FastMap, FxBuildHasher, new_dict_with_capacity, Value};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -40,10 +41,10 @@ fn json_stringify(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("json.stringify() expects 1 argument".to_string());
     }
-    let mut out = String::new();
+    let mut out = String::with_capacity(64);
     let mut seen = HashSet::new();
     stringify_value(&args[0], &mut out, &mut seen)?;
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 fn stringify_value(val: &Value, out: &mut String, seen: &mut HashSet<usize>) -> Result<(), String> {
@@ -64,6 +65,12 @@ fn stringify_value(val: &Value, out: &mut String, seen: &mut HashSet<usize>) -> 
                 out.push_str("null");
             }
         }
+        Value::Vec2(x, y) => {
+            stringify_f32_slice(&[*x, *y], out);
+        }
+        Value::Vec3(v) => stringify_f32_slice(v.as_slice(), out),
+        Value::Vec4(v) | Value::Quat(v) => stringify_f32_slice(v.as_slice(), out),
+        Value::Mat4(m) => stringify_f32_slice(m.as_slice(), out),
         Value::Str(s) => write_json_string(s, out),
         Value::List(list) => {
             let ptr = Rc::as_ptr(list) as usize;
@@ -127,20 +134,50 @@ fn stringify_value(val: &Value, out: &mut String, seen: &mut HashSet<usize>) -> 
     Ok(())
 }
 
+fn stringify_f32_slice(vals: &[f32], out: &mut String) {
+    out.push('[');
+    for (i, &f) in vals.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if f.is_finite() {
+            out.push_str(&f.to_string());
+        } else {
+            out.push_str("null");
+        }
+    }
+    out.push(']');
+}
+
 fn write_json_string(s: &str, out: &mut String) {
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            if i > start {
+                out.push_str(&s[start..i]);
             }
-            c => out.push(c),
+            match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                c => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+            }
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
         }
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
     }
     out.push('"');
 }
@@ -151,6 +188,7 @@ struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     depth: usize,
+    intern_cache: FastMap<&'a str, Rc<String>>,
 }
 
 impl<'a> JsonParser<'a> {
@@ -159,24 +197,46 @@ impl<'a> JsonParser<'a> {
             bytes: input.as_bytes(),
             pos: 0,
             depth: 0,
+            intern_cache: HashMap::with_hasher(FxBuildHasher),
         }
     }
 
+    #[inline(always)]
     fn is_eof(&self) -> bool {
         self.pos >= self.bytes.len()
     }
 
+    #[inline(always)]
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
     }
 
+    #[inline]
     fn skip_ws(&mut self) {
-        while let Some(b) = self.peek() {
-            if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
-                self.pos += 1;
-            } else {
-                break;
+        let b = self.bytes;
+        while self.pos < b.len() && matches!(b[self.pos], b' ' | b'\t' | b'\n' | b'\r') {
+            self.pos += 1;
+        }
+    }
+
+    #[inline]
+    fn intern_str(&mut self, s: Cow<'a, str>) -> Rc<String> {
+        match s {
+            Cow::Borrowed(slice) => {
+                if slice.len() <= 48 {
+                    if let Some(cached) = self.intern_cache.get(slice) {
+                        return Rc::clone(cached);
+                    }
+                    let rc = Rc::new(slice.to_string());
+                    if self.intern_cache.len() < 512 {
+                        self.intern_cache.insert(slice, Rc::clone(&rc));
+                    }
+                    rc
+                } else {
+                    Rc::new(slice.to_string())
+                }
             }
+            Cow::Owned(owned) => Rc::new(owned),
         }
     }
 
@@ -195,7 +255,10 @@ impl<'a> JsonParser<'a> {
         let res = match b {
             b'n' => self.parse_null(),
             b't' | b'f' => self.parse_bool(),
-            b'"' => self.parse_string().map(Value::Str),
+            b'"' => {
+                let s = self.parse_string_cow()?;
+                Ok(Value::Str(self.intern_str(s)))
+            }
             b'[' => self.parse_array(),
             b'{' => self.parse_object(),
             b'-' | b'0'..=b'9' => self.parse_number(),
@@ -239,7 +302,7 @@ impl<'a> JsonParser<'a> {
                 self.pos += 1;
             }
             Some(b'1'..=b'9') => {
-                while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                     self.pos += 1;
                 }
             }
@@ -250,7 +313,7 @@ impl<'a> JsonParser<'a> {
             is_float = true;
             self.pos += 1;
             let digits = self.pos;
-            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
             if self.pos == digits {
@@ -264,14 +327,28 @@ impl<'a> JsonParser<'a> {
                 self.pos += 1;
             }
             let digits = self.pos;
-            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
             if self.pos == digits {
                 return Err("json.parse(): missing exponent digits".to_string());
             }
         }
-        let slice = std::str::from_utf8(&self.bytes[start..self.pos])
+        let raw_num = &self.bytes[start..self.pos];
+        if !is_float && raw_num.len() <= 18 {
+            // Fast path for exact signed small/medium integers without std float/decimal parse overhead.
+            let (neg, digits) = if raw_num[0] == b'-' {
+                (true, &raw_num[1..])
+            } else {
+                (false, raw_num)
+            };
+            let mut acc: i64 = 0;
+            for &d in digits {
+                acc = acc * 10 + ((d - b'0') as i64);
+            }
+            return Ok(Value::Int(if neg { -acc } else { acc }));
+        }
+        let slice = std::str::from_utf8(raw_num)
             .map_err(|_| "json.parse(): invalid utf8 in number".to_string())?;
         if is_float {
             let f: f64 = slice
@@ -289,14 +366,51 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_string(&mut self) -> Result<String, String> {
+    fn parse_string_cow(&mut self) -> Result<Cow<'a, str>, String> {
         self.pos += 1; // skip '"'
-        let mut out = String::new();
+        let start = self.pos;
+        let bytes = self.bytes;
+        let mut i = start;
+        let mut has_non_ascii = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'"' {
+                self.pos = i + 1;
+                let s = if has_non_ascii {
+                    std::str::from_utf8(&bytes[start..i])
+                        .map_err(|_| "json.parse(): invalid UTF-8".to_string())?
+                } else {
+                    std::str::from_utf8(&bytes[start..i]).unwrap()
+                };
+                return Ok(Cow::Borrowed(s));
+            }
+            if b == b'\\' {
+                break;
+            }
+            if b < 0x20 {
+                return Err("json.parse(): unescaped control character".to_string());
+            }
+            if b >= 0x80 {
+                has_non_ascii = true;
+            }
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err("json.parse(): unterminated string".to_string());
+        }
+
+        // Slow escape path: start with validated prefix up to backslash.
+        let prefix = std::str::from_utf8(&bytes[start..i])
+            .map_err(|_| "json.parse(): invalid UTF-8".to_string())?;
+        let mut out = String::with_capacity(prefix.len() + 16);
+        out.push_str(prefix);
+        self.pos = i;
+
         while !self.is_eof() {
             let b = self.bytes[self.pos];
             self.pos += 1;
             if b == b'"' {
-                return Ok(out);
+                return Ok(Cow::Owned(out));
             }
             if b == b'\\' {
                 if self.is_eof() {
@@ -355,7 +469,6 @@ impl<'a> JsonParser<'a> {
             } else if b < 0x80 {
                 out.push(b as char);
             } else {
-                // Multi-byte UTF-8 sequence
                 let rest = std::str::from_utf8(&self.bytes[self.pos - 1..])
                     .map_err(|_| "json.parse(): invalid UTF-8".to_string())?;
                 let ch = rest.chars().next().unwrap();
@@ -368,7 +481,7 @@ impl<'a> JsonParser<'a> {
 
     fn parse_array(&mut self) -> Result<Value, String> {
         self.pos += 1; // skip '['
-        let mut items = Vec::new();
+        let mut items = Vec::with_capacity(8);
         self.skip_ws();
         if self.peek() == Some(b']') {
             self.pos += 1;
@@ -393,18 +506,18 @@ impl<'a> JsonParser<'a> {
 
     fn parse_object(&mut self) -> Result<Value, String> {
         self.pos += 1; // skip '{'
-        let mut map = HashMap::new();
+        let mut map = new_dict_with_capacity(4);
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+            return Ok(Value::dict(map));
         }
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
                 return Err("json.parse(): expected string key in object".to_string());
             }
-            let key = self.parse_string()?;
+            let key = self.parse_string_cow()?.into_owned();
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return Err("json.parse(): expected ':' after object key".to_string());
@@ -424,6 +537,6 @@ impl<'a> JsonParser<'a> {
                 _ => return Err("json.parse(): expected ',' or '}' in object".to_string()),
             }
         }
-        Ok(Value::Dict(Rc::new(RefCell::new(map))))
+        Ok(Value::dict(map))
     }
 }

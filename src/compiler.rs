@@ -82,10 +82,21 @@ impl Compiler {
                 | crate::bytecode::Op::SubLocalInt(i, _)
                 | crate::bytecode::Op::LtLocalInt(i, _)
                 | crate::bytecode::Op::LeLocalInt(i, _)
-                | crate::bytecode::Op::IncLocalPop(i, _) => Some(*i),
+                | crate::bytecode::Op::IncLocalPop(i, _)
+                | crate::bytecode::Op::JumpIfLtLocalInt(i, _, _)
+                | crate::bytecode::Op::JumpIfLeLocalInt(i, _, _)
+                | crate::bytecode::Op::JumpIfGtLocalInt(i, _, _)
+                | crate::bytecode::Op::AppendLocalStr(i, _) => Some(*i),
                 crate::bytecode::Op::AddLocals(a, b)
                 | crate::bytecode::Op::SubLocals(a, b)
-                | crate::bytecode::Op::LtLocals(a, b) => Some((*a).max(*b)),
+                | crate::bytecode::Op::LtLocals(a, b)
+                | crate::bytecode::Op::JumpIfLtLocals(a, b, _)
+                | crate::bytecode::Op::JumpIfLeLocals(a, b, _)
+                | crate::bytecode::Op::GetIndexLocal(a, b)
+                | crate::bytecode::Op::SetIndexLocalPop(a, b)
+                | crate::bytecode::Op::AddLocalsPop(a, b)
+                | crate::bytecode::Op::SubLocalsPop(a, b)
+                | crate::bytecode::Op::MulLocals(a, b) => Some((*a).max(*b)),
                 crate::bytecode::Op::ForPrep(i, _) | crate::bytecode::Op::ForIter(i, _) => {
                     Some(i.saturating_add(2))
                 }
@@ -578,8 +589,13 @@ impl Compiler {
                     continue_jumps: Vec::new(),
                 });
 
-                self.compile_expr(cond)?;
-                let exit_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
+                let exit_jump = match self.compile_jump_if_false_fused(cond, span.line) {
+                    Some(j) => j,
+                    None => {
+                        self.compile_expr(cond)?;
+                        self.emit(Op::JumpIfFalsePop(0), span.line)
+                    }
+                };
 
                 self.compile_expr(body)?;
                 self.emit(Op::Pop, span.line);
@@ -940,6 +956,30 @@ impl Compiler {
                     self.emit(Op::IncLocalPop(slot, delta), line);
                     return Ok(());
                 }
+                if let Some((dst, src, is_sub, line)) = self.match_local_binary_assign_pop(expr) {
+                    self.emit(
+                        if is_sub {
+                            Op::SubLocalsPop(dst, src)
+                        } else {
+                            Op::AddLocalsPop(dst, src)
+                        },
+                        line,
+                    );
+                    return Ok(());
+                }
+                if let Some((slot, literal, line)) = self.match_local_append_str(expr) {
+                    let cidx = self.current().chunk.add_string_constant(&literal);
+                    self.emit(Op::AppendLocalStr(slot, cidx), line);
+                    return Ok(());
+                }
+                if let Some((obj_slot, idx_slot, rhs_expr, line)) =
+                    self.match_pure_local_set_index(expr)
+                {
+                    let rhs_cloned = rhs_expr.clone();
+                    self.compile_expr(&rhs_cloned)?;
+                    self.emit(Op::SetIndexLocalPop(obj_slot, idx_slot), line);
+                    return Ok(());
+                }
                 self.compile_expr(expr)?;
                 self.emit(Op::Pop, expr.span().line);
                 Ok(())
@@ -1270,8 +1310,13 @@ impl Compiler {
                 else_branch,
                 span,
             } => {
-                self.compile_expr(cond)?;
-                let else_jump = self.emit(Op::JumpIfFalsePop(0), span.line);
+                let else_jump = match self.compile_jump_if_false_fused(cond, span.line) {
+                    Some(j) => j,
+                    None => {
+                        self.compile_expr(cond)?;
+                        self.emit(Op::JumpIfFalsePop(0), span.line)
+                    }
+                };
 
                 self.compile_expr_inner(then_branch, in_tail)?;
                 let end_jump = self.emit(Op::Jump(0), span.line);
@@ -1846,6 +1891,17 @@ impl Compiler {
                 index,
                 span,
             } => {
+                if let (Expr::Ident(obj_name, _), Expr::Ident(idx_name, _)) =
+                    (object.as_ref(), index.as_ref())
+                {
+                    if let (Some(obj_slot), Some(idx_slot)) = (
+                        self.match_local_slot(obj_name),
+                        self.match_local_slot(idx_name),
+                    ) {
+                        self.emit(Op::GetIndexLocal(obj_slot, idx_slot), span.line);
+                        return Ok(());
+                    }
+                }
                 self.compile_expr(object)?;
                 self.push_temps(1);
                 self.compile_expr(index)?;
@@ -2119,6 +2175,7 @@ impl Compiler {
                 return match op {
                     BinaryOp::Add => Some(Op::AddLocals(a, b)),
                     BinaryOp::Sub => Some(Op::SubLocals(a, b)),
+                    BinaryOp::Mul => Some(Op::MulLocals(a, b)),
                     BinaryOp::Lt => Some(Op::LtLocals(a, b)),
                     _ => None,
                 };
@@ -2185,6 +2242,186 @@ impl Compiler {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn match_local_binary_assign_pop(&self, expr: &Expr) -> Option<(u16, u16, bool, usize)> {
+        let Expr::Assign {
+            target,
+            op,
+            value,
+            span,
+        } = expr
+        else {
+            return None;
+        };
+        let AssignTarget::Var(target_name) = target.as_ref() else {
+            return None;
+        };
+        let dst = self.match_local_slot(target_name)?;
+        match op {
+            Some(BinaryOp::Add) => {
+                if let Expr::Ident(rhs_name, _) = value.as_ref() {
+                    return self
+                        .match_local_slot(rhs_name)
+                        .map(|src| (dst, src, false, span.line));
+                }
+                None
+            }
+            Some(BinaryOp::Sub) => {
+                if let Expr::Ident(rhs_name, _) = value.as_ref() {
+                    return self
+                        .match_local_slot(rhs_name)
+                        .map(|src| (dst, src, true, span.line));
+                }
+                None
+            }
+            None => {
+                if let Expr::Binary {
+                    left,
+                    op: bin_op,
+                    right,
+                    ..
+                } = value.as_ref()
+                {
+                    if let (Expr::Ident(lhs_name, _), Expr::Ident(rhs_name, _)) =
+                        (left.as_ref(), right.as_ref())
+                    {
+                        if lhs_name == target_name {
+                            return match bin_op {
+                                BinaryOp::Add => self
+                                    .match_local_slot(rhs_name)
+                                    .map(|src| (dst, src, false, span.line)),
+                                BinaryOp::Sub => self
+                                    .match_local_slot(rhs_name)
+                                    .map(|src| (dst, src, true, span.line)),
+                                _ => None,
+                            };
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn compile_jump_if_false_fused(&mut self, cond: &Expr, line: usize) -> Option<usize> {
+        let Expr::Binary {
+            left, op, right, ..
+        } = cond
+        else {
+            return None;
+        };
+        if let (Expr::Ident(name, _), Expr::Int(imm, _)) = (left.as_ref(), right.as_ref()) {
+            if let (Some(slot), Ok(v)) = (self.match_local_slot(name), i32::try_from(*imm)) {
+                return match op {
+                    BinaryOp::Lt => Some(self.emit(Op::JumpIfLtLocalInt(slot, v, 0), line)),
+                    BinaryOp::Le => Some(self.emit(Op::JumpIfLeLocalInt(slot, v, 0), line)),
+                    BinaryOp::Gt => Some(self.emit(Op::JumpIfGtLocalInt(slot, v, 0), line)),
+                    _ => None,
+                };
+            }
+        }
+        if let (Expr::Ident(lhs, _), Expr::Ident(rhs, _)) = (left.as_ref(), right.as_ref()) {
+            if let (Some(a), Some(b)) = (self.match_local_slot(lhs), self.match_local_slot(rhs)) {
+                return match op {
+                    BinaryOp::Lt => Some(self.emit(Op::JumpIfLtLocals(a, b, 0), line)),
+                    BinaryOp::Le => Some(self.emit(Op::JumpIfLeLocals(a, b, 0), line)),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    fn match_local_append_str(&self, expr: &Expr) -> Option<(u16, String, usize)> {
+        let Expr::Assign {
+            target,
+            op,
+            value,
+            span,
+        } = expr
+        else {
+            return None;
+        };
+        let AssignTarget::Var(target_name) = target.as_ref() else {
+            return None;
+        };
+        let slot = self.match_local_slot(target_name)?;
+        match op {
+            Some(BinaryOp::Add) => {
+                if let Expr::Str(lit, _) = value.as_ref() {
+                    return Some((slot, lit.clone(), span.line));
+                }
+                None
+            }
+            None => {
+                if let Expr::Binary {
+                    left,
+                    op: BinaryOp::Add,
+                    right,
+                    ..
+                } = value.as_ref()
+                {
+                    if let (Expr::Ident(lhs_name, _), Expr::Str(lit, _)) =
+                        (left.as_ref(), right.as_ref())
+                    {
+                        if lhs_name == target_name {
+                            return Some((slot, lit.clone(), span.line));
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn match_pure_local_set_index<'a>(
+        &self,
+        expr: &'a Expr,
+    ) -> Option<(u16, u16, &'a Expr, usize)> {
+        let Expr::Assign {
+            target,
+            op: None,
+            value,
+            span,
+        } = expr
+        else {
+            return None;
+        };
+        let AssignTarget::Index { object, index } = target.as_ref() else {
+            return None;
+        };
+        let (Expr::Ident(obj_name, _), Expr::Ident(idx_name, _)) =
+            (object.as_ref(), index.as_ref())
+        else {
+            return None;
+        };
+        let obj_slot = self.match_local_slot(obj_name)?;
+        let idx_slot = self.match_local_slot(idx_name)?;
+        if !self.is_nonthrowing_pure_rhs(value) {
+            return None;
+        }
+        Some((obj_slot, idx_slot, value.as_ref(), span.line))
+    }
+
+    fn is_nonthrowing_pure_rhs(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Int(_, _)
+            | Expr::Float(_, _)
+            | Expr::Str(_, _)
+            | Expr::Bytes(_, _)
+            | Expr::Bool(_, _)
+            | Expr::Unit(_) => true,
+            Expr::Ident(name, _) => self.match_local_slot(name).is_some(),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            } => matches!(expr.as_ref(), Expr::Int(_, _) | Expr::Float(_, _)),
+            _ => false,
         }
     }
 }

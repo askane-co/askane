@@ -2,6 +2,7 @@ mod archive;
 mod audio;
 mod base64;
 mod binary;
+mod buffer;
 mod bytes;
 mod cli;
 mod clipboard;
@@ -24,6 +25,7 @@ mod input;
 mod json;
 mod kv;
 pub(crate) mod log;
+mod geom;
 mod math;
 mod mem;
 mod net;
@@ -41,7 +43,7 @@ mod term;
 mod test;
 mod time;
 mod toml;
-mod ui;
+pub(crate) mod ui;
 mod url;
 mod uuid;
 mod ws;
@@ -51,7 +53,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::value::{ModuleData, NativeFunction, Value};
+use crate::value::{FxBuildHasher, ModuleData, NativeFunction, Value};
 use crate::vm::VM;
 
 pub type NativeFnPtr = fn(&mut VM, &[Value]) -> Result<Value, String>;
@@ -61,14 +63,14 @@ pub fn build_module(
     fns: &[(&'static str, NativeFnPtr)],
     consts: &[(&str, Value)],
 ) -> Value {
-    let mut exports = HashMap::new();
+    let mut exports = HashMap::with_hasher(FxBuildHasher);
     for &(fn_name, func) in fns {
         exports.insert(
             fn_name.to_string(),
-            Value::NativeFn(NativeFunction {
+            Value::NativeFn(Rc::new(NativeFunction {
                 name: fn_name,
                 func,
-            }),
+            })),
         );
     }
     for (k, v) in consts {
@@ -92,6 +94,7 @@ pub fn reset_runtime_state() {
 }
 
 pub const BUILTIN_MODULE_NAMES: &[&str] = &[
+    "geom",
     "math",
     "fs",
     "sys",
@@ -105,6 +108,7 @@ pub const BUILTIN_MODULE_NAMES: &[&str] = &[
     "random",
     "base64",
     "bytes",
+    "buffer",
     "csv",
     "log",
     "test",
@@ -209,6 +213,11 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
             "data",
             "all",
             "Byte buffer conversions and zero-allocation helpers",
+        ),
+        "buffer" => (
+            "data",
+            "all",
+            "Typed binary buffers (u8/i32/u32/f32) with safe element views and BudgetCore tracking",
         ),
         "csv" => (
             "data",
@@ -338,12 +347,14 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
             "Cooperative green tasks (spawn, yield_now, sleep, join, select, timeout)",
         ),
         "channel" => ("runtime", "all", "Bounded channels with deadlock detection"),
+        "geom" => ("math", "all", "2D/3D vectors, matrices, quaternions, rays, AABBs and frustums"),
         _ => ("other", "all", ""),
     }
 }
 
 pub fn get_builtin_module(name: &str) -> Option<Value> {
     match name {
+        "geom" => Some(geom::module()),
         "math" => Some(math::module()),
         "fs" => Some(fs::module()),
         "sys" => Some(sys::module()),
@@ -357,6 +368,7 @@ pub fn get_builtin_module(name: &str) -> Option<Value> {
         "random" => Some(random::module()),
         "base64" => Some(base64::module()),
         "bytes" => Some(bytes::module()),
+        "buffer" => Some(buffer::module()),
         "csv" => Some(csv::module()),
         "log" => Some(log::module()),
         "test" => Some(test::module()),

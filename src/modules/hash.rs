@@ -105,7 +105,7 @@ fn hash_sha256(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     for b in digest {
         hex.push_str(&format!("{:02x}", b));
     }
-    Ok(Value::Str(hex))
+    Ok(Value::from_str(hex))
 }
 
 fn hash_crc32(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

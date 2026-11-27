@@ -64,7 +64,9 @@ pub(crate) fn str_split(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 .saturating_mul(std::mem::size_of::<Value>() + 4)
                 .saturating_add(text.len()),
         )?;
-        text.chars().map(|c| Value::Str(c.to_string())).collect()
+        text.chars()
+            .map(|c| Value::from_str(c.to_string()))
+            .collect()
     } else {
         let count = text.split(sep).count();
         vm.charge_alloc(
@@ -72,7 +74,7 @@ pub(crate) fn str_split(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 .saturating_mul(std::mem::size_of::<Value>())
                 .saturating_add(text.len()),
         )?;
-        text.split(sep).map(|p| Value::Str(p.to_string())).collect()
+        text.split(sep).map(Value::from_str).collect()
     };
     Ok(Value::List(Rc::new(RefCell::new(parts))))
 }
@@ -85,7 +87,7 @@ pub(crate) fn str_trim(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let trimmed = text.trim();
     vm.charge_alloc(trimmed.len())?;
     vm.charge_work((text.len() as u64) / 64 + 1)?;
-    Ok(Value::Str(trimmed.to_string()))
+    Ok(Value::from_str(trimmed))
 }
 
 pub(crate) fn str_trim_start(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -96,7 +98,7 @@ pub(crate) fn str_trim_start(vm: &mut VM, args: &[Value]) -> Result<Value, Strin
     let trimmed = text.trim_start();
     vm.charge_alloc(trimmed.len())?;
     vm.charge_work((text.len() as u64) / 64 + 1)?;
-    Ok(Value::Str(trimmed.to_string()))
+    Ok(Value::from_str(trimmed))
 }
 
 pub(crate) fn str_trim_end(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -107,7 +109,7 @@ pub(crate) fn str_trim_end(vm: &mut VM, args: &[Value]) -> Result<Value, String>
     let trimmed = text.trim_end();
     vm.charge_alloc(trimmed.len())?;
     vm.charge_work((text.len() as u64) / 64 + 1)?;
-    Ok(Value::Str(trimmed.to_string()))
+    Ok(Value::from_str(trimmed))
 }
 
 pub(crate) fn str_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -126,7 +128,7 @@ pub(crate) fn str_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> 
             return Err("strings.replace() output exceeds 64 MiB limit".to_string());
         }
         vm.charge_alloc(out_len)?;
-        return Ok(Value::Str(text.replace(from, to)));
+        return Ok(Value::from_str(text.replace(from, to)));
     }
     let mut out = String::new();
     let mut last = 0;
@@ -145,7 +147,7 @@ pub(crate) fn str_replace(vm: &mut VM, args: &[Value]) -> Result<Value, String> 
     }
     out.push_str(tail);
     vm.charge_alloc(out.len())?;
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 pub(crate) fn str_contains(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -186,7 +188,7 @@ pub(crate) fn str_upper(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if out.len() > s.len() {
         vm.charge_alloc(out.len() - s.len())?;
     }
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 pub(crate) fn str_lower(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -200,7 +202,7 @@ pub(crate) fn str_lower(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if out.len() > s.len() {
         vm.charge_alloc(out.len() - s.len())?;
     }
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 pub(crate) fn str_find(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -230,7 +232,7 @@ pub(crate) fn str_repeat(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     vm.charge_alloc(out_len)?;
     vm.charge_work((out_len as u64) / 64 + 1)?;
-    Ok(Value::Str(text.repeat(count)))
+    Ok(Value::from_str(text.repeat(count)))
 }
 
 pub(crate) fn str_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -245,7 +247,7 @@ pub(crate) fn str_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .saturating_mul(std::mem::size_of::<Value>())
             .saturating_add(text.len()),
     )?;
-    let lines: Vec<Value> = text.lines().map(|l| Value::Str(l.to_string())).collect();
+    let lines: Vec<Value> = text.lines().map(Value::from_str).collect();
     Ok(Value::List(Rc::new(RefCell::new(lines))))
 }
 
@@ -293,7 +295,7 @@ pub(crate) fn str_pad_start(vm: &mut VM, args: &[Value]) -> Result<Value, String
     } else {
         " "
     };
-    Ok(Value::Str(pad_impl(vm, text, width, fill, true)?))
+    Ok(Value::from_str(pad_impl(vm, text, width, fill, true)?))
 }
 
 pub(crate) fn str_pad_end(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -310,7 +312,7 @@ pub(crate) fn str_pad_end(vm: &mut VM, args: &[Value]) -> Result<Value, String> 
     } else {
         " "
     };
-    Ok(Value::Str(pad_impl(vm, text, width, fill, false)?))
+    Ok(Value::from_str(pad_impl(vm, text, width, fill, false)?))
 }
 
 pub(crate) fn str_slice(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -340,7 +342,7 @@ pub(crate) fn str_slice(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let s = norm(start_raw);
     let e = norm(end_raw);
     if s >= e {
-        return Ok(Value::Str(String::new()));
+        return Ok(Value::from_str(""));
     }
     let mut start_byte = text.len();
     let mut end_byte = text.len();
@@ -355,7 +357,7 @@ pub(crate) fn str_slice(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let sliced = &text[start_byte..end_byte];
     vm.charge_alloc(sliced.len())?;
-    Ok(Value::Str(sliced.to_string()))
+    Ok(Value::from_str(sliced))
 }
 
 pub(crate) fn str_join(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -389,7 +391,7 @@ pub(crate) fn str_join(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     vm.charge_alloc(out.len())?;
     vm.charge_work((out.len() as u64) / 64 + 1)?;
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 fn str_byte_len(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -439,7 +441,7 @@ fn str_strip_prefix(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let pfx = expect_str(&args[1], "strip_prefix")?;
     let out = text.strip_prefix(pfx).unwrap_or(text);
     vm.charge_alloc(out.len())?;
-    Ok(Value::Str(out.to_string()))
+    Ok(Value::from_str(out))
 }
 
 fn str_strip_suffix(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -450,7 +452,7 @@ fn str_strip_suffix(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let sfx = expect_str(&args[1], "strip_suffix")?;
     let out = text.strip_suffix(sfx).unwrap_or(text);
     vm.charge_alloc(out.len())?;
-    Ok(Value::Str(out.to_string()))
+    Ok(Value::from_str(out))
 }
 
 fn split_once_impl(vm: &mut VM, args: &[Value], rev: bool, name: &str) -> Result<Value, String> {
@@ -475,8 +477,8 @@ fn split_once_impl(vm: &mut VM, args: &[Value], rev: bool, name: &str) -> Result
         Some((l, r)) => {
             vm.charge_alloc(text.len())?;
             Ok(Value::List(Rc::new(RefCell::new(vec![
-                Value::Str(l.to_string()),
-                Value::Str(r.to_string()),
+                Value::from_str(l),
+                Value::from_str(r),
             ]))))
         }
         None => Ok(Value::Unit),
@@ -505,12 +507,12 @@ fn str_truncate_utf8(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     };
     if max_bytes >= text.len() {
-        return Ok(Value::Str(text.to_string()));
+        return Ok(args[0].clone());
     }
     let mut end = max_bytes;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     vm.charge_alloc(end)?;
-    Ok(Value::Str(text[..end].to_string()))
+    Ok(Value::from_str(&text[..end]))
 }

@@ -1,11 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::env;
 use std::process;
 use std::rc::Rc;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{new_dict_with_capacity, Value};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -30,8 +29,8 @@ fn sys_args(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("sys.args() expects 0 arguments".to_string());
     }
     let list: Vec<Value> = match vm.script_args_slice() {
-        Some(args) => args.iter().cloned().map(Value::Str).collect(),
-        None => env::args().map(Value::Str).collect(),
+        Some(args) => args.iter().map(|s| Value::from_str(s.clone())).collect(),
+        None => env::args().map(Value::from_str).collect(),
     };
     Ok(Value::List(Rc::new(RefCell::new(list))))
 }
@@ -51,7 +50,7 @@ fn sys_env(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     };
     vm.check_env(name)?;
     match env::var(name) {
-        Ok(val) => Ok(Value::Str(val)),
+        Ok(val) => Ok(Value::from_str(val)),
         Err(_) => Ok(Value::Unit),
     }
 }
@@ -72,14 +71,14 @@ fn sys_os(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("sys.os() expects 0 arguments".to_string());
     }
-    Ok(Value::Str(env::consts::OS.to_string()))
+    Ok(Value::from_str(env::consts::OS))
 }
 
 fn sys_arch(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("sys.arch() expects 0 arguments".to_string());
     }
-    Ok(Value::Str(env::consts::ARCH.to_string()))
+    Ok(Value::from_str(env::consts::ARCH))
 }
 
 fn sys_sleep(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -99,27 +98,32 @@ fn sys_budget(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("sys.budget() expects 0 arguments".to_string());
     }
-    let (mem_used, mem_limit, io_used, io_limit, steps_left) = vm.budget_snapshot();
-    let mut map = HashMap::new();
-    map.insert("memory_used".to_string(), Value::Int(mem_used as i64));
+    let snap = vm.budget_snapshot_full();
+    let mut map = new_dict_with_capacity(8);
+    map.insert("memory_used".to_string(), Value::Int(snap.memory_used as i64));
+    map.insert(
+        "memory_peak".to_string(),
+        Value::Int(snap.memory_peak as i64),
+    );
     map.insert(
         "memory_limit".to_string(),
-        mem_limit
+        snap.memory_limit
             .map(|v| Value::Int(v as i64))
             .unwrap_or(Value::Unit),
     );
-    map.insert("io_used".to_string(), Value::Int(io_used as i64));
+    map.insert("io_used".to_string(), Value::Int(snap.io_used as i64));
     map.insert(
         "io_limit".to_string(),
-        io_limit
+        snap.io_limit
             .map(|v| Value::Int(v as i64))
             .unwrap_or(Value::Unit),
     );
+    map.insert("work_steps".to_string(), Value::Int(snap.work_steps as i64));
     map.insert(
         "instructions_left".to_string(),
-        steps_left
+        snap.instructions_left
             .map(|v| Value::Int(v as i64))
             .unwrap_or(Value::Unit),
     );
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    Ok(Value::dict(map))
 }

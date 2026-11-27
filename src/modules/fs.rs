@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::modules::{NativeFnPtr, build_module};
-use crate::value::{NativeFunction, StructDef, StructInstance, Value};
+use crate::value::{FastMap, StructDef, StructInstance, Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -111,7 +111,7 @@ fn fs_read(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let content = crate::read_text_limited(&path_buf, MAX_FS_BYTES)
         .map_err(|e| format!("fs.read('{}'): {}", path, e))?;
-    Ok(Value::Str(content))
+    Ok(Value::from_str(content))
 }
 
 fn fs_write(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -196,7 +196,7 @@ fn fs_list_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         let entry = entry.map_err(|e| format!("fs.list_dir('{}'): {}", path, e))?;
         let s = entry.file_name().to_string_lossy().to_string();
         vm.charge_alloc(s.len().saturating_add(std::mem::size_of::<Value>()))?;
-        names.push(Value::Str(s));
+        names.push(Value::from_str(s));
     }
     Ok(Value::List(Rc::new(RefCell::new(names))))
 }
@@ -376,7 +376,7 @@ fn collect_glob(
                 && vm.resolve_read_path(&check_target).is_ok()
             {
                 vm.charge_alloc(rel_str.len().saturating_add(std::mem::size_of::<Value>()))?;
-                out.push(Value::Str(rel_str));
+                out.push(Value::from_str(rel_str));
             }
             if meta.is_dir() {
                 collect_glob(vm, &path, base, pattern, out, depth + 1)?;
@@ -426,14 +426,11 @@ struct FsStreamRegistry {
 
 fn make_handle_def(name: &str, methods_spec: &[(&'static str, NativeFnPtr)]) -> Rc<StructDef> {
     let field_names = vec!["__id".to_string()];
-    let mut field_index = HashMap::new();
+    let mut field_index = FastMap::default();
     field_index.insert("__id".to_string(), 0);
-    let mut methods = HashMap::new();
+    let mut methods = new_dict_with_capacity(methods_spec.len());
     for &(mname, func) in methods_spec {
-        methods.insert(
-            mname.to_string(),
-            Value::NativeFn(NativeFunction { name: mname, func }),
-        );
+        methods.insert(mname.to_string(), Value::native_fn(mname, func));
     }
     Rc::new(StructDef {
         ic_id: crate::bytecode::next_ic_id(),
@@ -571,7 +568,7 @@ fn fs_read_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         };
         vm.charge_io(line.len().max(1))?;
         vm.charge_alloc(line.len().saturating_add(std::mem::size_of::<Value>()))?;
-        lines.push(Value::Str(line));
+        lines.push(Value::from_str(line));
     }
     Ok(Value::List(Rc::new(RefCell::new(lines))))
 }
@@ -678,7 +675,7 @@ fn fs_reader_next(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         Some(line) => {
             vm.charge_io(line.len().max(1))?;
             vm.charge_alloc(line.len())?;
-            Ok(Value::Str(line))
+            Ok(Value::from_str(line))
         }
         None => Ok(Value::Unit),
     }
@@ -896,7 +893,7 @@ fn fs_temp_file(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             Ok(_) => {
                 let display = strip_verbatim(&candidate).into_owned();
                 vm.charge_io(1)?;
-                return Ok(Value::Str(display));
+                return Ok(Value::from_str(display));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("fs.temp_file(): {}", e)),
@@ -948,12 +945,12 @@ fn walk_collect(
         let is_dir = meta.is_dir();
         let size = if meta.is_file() { meta.len() as i64 } else { 0 };
         vm.charge_alloc(rel.len() + name.len() + 128)?;
-        let mut map = HashMap::new();
-        map.insert("path".to_string(), Value::Str(rel));
-        map.insert("name".to_string(), Value::Str(name));
+        let mut map = new_dict_with_capacity(4);
+        map.insert("path".to_string(), Value::from_str(rel));
+        map.insert("name".to_string(), Value::from_str(name));
         map.insert("is_dir".to_string(), Value::Bool(is_dir));
         map.insert("size".to_string(), Value::Int(size));
-        out.push(Value::Dict(Rc::new(RefCell::new(map))));
+        out.push(Value::dict(map));
         if is_dir && depth < max_depth {
             walk_collect(vm, &path, base, out, depth + 1, max_depth, max_entries)?;
         }

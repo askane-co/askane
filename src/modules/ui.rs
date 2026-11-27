@@ -87,6 +87,10 @@ enum WidgetKind {
     Slider,
     Select,
     Spacer,
+    Rect,
+    Image,
+    NineSlice,
+    IconButton,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +108,8 @@ struct WidgetNode {
     step_num: f64,
     options: Vec<String>,
     selected_idx: usize,
+    image_id: Option<i64>,
+    slice: [i32; 4],
     width_hint: Option<i32>,
     height_hint: Option<i32>,
     padding: Option<i32>,
@@ -235,6 +241,10 @@ pub fn module() -> Value {
             ("slider", mod_slider),
             ("select", mod_select),
             ("spacer", mod_spacer),
+            ("rect", mod_rect),
+            ("image", mod_image),
+            ("nine_slice", mod_nine_slice),
+            ("icon_button", mod_icon_button),
             ("window", mod_window),
             ("is_open", mod_is_open),
             ("close", mod_close),
@@ -346,7 +356,7 @@ fn as_str<'a>(val: &'a Value, ctx: &str) -> Result<&'a str, String> {
 }
 
 fn theme_to_value(t: &Theme) -> Value {
-    let mut map = HashMap::new();
+    let mut map = crate::value::new_dict_with_capacity(14);
     map.insert("bg".to_string(), Value::Int(t.bg as i64));
     map.insert("surface".to_string(), Value::Int(t.surface as i64));
     map.insert(
@@ -373,7 +383,7 @@ fn theme_to_value(t: &Theme) -> Value {
     map.insert("padding".to_string(), Value::Int(t.padding as i64));
     map.insert("spacing".to_string(), Value::Int(t.spacing as i64));
     map.insert("font_size".to_string(), Value::Int(t.font_size as i64));
-    Value::Dict(Rc::new(RefCell::new(map)))
+    Value::dict(map)
 }
 
 fn parse_theme(val: Option<&Value>, base: &Theme) -> Result<Theme, String> {
@@ -486,9 +496,9 @@ fn mod_theme(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 fn make_node_dict(
     kind: &str,
     opts: Option<&Value>,
-    mut fields: HashMap<String, Value>,
+    mut fields: crate::value::DictMap,
 ) -> Result<Value, String> {
-    fields.insert("__ui_node".to_string(), Value::Str(kind.to_string()));
+    fields.insert("__ui_node".to_string(), Value::from_str(kind));
     if let Some(opt_val) = opts {
         let Value::Dict(d) = opt_val else {
             return Err(format!("ui.{}() options must be a dict", kind));
@@ -499,14 +509,14 @@ fn make_node_dict(
             }
         }
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(fields))))
+    Ok(Value::dict(fields))
 }
 
 fn mod_column(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("ui.column() expects (children, [opts])".to_string());
     }
-    let mut fields = HashMap::new();
+    let mut fields = crate::value::new_dict_with_capacity(2);
     fields.insert("children".to_string(), args[0].clone());
     make_node_dict("column", args.get(1), fields)
 }
@@ -515,7 +525,7 @@ fn mod_row(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("ui.row() expects (children, [opts])".to_string());
     }
-    let mut fields = HashMap::new();
+    let mut fields = crate::value::new_dict_with_capacity(2);
     fields.insert("children".to_string(), args[0].clone());
     make_node_dict("row", args.get(1), fields)
 }
@@ -524,8 +534,8 @@ fn mod_label(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("ui.label() expects (text, [opts])".to_string());
     }
-    let mut fields = HashMap::new();
-    fields.insert("text".to_string(), Value::Str(args[0].to_string()));
+    let mut fields = crate::value::new_dict_with_capacity(2);
+    fields.insert("text".to_string(), Value::from_str(args[0].to_string()));
     make_node_dict("label", args.get(1), fields)
 }
 
@@ -533,8 +543,8 @@ fn mod_button(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("ui.button() expects (text, [opts])".to_string());
     }
-    let mut fields = HashMap::new();
-    fields.insert("text".to_string(), Value::Str(args[0].to_string()));
+    let mut fields = crate::value::new_dict_with_capacity(2);
+    fields.insert("text".to_string(), Value::from_str(args[0].to_string()));
     make_node_dict("button", args.get(1), fields)
 }
 
@@ -542,8 +552,8 @@ fn mod_text_input(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("ui.text_input() expects (value, [opts])".to_string());
     }
-    let mut fields = HashMap::new();
-    fields.insert("value".to_string(), Value::Str(args[0].to_string()));
+    let mut fields = crate::value::new_dict_with_capacity(2);
+    fields.insert("value".to_string(), Value::from_str(args[0].to_string()));
     make_node_dict("text_input", args.get(1), fields)
 }
 
@@ -552,8 +562,8 @@ fn mod_checkbox(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("ui.checkbox() expects (label, checked, [opts])".to_string());
     }
     let checked = matches!(args[1], Value::Bool(true));
-    let mut fields = HashMap::new();
-    fields.insert("text".to_string(), Value::Str(args[0].to_string()));
+    let mut fields = crate::value::new_dict_with_capacity(3);
+    fields.insert("text".to_string(), Value::from_str(args[0].to_string()));
     fields.insert("checked".to_string(), Value::Bool(checked));
     make_node_dict("checkbox", args.get(2), fields)
 }
@@ -568,7 +578,7 @@ fn mod_slider(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if min > max {
         return Err("ui.slider() min cannot be greater than max".to_string());
     }
-    let mut fields = HashMap::new();
+    let mut fields = crate::value::new_dict_with_capacity(4);
     fields.insert("value".to_string(), Value::Float(val.clamp(min, max)));
     fields.insert("min".to_string(), Value::Float(min));
     fields.insert("max".to_string(), Value::Float(max));
@@ -579,7 +589,7 @@ fn mod_select(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err("ui.select() expects (options, selected, [opts])".to_string());
     }
-    let mut fields = HashMap::new();
+    let mut fields = crate::value::new_dict_with_capacity(3);
     fields.insert("options".to_string(), args[0].clone());
     fields.insert("selected".to_string(), args[1].clone());
     make_node_dict("select", args.get(2), fields)
@@ -589,11 +599,58 @@ fn mod_spacer(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() > 1 {
         return Err("ui.spacer() expects 0 or 1 argument (size)".to_string());
     }
-    let mut fields = HashMap::new();
+    let mut fields = crate::value::new_dict_map();
     if let Some(sz) = args.first() {
         fields.insert("size".to_string(), sz.clone());
     }
     make_node_dict("spacer", None, fields)
+}
+
+fn mod_rect(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err("ui.rect() expects 0 or 1 argument (opts)".to_string());
+    }
+    let fields = crate::value::new_dict_map();
+    make_node_dict("rect", args.first(), fields)
+}
+
+fn mod_image(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err("ui.image() expects (handle, [opts])".to_string());
+    }
+    let handle = as_i32(&args[0], "ui.image handle")? as i64;
+    let mut fields = crate::value::new_dict_with_capacity(2);
+    fields.insert("image".to_string(), Value::Int(handle));
+    make_node_dict("image", args.get(1), fields)
+}
+
+fn mod_nine_slice(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 5 || args.len() > 6 {
+        return Err("ui.nine_slice() expects (handle, left, top, right, bottom, [opts])".to_string());
+    }
+    let handle = as_i32(&args[0], "ui.nine_slice handle")? as i64;
+    let left = as_i32(&args[1], "ui.nine_slice left")?.max(0);
+    let top = as_i32(&args[2], "ui.nine_slice top")?.max(0);
+    let right = as_i32(&args[3], "ui.nine_slice right")?.max(0);
+    let bottom = as_i32(&args[4], "ui.nine_slice bottom")?.max(0);
+    let mut fields = crate::value::new_dict_with_capacity(6);
+    fields.insert("image".to_string(), Value::Int(handle));
+    fields.insert("slice_l".to_string(), Value::Int(left as i64));
+    fields.insert("slice_t".to_string(), Value::Int(top as i64));
+    fields.insert("slice_r".to_string(), Value::Int(right as i64));
+    fields.insert("slice_b".to_string(), Value::Int(bottom as i64));
+    make_node_dict("nine_slice", args.get(5), fields)
+}
+
+fn mod_icon_button(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err("ui.icon_button() expects (handle, text, [opts])".to_string());
+    }
+    let handle = as_i32(&args[0], "ui.icon_button handle")? as i64;
+    let mut fields = crate::value::new_dict_with_capacity(3);
+    fields.insert("image".to_string(), Value::Int(handle));
+    fields.insert("text".to_string(), Value::from_str(args[1].to_string()));
+    make_node_dict("icon_button", args.get(2), fields)
 }
 
 fn parse_widget_node(
@@ -631,11 +688,15 @@ fn parse_widget_node(
         "slider" => (WidgetKind::Slider, "slider"),
         "select" => (WidgetKind::Select, "select"),
         "spacer" => (WidgetKind::Spacer, "spacer"),
+        "rect" => (WidgetKind::Rect, "rect"),
+        "image" => (WidgetKind::Image, "image"),
+        "nine_slice" => (WidgetKind::NineSlice, "nine_slice"),
+        "icon_button" => (WidgetKind::IconButton, "icon_button"),
         other => return Err(format!("Unknown UI widget kind: '{}'", other)),
     };
 
     let (id, explicit_id) = if let Some(Value::Str(s)) = map.get("id") {
-        (s.clone(), true)
+        (s.as_ref().clone(), true)
     } else {
         *auto_id += 1;
         (format!("__auto_{}_{}", kind_name, *auto_id), false)
@@ -688,7 +749,7 @@ fn parse_widget_node(
                 (*i).clamp(0, options.len() as i64 - 1) as usize
             }
         }
-        Some(Value::Str(s)) => options.iter().position(|o| o == s).unwrap_or(0),
+        Some(Value::Str(s)) => options.iter().position(|o| o == s.as_str()).unwrap_or(0),
         _ => 0,
     };
 
@@ -726,6 +787,28 @@ fn parse_widget_node(
     };
     let disabled = matches!(map.get("disabled"), Some(Value::Bool(true)));
     let password = matches!(map.get("password"), Some(Value::Bool(true)));
+    let image_id = match map.get("image") {
+        Some(v) => Some(as_i32(v, "widget.image")? as i64),
+        None => None,
+    };
+    let slice = [
+        match map.get("slice_l") {
+            Some(v) => as_i32(v, "widget.slice_l")?.clamp(0, 2048),
+            None => 0,
+        },
+        match map.get("slice_t") {
+            Some(v) => as_i32(v, "widget.slice_t")?.clamp(0, 2048),
+            None => 0,
+        },
+        match map.get("slice_r") {
+            Some(v) => as_i32(v, "widget.slice_r")?.clamp(0, 2048),
+            None => 0,
+        },
+        match map.get("slice_b") {
+            Some(v) => as_i32(v, "widget.slice_b")?.clamp(0, 2048),
+            None => 0,
+        },
+    ];
 
     let on_click = map.get("on_click").cloned();
     let on_change = map.get("on_change").cloned();
@@ -758,6 +841,8 @@ fn parse_widget_node(
         step_num,
         options,
         selected_idx,
+        image_id,
+        slice,
         width_hint,
         height_hint,
         padding,
@@ -826,6 +911,31 @@ fn measure_node(node: &WidgetNode, theme: &Theme) -> (i32, i32) {
             node.width_hint.unwrap_or(12),
             node.height_hint.unwrap_or(12),
         ),
+        WidgetKind::Rect => (
+            node.width_hint.unwrap_or(32),
+            node.height_hint.unwrap_or(32),
+        ),
+        WidgetKind::Image | WidgetKind::NineSlice => {
+            let (iw, ih) = node
+                .image_id
+                .and_then(|id| crate::modules::gfx::handle_dims(id))
+                .unwrap_or((32, 32));
+            (
+                node.width_hint.unwrap_or(iw.max(1)),
+                node.height_hint.unwrap_or(ih.max(1)),
+            )
+        }
+        WidgetKind::IconButton => {
+            let icon_side = (base_h - 8).max(16);
+            let label_w = if node.text.is_empty() {
+                0
+            } else {
+                text_chars * (f * 6 / 10).max(8) + 8
+            };
+            let w = node.width_hint.unwrap_or_else(|| (16 + icon_side + label_w).max(40));
+            let h = node.height_hint.unwrap_or(base_h.max(34));
+            (w, h)
+        }
         WidgetKind::Column => {
             let pad = node.padding.unwrap_or(0);
             let sp = node.spacing.unwrap_or(theme.spacing);
@@ -980,6 +1090,111 @@ fn stroke_rect(buf: &mut [u32], bw: i32, bh: i32, x: i32, y: i32, w: i32, h: i32
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn blit_scaled_ui(
+    buf: &mut [u32],
+    bw: i32,
+    bh: i32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    src: &[u32],
+    sw: i32,
+    _sh: i32,
+    sx0: i32,
+    sy0: i32,
+    sub_w: i32,
+    sub_h: i32,
+) {
+    if dw <= 0 || dh <= 0 || sub_w <= 0 || sub_h <= 0 || bw <= 0 || bh <= 0 {
+        return;
+    }
+    let x0 = dx.max(0);
+    let y0 = dy.max(0);
+    let x1 = dx.saturating_add(dw).min(bw);
+    let y1 = dy.saturating_add(dh).min(bh);
+    for py in y0..y1 {
+        let sy = sy0 + (((py - dy) as i64 * sub_h as i64) / dh as i64).clamp(0, sub_h as i64 - 1) as i32;
+        let srow = (sy as usize) * (sw as usize);
+        let drow = (py as usize) * (bw as usize);
+        for px in x0..x1 {
+            let sx = sx0 + (((px - dx) as i64 * sub_w as i64) / dw as i64).clamp(0, sub_w as i64 - 1) as i32;
+            let sc = src[srow + sx as usize];
+            let sa = (sc >> 24) & 0xFF;
+            if sa == 0 {
+                continue;
+            }
+            let cell = &mut buf[drow + px as usize];
+            if sa == 255 {
+                *cell = sc & 0x00FF_FFFF;
+            } else {
+                let blended = crate::surface::blend_argb_over(0xFF00_0000 | *cell, sc);
+                *cell = blended & 0x00FF_FFFF;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blit_nine_slice_ui(
+    buf: &mut [u32],
+    bw: i32,
+    bh: i32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    src: &[u32],
+    sw: i32,
+    sh: i32,
+    slice: [i32; 4],
+) {
+    if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+        return;
+    }
+    let sl = slice[0].clamp(0, sw / 2);
+    let sr = slice[2].clamp(0, sw - sl);
+    let st = slice[1].clamp(0, sh / 2);
+    let sb = slice[3].clamp(0, sh - st);
+
+    let dl = sl.min(dw);
+    let dr = sr.min((dw - dl).max(0));
+    let dt = st.min(dh);
+    let db = sb.min((dh - dt).max(0));
+
+    let sx_bounds = [0, sl, sw - sr, sw];
+    let sy_bounds = [0, st, sh - sb, sh];
+    let dx_bounds = [dx, dx + dl, dx + dw - dr, dx + dw];
+    let dy_bounds = [dy, dy + dt, dy + dh - db, dy + dh];
+
+    for ry in 0..3 {
+        let sy0 = sy_bounds[ry];
+        let sub_h = sy_bounds[ry + 1] - sy0;
+        let dest_y = dy_bounds[ry];
+        let dest_h = dy_bounds[ry + 1] - dest_y;
+        for rx in 0..3 {
+            let sx0 = sx_bounds[rx];
+            let sub_w = sx_bounds[rx + 1] - sx0;
+            let dest_x = dx_bounds[rx];
+            let dest_w = dx_bounds[rx + 1] - dest_x;
+            blit_scaled_ui(buf, bw, bh, dest_x, dest_y, dest_w, dest_h, src, sw, sh, sx0, sy0, sub_w, sub_h);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_peek_pixel(x: i32, y: i32) -> Option<u32> {
+    UI_SESSION.with(|slot| {
+        let b = slot.borrow();
+        let s = b.as_ref()?;
+        if x < 0 || y < 0 || x >= s.width || y >= s.height {
+            return None;
+        }
+        s.buffer.get((y as usize) * (s.width as usize) + (x as usize)).copied()
+    })
+}
+
 fn fill_circle(buf: &mut [u32], bw: i32, bh: i32, cx: i32, cy: i32, r: i32, color: u32) {
     if bw <= 0 || bh <= 0 || r <= 0 {
         return;
@@ -1059,13 +1274,13 @@ fn point_in_rect(px: i32, py: i32, r: &LayoutRect) -> bool {
 }
 
 fn emit_event(events: &mut Vec<Value>, kind: &str, id: &str, val: Option<Value>) {
-    let mut map = HashMap::new();
-    map.insert("type".to_string(), Value::Str(kind.to_string()));
-    map.insert("id".to_string(), Value::Str(id.to_string()));
+    let mut map = crate::value::new_dict_with_capacity(3);
+    map.insert("type".to_string(), Value::from_str(kind));
+    map.insert("id".to_string(), Value::from_str(id));
     if let Some(v) = val {
         map.insert("value".to_string(), v);
     }
-    events.push(Value::Dict(Rc::new(RefCell::new(map))));
+    events.push(Value::dict(map));
 }
 
 fn snap_slider(raw: f64, min: f64, max: f64, step: f64) -> f64 {
@@ -1129,6 +1344,97 @@ fn render_and_interact_node(
             }
         }
         WidgetKind::Spacer => {}
+        WidgetKind::Rect => {
+            let bg = node.bg_color.unwrap_or(theme.surface);
+            fill_rect(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, bg);
+            if let Some(bc) = node.border_color {
+                stroke_rect(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, bc);
+            }
+        }
+        WidgetKind::Image => {
+            if let Some(id) = node.image_id {
+                if let Ok((sw, sh, src)) = crate::modules::gfx::copy_handle_rgba(id) {
+                    blit_scaled_ui(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, &src, sw, sh, 0, 0, sw, sh);
+                }
+            }
+            if let Some(bc) = node.border_color {
+                stroke_rect(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, bc);
+            }
+        }
+        WidgetKind::NineSlice => {
+            if let Some(id) = node.image_id {
+                if let Ok((sw, sh, src)) = crate::modules::gfx::copy_handle_rgba(id) {
+                    blit_nine_slice_ui(
+                        &mut sess.buffer,
+                        bw,
+                        bh,
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        &src,
+                        sw,
+                        sh,
+                        node.slice,
+                    );
+                }
+            }
+            if let Some(bc) = node.border_color {
+                stroke_rect(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, bc);
+            }
+        }
+        WidgetKind::IconButton => {
+            let bg = if node.disabled {
+                theme.surface
+            } else if hovered && sess.mouse_down {
+                theme.surface_active
+            } else if hovered {
+                node.bg_color.unwrap_or(theme.accent_hover)
+            } else {
+                node.bg_color.unwrap_or(theme.accent)
+            };
+            let fg = if node.disabled {
+                theme.muted
+            } else {
+                node.text_color.unwrap_or(theme.accent_text)
+            };
+            fill_rect(&mut sess.buffer, bw, bh, rect.x, rect.y, rect.w, rect.h, bg);
+            stroke_rect(
+                &mut sess.buffer,
+                bw,
+                bh,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                node.border_color.unwrap_or(theme.border),
+            );
+            let icon_side = (rect.h - 8).clamp(8, rect.w - 8).max(8);
+            let icon_x = rect.x + 6;
+            let icon_y = rect.y + (rect.h - icon_side) / 2;
+            if let Some(id) = node.image_id {
+                if let Ok((sw, sh, src)) = crate::modules::gfx::copy_handle_rgba(id) {
+                    blit_scaled_ui(&mut sess.buffer, bw, bh, icon_x, icon_y, icon_side, icon_side, &src, sw, sh, 0, 0, sw, sh);
+                }
+            }
+            if !node.text.is_empty() {
+                sess.texts.push(TextDrawCmd {
+                    x: icon_x + icon_side + 8,
+                    y: rect.y + (rect.h - theme.font_size).max(4) / 2,
+                    color: fg,
+                    text: node.text.clone(),
+                });
+            }
+            if was_clicked {
+                emit_event(&mut sess.events, "click", &node.id, None);
+                if let Some(cb) = &node.on_click {
+                    callbacks.push(CallbackInvocation {
+                        callback: cb.clone(),
+                        args: vec![Value::from_str(node.id.clone())],
+                    });
+                }
+            }
+        }
         WidgetKind::Label => {
             let color = node.text_color.unwrap_or(theme.text);
             sess.texts.push(TextDrawCmd {
@@ -1175,7 +1481,7 @@ fn render_and_interact_node(
                 if let Some(cb) = &node.on_click {
                     callbacks.push(CallbackInvocation {
                         callback: cb.clone(),
-                        args: vec![Value::Str(node.id.clone())],
+                        args: vec![Value::from_str(node.id.clone())],
                     });
                 }
             }
@@ -1223,12 +1529,12 @@ fn render_and_interact_node(
                         &mut sess.events,
                         "change",
                         &node.id,
-                        Some(Value::Str(text_now.clone())),
+                        Some(Value::from_str(text_now.clone())),
                     );
                     if let Some(cb) = &node.on_change {
                         callbacks.push(CallbackInvocation {
                             callback: cb.clone(),
-                            args: vec![Value::Str(text_now.clone())],
+                            args: vec![Value::from_str(text_now.clone())],
                         });
                     }
                 }
@@ -1237,12 +1543,12 @@ fn render_and_interact_node(
                         &mut sess.events,
                         "submit",
                         &node.id,
-                        Some(Value::Str(text_now.clone())),
+                        Some(Value::from_str(text_now.clone())),
                     );
                     if let Some(cb) = &node.on_submit {
                         callbacks.push(CallbackInvocation {
                             callback: cb.clone(),
-                            args: vec![Value::Str(text_now.clone())],
+                            args: vec![Value::from_str(text_now.clone())],
                         });
                     }
                 }
@@ -1438,12 +1744,12 @@ fn render_and_interact_node(
                     &mut sess.events,
                     "change",
                     &node.id,
-                    Some(Value::Str(chosen.clone())),
+                    Some(Value::from_str(chosen.clone())),
                 );
                 if let Some(cb) = &node.on_change {
                     callbacks.push(CallbackInvocation {
                         callback: cb.clone(),
-                        args: vec![Value::Str(chosen)],
+                        args: vec![Value::from_str(chosen)],
                     });
                 }
             }
@@ -1715,16 +2021,16 @@ fn mod_layout(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         &mut rects,
     );
 
-    let mut result = HashMap::new();
+    let mut result = crate::value::new_dict_with_capacity(rects.len() + 1);
     let mut list_vals = Vec::with_capacity(rects.len());
     for r in rects {
-        let mut item = HashMap::new();
-        item.insert("kind".to_string(), Value::Str(r.kind));
+        let mut item = crate::value::new_dict_with_capacity(5);
+        item.insert("kind".to_string(), Value::from_str(r.kind));
         item.insert("x".to_string(), Value::Int(r.x as i64));
         item.insert("y".to_string(), Value::Int(r.y as i64));
         item.insert("w".to_string(), Value::Int(r.w as i64));
         item.insert("h".to_string(), Value::Int(r.h as i64));
-        let dict_val = Value::Dict(Rc::new(RefCell::new(item)));
+        let dict_val = Value::dict(item);
         if let Some(id) = r.id {
             result.insert(id, dict_val.clone());
         }
@@ -1734,7 +2040,7 @@ fn mod_layout(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         "_nodes".to_string(),
         Value::List(Rc::new(RefCell::new(list_vals))),
     );
-    Ok(Value::Dict(Rc::new(RefCell::new(result))))
+    Ok(Value::dict(result))
 }
 
 fn mod_state(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -1751,7 +2057,7 @@ fn mod_state(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             return Ok(Value::Unit);
         };
         if let Some(t) = &st.text_val {
-            return Ok(Value::Str(t.clone()));
+            return Ok(Value::from_str(t.clone()));
         }
         if let Some(b) = st.checked_val {
             return Ok(Value::Bool(b));
@@ -1778,7 +2084,7 @@ fn mod_set_state(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .ok_or_else(|| "No active ui.window".to_string())?;
         let st = sess.widgets.entry(id).or_default();
         match &args[1] {
-            Value::Str(s) => st.text_val = Some(s.clone()),
+            Value::Str(s) => st.text_val = Some(s.as_ref().clone()),
             Value::Bool(b) => st.checked_val = Some(*b),
             Value::Int(i) => {
                 st.slider_val = Some(*i as f64);

@@ -1,9 +1,5 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{Value, new_dict_map, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -76,14 +72,14 @@ fn url_encode(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("url.encode() expects 1 string argument".to_string());
     }
-    Ok(Value::Str(pct_encode(expect_str(&args[0], "encode")?)))
+    Ok(Value::from_str(pct_encode(expect_str(&args[0], "encode")?)))
 }
 
 fn url_decode(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("url.decode() expects 1 string argument".to_string());
     }
-    Ok(Value::Str(pct_decode(
+    Ok(Value::from_str(pct_decode(
         expect_str(&args[0], "decode")?,
         true,
     )?))
@@ -94,18 +90,21 @@ fn url_query_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("url.query_parse() expects 1 string argument".to_string());
     }
     let raw = expect_str(&args[0], "query_parse")?.trim_start_matches('?');
-    let mut map = HashMap::new();
+    let mut map = new_dict_map();
     if raw.is_empty() {
-        return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+        return Ok(Value::dict(map));
     }
     for pair in raw.split('&') {
         if pair.is_empty() {
             continue;
         }
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        map.insert(pct_decode(k, true)?, Value::Str(pct_decode(v, true)?));
+        map.insert(
+            pct_decode(k, true)?,
+            Value::from_str(pct_decode(v, true)?),
+        );
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    Ok(Value::dict(map))
 }
 
 fn url_query_stringify(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -129,7 +128,7 @@ fn url_query_stringify(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         let v = format!("{}", map[k]);
         parts.push(format!("{}={}", pct_encode(k), pct_encode(&v)));
     }
-    Ok(Value::Str(parts.join("&")))
+    Ok(Value::from_str(parts.join("&")))
 }
 
 fn url_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -141,12 +140,12 @@ fn url_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         .split_once("://")
         .ok_or_else(|| "url.parse(): missing '://' scheme".to_string())?;
     let (before_frag, fragment) = match rest.split_once('#') {
-        Some((a, f)) => (a, Value::Str(f.to_string())),
-        None => (rest, Value::Str(String::new())),
+        Some((a, f)) => (a, Value::from_str(f)),
+        None => (rest, Value::from_str("")),
     };
     let (before_query, query) = match before_frag.split_once('?') {
-        Some((a, q)) => (a, Value::Str(q.to_string())),
-        None => (before_frag, Value::Str(String::new())),
+        Some((a, q)) => (a, Value::from_str(q)),
+        None => (before_frag, Value::from_str("")),
     };
     let (authority, path) = match before_query.find('/') {
         Some(idx) => (&before_query[..idx], before_query[idx..].to_string()),
@@ -172,15 +171,15 @@ fn url_parse(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         (host_port.to_string(), None)
     };
 
-    let mut out = HashMap::new();
-    out.insert("scheme".to_string(), Value::Str(scheme.to_string()));
-    out.insert("host".to_string(), Value::Str(host));
+    let mut out = new_dict_with_capacity(6);
+    out.insert("scheme".to_string(), Value::from_str(scheme));
+    out.insert("host".to_string(), Value::from_str(host));
     out.insert(
         "port".to_string(),
         port.map(Value::Int).unwrap_or(Value::Unit),
     );
-    out.insert("path".to_string(), Value::Str(path));
+    out.insert("path".to_string(), Value::from_str(path));
     out.insert("query".to_string(), query);
     out.insert("fragment".to_string(), fragment);
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::dict(out))
 }

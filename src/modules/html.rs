@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{DictMap, Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -82,7 +82,7 @@ fn html_escape(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let escaped = escape_str(&args[0].to_string());
     vm.charge_alloc(escaped.len())?;
-    Ok(Value::Str(escaped))
+    Ok(Value::from_str(escaped))
 }
 
 fn html_unescape(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -91,7 +91,7 @@ fn html_unescape(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let decoded = unescape_str(&args[0].to_string());
     vm.charge_alloc(decoded.len())?;
-    Ok(Value::Str(decoded))
+    Ok(Value::from_str(decoded))
 }
 
 #[derive(Clone)]
@@ -104,23 +104,20 @@ struct DomNode {
 
 impl DomNode {
     fn to_value(&self) -> Value {
-        let mut attrs_map = HashMap::with_capacity(self.attrs.len());
+        let mut attrs_map = new_dict_with_capacity(self.attrs.len());
         for (k, v) in &self.attrs {
-            attrs_map.insert(k.clone(), Value::Str(v.clone()));
+            attrs_map.insert(k.clone(), Value::from_str(v.clone()));
         }
         let child_vals: Vec<Value> = self.children.iter().map(DomNode::to_value).collect();
-        let mut map = HashMap::new();
-        map.insert("tag".to_string(), Value::Str(self.tag.clone()));
-        map.insert(
-            "attrs".to_string(),
-            Value::Dict(Rc::new(RefCell::new(attrs_map))),
-        );
-        map.insert("text".to_string(), Value::Str(self.text.clone()));
+        let mut map = new_dict_with_capacity(4);
+        map.insert("tag".to_string(), Value::from_str(self.tag.clone()));
+        map.insert("attrs".to_string(), Value::dict(attrs_map));
+        map.insert("text".to_string(), Value::from_str(self.text.clone()));
         map.insert(
             "children".to_string(),
             Value::List(Rc::new(RefCell::new(child_vals))),
         );
-        Value::Dict(Rc::new(RefCell::new(map)))
+        Value::dict(map)
     }
 }
 
@@ -334,7 +331,7 @@ pub(crate) fn html_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(dom.to_value())
 }
 
-fn node_matches_simple(node: &HashMap<String, Value>, part: &str) -> bool {
+fn node_matches_simple(node: &DictMap, part: &str) -> bool {
     let mut tag_req: Option<&str> = None;
     let mut id_req: Option<&str> = None;
     let mut class_reqs: Vec<&str> = Vec::new();
@@ -528,5 +525,5 @@ pub(crate) fn html_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let mut out = String::new();
     let mut steps = 0usize;
     extract_node_text(vm, &args[0], &mut out, 0, &mut steps)?;
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }

@@ -1,9 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{DictMap, Value, new_dict_map, new_dict_with_capacity};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -31,8 +30,8 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         list.iter().map(|v| v.to_string()).collect()
     };
 
-    let mut flags: HashMap<String, Value> = HashMap::new();
-    let mut options: HashMap<String, Value> = HashMap::new();
+    let mut flags: DictMap = new_dict_map();
+    let mut options: DictMap = new_dict_map();
     let mut positional: Vec<Value> = Vec::new();
     let mut rest_positional = false;
     let mut i = 0usize;
@@ -43,7 +42,7 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
         let arg = &raw_args[i];
         if rest_positional {
-            positional.push(Value::Str(arg.clone()));
+            positional.push(Value::from_str(arg.clone()));
             i += 1;
             continue;
         }
@@ -54,9 +53,9 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
         if let Some(long) = arg.strip_prefix("--") {
             if let Some((k, v)) = long.split_once('=') {
-                options.insert(k.to_string(), Value::Str(v.to_string()));
+                options.insert(k.to_string(), Value::from_str(v.to_string()));
             } else if i + 1 < raw_args.len() && !raw_args[i + 1].starts_with('-') {
-                options.insert(long.to_string(), Value::Str(raw_args[i + 1].clone()));
+                options.insert(long.to_string(), Value::from_str(raw_args[i + 1].clone()));
                 flags.insert(long.to_string(), Value::Bool(true));
                 i += 2;
                 continue;
@@ -80,7 +79,7 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 continue;
             }
         }
-        positional.push(Value::Str(arg.clone()));
+        positional.push(Value::from_str(arg.clone()));
         i += 1;
     }
 
@@ -91,22 +90,16 @@ fn cli_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         .saturating_mul(64)
         .saturating_add(raw_args.iter().map(|s| s.len()).sum());
     let command = positional.first().cloned().unwrap_or(Value::Unit);
-    let mut out = HashMap::new();
+    let mut out = new_dict_with_capacity(4);
     out.insert("command".to_string(), command);
-    out.insert(
-        "flags".to_string(),
-        Value::Dict(Rc::new(RefCell::new(flags))),
-    );
-    out.insert(
-        "options".to_string(),
-        Value::Dict(Rc::new(RefCell::new(options))),
-    );
+    out.insert("flags".to_string(), Value::dict(flags));
+    out.insert("options".to_string(), Value::dict(options));
     out.insert(
         "positional".to_string(),
         Value::List(Rc::new(RefCell::new(positional))),
     );
     vm.charge_alloc(approx_alloc.max(256))?;
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::dict(out))
 }
 
 fn cli_has_flag(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -120,7 +113,10 @@ fn cli_has_flag(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("cli.has_flag() flag name must be string".to_string());
     };
     let found = match d.borrow().get("flags") {
-        Some(Value::Dict(flags)) => flags.borrow().get(name).is_some_and(|v| v.is_truthy()),
+        Some(Value::Dict(flags)) => flags
+            .borrow()
+            .get(name.as_str())
+            .is_some_and(|v| v.is_truthy()),
         _ => false,
     };
     Ok(Value::Bool(found))

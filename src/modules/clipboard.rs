@@ -113,7 +113,7 @@ fn clip_get_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     #[cfg(windows)]
     {
-        Ok(Value::Str(win32_clip::get_text()?))
+        Ok(Value::from_str(win32_clip::get_text()?))
     }
     #[cfg(not(windows))]
     {

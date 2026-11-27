@@ -427,7 +427,7 @@ fn log_format(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let tag = args[0].to_string().to_ascii_uppercase();
     let as_json = LOG_JSON.with(|c| c.get());
-    Ok(Value::Str(format_structured(&tag, &args[1..], as_json)))
+    Ok(Value::from_str(format_structured(&tag, &args[1..], as_json)))
 }
 
 fn emit_log(level: u8, tag: &str, args: &[Value]) {

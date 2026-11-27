@@ -1,9 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::modules::{NativeFnPtr, build_module};
-use crate::value::{NativeFunction, StructDef, StructInstance, Value};
+use crate::value::{FastMap, StructDef, StructInstance, Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 const MAX_SIGNAL_CASCADE: i64 = 32;
@@ -27,16 +26,14 @@ fn make_signal_def() -> Rc<StructDef> {
         "__next_id".to_string(),
         "__depth".to_string(),
     ];
-    let mut field_index = HashMap::new();
+    let mut field_index = FastMap::default();
+    field_index.reserve(field_names.len());
     for (i, n) in field_names.iter().enumerate() {
         field_index.insert(n.clone(), i);
     }
-    let mut methods = HashMap::new();
+    let mut methods = new_dict_with_capacity(methods_spec.len());
     for &(name, func) in methods_spec {
-        methods.insert(
-            name.to_string(),
-            Value::NativeFn(NativeFunction { name, func }),
-        );
+        methods.insert(name.to_string(), Value::native_fn(name, func));
     }
     Rc::new(StructDef {
         ic_id: crate::bytecode::next_ic_id(),

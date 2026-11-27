@@ -162,7 +162,7 @@ fn mod_key_name(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     };
     Ok(match vk_to_key_name(vk) {
-        Some(s) => Value::Str(s),
+        Some(s) => Value::from_str(s),
         None => Value::Unit,
     })
 }

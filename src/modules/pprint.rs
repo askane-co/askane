@@ -192,7 +192,7 @@ fn pprint_format(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let mut steps = 0usize;
     fmt_pretty(vm, &args[0], indent, 0, &mut seen, &mut out, &mut steps)?;
     vm.charge_alloc(out.len())?;
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }
 
 fn pprint_print(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

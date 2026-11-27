@@ -1,4 +1,5 @@
 use crate::modules::build_module;
+use crate::surface::ClipRect;
 use crate::value::Value;
 use crate::vm::VM;
 
@@ -41,6 +42,44 @@ pub fn module() -> Value {
             ("mouse_down", gfx_mouse_down),
             ("mouse_pressed", gfx_mouse_pressed),
             ("close", gfx_close),
+            // Stage 2: Clipping, Surfaces, Layers, Camera2D, Bitmap & BMFont Text
+            ("clip", gfx_clip),
+            ("reset_clip", gfx_reset_clip),
+            ("surface_new", gfx_surface_new),
+            ("surface_free", gfx_surface_free),
+            ("surface_width", gfx_surface_width),
+            ("surface_height", gfx_surface_height),
+            ("surface_from_image", gfx_surface_from_image),
+            ("draw_to", gfx_draw_to),
+            ("draw_surface", gfx_draw_surface),
+            ("draw_surface_scaled", gfx_draw_surface_scaled),
+            ("draw_surface_keyed", gfx_draw_surface_keyed),
+            ("draw_surface_alpha", gfx_draw_surface_alpha),
+            ("read_pixel", gfx_read_pixel),
+            ("frame_hash", gfx_frame_hash),
+            ("layer_new", gfx_layer_new),
+            ("layer_free", gfx_layer_free),
+            ("layer_mode", gfx_layer_mode),
+            ("layer_visible", gfx_layer_visible),
+            ("layer_z", gfx_layer_z),
+            ("layer_parallax", gfx_layer_parallax),
+            ("draw_to_layer", gfx_draw_to_layer),
+            ("compose_layers", gfx_compose_layers),
+            ("set_camera", gfx_set_camera),
+            ("camera", gfx_camera),
+            ("reset_camera", gfx_reset_camera),
+            ("set_camera_shake", gfx_set_camera_shake),
+            ("update_camera", gfx_update_camera),
+            ("world_to_screen", gfx_world_to_screen),
+            ("screen_to_world", gfx_screen_to_world),
+            ("mouse_world", gfx_mouse_world),
+            ("font_bitmap", gfx_font_bitmap),
+            ("font_load_bmfont", gfx_font_load_bmfont),
+            ("font_free", gfx_font_free),
+            ("draw_text", gfx_draw_text),
+            ("measure_text", gfx_measure_text),
+            ("text_line_height", gfx_text_line_height),
+            ("text_width", gfx_text_width),
         ],
         &[],
     )
@@ -48,6 +87,25 @@ pub fn module() -> Value {
 
 mod gfx_state {
     use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use crate::budget::BudgetCore;
+    use crate::camera::Camera2D;
+    use crate::font_atlas::FontSystem;
+    use crate::layers::LayerBank;
+    use crate::surface::{ClipRect, Surface};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ActiveTarget {
+        Surface(usize),
+        Layer(usize),
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct TargetFrame {
+        pub target: ActiveTarget,
+        pub camera: Camera2D,
+    }
 
     #[allow(dead_code)]
     pub struct TextDraw {
@@ -69,6 +127,7 @@ mod gfx_state {
         pub height: i32,
         pub buffer: Vec<u32>,
         pub texts: Vec<TextDraw>,
+        pub clip: Option<ClipRect>,
         pub open: bool,
         pub headless: bool,
     }
@@ -76,9 +135,47 @@ mod gfx_state {
     thread_local! {
         pub static FRAME: RefCell<Option<FrameState>> = const { RefCell::new(None) };
         pub static IMAGES: RefCell<Vec<BmpImage>> = const { RefCell::new(Vec::new()) };
+        pub static SURFACES: RefCell<Vec<Option<Surface>>> = const { RefCell::new(Vec::new()) };
+        pub static LAYERS: RefCell<LayerBank> = RefCell::new(LayerBank::new());
+        pub static TARGET_STACK: RefCell<Vec<TargetFrame>> = const { RefCell::new(Vec::new()) };
+        pub static ROOT_CAMERA: RefCell<Camera2D> = RefCell::new(Camera2D::default());
+        pub static FONTS: RefCell<FontSystem> = RefCell::new(FontSystem::new());
         pub static LAST_FRAME: RefCell<Option<std::time::Instant>> = const { RefCell::new(None) };
         pub static PREV_KEYS: RefCell<[bool; 256]> = const { RefCell::new([false; 256]) };
         pub static HEADLESS_ENABLED: RefCell<bool> = const { RefCell::new(false) };
+        pub static ACTIVE_BUDGET: RefCell<Option<Arc<BudgetCore>>> = const { RefCell::new(None) };
+    }
+
+    pub fn bind_budget(core: &Arc<BudgetCore>) {
+        ACTIVE_BUDGET.with(|slot| {
+            *slot.borrow_mut() = Some(Arc::clone(core));
+        });
+    }
+
+    pub fn with_budget_opt<R>(f: impl FnOnce(Option<&BudgetCore>) -> R) -> R {
+        ACTIVE_BUDGET.with(|slot| f(slot.borrow().as_deref()))
+    }
+
+    pub fn current_camera() -> Camera2D {
+        TARGET_STACK.with(|st| {
+            let s = st.borrow();
+            if let Some(top) = s.last() {
+                top.camera
+            } else {
+                ROOT_CAMERA.with(|c| *c.borrow())
+            }
+        })
+    }
+
+    pub fn set_current_camera(cam: Camera2D) {
+        TARGET_STACK.with(|st| {
+            let mut s = st.borrow_mut();
+            if let Some(top) = s.last_mut() {
+                top.camera = cam;
+            } else {
+                ROOT_CAMERA.with(|c| *c.borrow_mut() = cam);
+            }
+        });
     }
 
     pub fn is_headless_enabled() -> bool {
@@ -98,6 +195,7 @@ mod gfx_state {
                 height,
                 buffer,
                 texts: Vec::new(),
+                clip: None,
                 open: true,
                 headless: true,
             });
@@ -110,10 +208,25 @@ mod gfx_state {
         });
         #[cfg(windows)]
         super::win32_gfx::destroy_native_window();
+        TARGET_STACK.with(|st| st.borrow_mut().clear());
+        ROOT_CAMERA.with(|c| c.borrow_mut().reset());
         IMAGES.with(|imgs| imgs.borrow_mut().clear());
         LAST_FRAME.with(|lf| *lf.borrow_mut() = None);
         PREV_KEYS.with(|pk| *pk.borrow_mut() = [false; 256]);
         if reset_headless {
+            with_budget_opt(|b| {
+                SURFACES.with(|surfs| {
+                    for slot in surfs.borrow_mut().iter_mut() {
+                        if let Some(mut s) = slot.take() {
+                            s.refund_to(b);
+                        }
+                    }
+                    surfs.borrow_mut().clear();
+                });
+                LAYERS.with(|layers| layers.borrow_mut().clear_all(b));
+                FONTS.with(|fonts| fonts.borrow_mut().clear_all(b));
+            });
+            ACTIVE_BUDGET.with(|slot| *slot.borrow_mut() = None);
             HEADLESS_ENABLED.with(|h| *h.borrow_mut() = false);
         }
     }
@@ -202,6 +315,72 @@ mod gfx_state {
             pixels,
             has_alpha: false,
         })
+    }
+}
+
+const SURFACE_ID_BASE: i64 = 10_000;
+const LAYER_ID_BASE: i64 = 20_000;
+
+pub(crate) fn decode_bmp_argb(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {
+    let mut bmp = gfx_state::parse_bmp_safe(data)?;
+    for p in &mut bmp.pixels {
+        *p |= 0xFF00_0000;
+    }
+    Ok((bmp.width, bmp.height, bmp.pixels))
+}
+
+pub(crate) fn handle_dims(handle: i64) -> Option<(i32, i32)> {
+    if (0..SURFACE_ID_BASE).contains(&handle) {
+        gfx_state::IMAGES.with(|imgs| imgs.borrow().get(handle as usize).map(|i| (i.width, i.height)))
+    } else if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(&handle) {
+        let slot = (handle - SURFACE_ID_BASE) as usize;
+        gfx_state::SURFACES.with(|s| {
+            s.borrow()
+                .get(slot)
+                .and_then(|o| o.as_ref())
+                .map(|surf| (surf.width, surf.height))
+        })
+    } else if handle >= LAYER_ID_BASE {
+        let slot = (handle - LAYER_ID_BASE) as usize;
+        gfx_state::LAYERS.with(|l| l.borrow().get(slot).ok().map(|lay| (lay.surface.width, lay.surface.height)))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn copy_handle_rgba(handle: i64) -> Result<(i32, i32, Vec<u32>), String> {
+    if (0..SURFACE_ID_BASE).contains(&handle) {
+        gfx_state::IMAGES.with(|imgs| {
+            let list = imgs.borrow();
+            let img = list
+                .get(handle as usize)
+                .ok_or_else(|| format!("Invalid image handle {}", handle))?;
+            let pixels = if img.has_alpha {
+                img.pixels.clone()
+            } else {
+                img.pixels.iter().map(|&p| p | 0xFF00_0000).collect()
+            };
+            Ok((img.width, img.height, pixels))
+        })
+    } else if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(&handle) {
+        let slot = (handle - SURFACE_ID_BASE) as usize;
+        gfx_state::SURFACES.with(|surfs| {
+            let list = surfs.borrow();
+            let surf = list
+                .get(slot)
+                .and_then(|s| s.as_ref())
+                .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+            Ok((surf.width, surf.height, surf.pixels.clone()))
+        })
+    } else if handle >= LAYER_ID_BASE {
+        let slot = (handle - LAYER_ID_BASE) as usize;
+        gfx_state::LAYERS.with(|layers| {
+            let b = layers.borrow();
+            let lay = b.get(slot)?;
+            Ok((lay.surface.width, lay.surface.height, lay.surface.pixels.clone()))
+        })
+    } else {
+        Err(format!("Invalid handle {}", handle))
     }
 }
 
@@ -545,6 +724,7 @@ mod win32_gfx {
                     height,
                     buffer,
                     texts: Vec::new(),
+                    clip: None,
                     open: true,
                     headless: false,
                 });
@@ -719,6 +899,7 @@ fn gfx_headless(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .saturating_mul(h as usize)
             .saturating_mul(std::mem::size_of::<u32>()),
     )?;
+    gfx_state::bind_budget(vm.budget_core());
     gfx_state::set_headless_enabled(true);
     gfx_state::open_headless(w, h);
     Ok(Value::Unit)
@@ -747,6 +928,7 @@ fn gfx_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .saturating_mul(h as usize)
             .saturating_mul(std::mem::size_of::<u32>()),
     )?;
+    gfx_state::bind_budget(vm.budget_core());
     if gfx_state::is_headless_enabled() {
         let _ = title;
         gfx_state::open_headless(w as i32, h as i32);
@@ -786,6 +968,130 @@ fn gfx_is_open(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
 }
 
+fn with_active_target<R>(
+    f: impl FnOnce(&[u32], i32, i32, ClipRect, bool, &crate::camera::Camera2D) -> Result<R, String>,
+) -> Result<R, String> {
+    let top = gfx_state::TARGET_STACK.with(|st| st.borrow().last().copied());
+    match top {
+        Some(tf) => match tf.target {
+            gfx_state::ActiveTarget::Surface(slot) => gfx_state::SURFACES.with(|surfs| {
+                let list = surfs.borrow();
+                let surf = list
+                    .get(slot)
+                    .and_then(|o| o.as_ref())
+                    .ok_or_else(|| "Active target surface was freed".to_string())?;
+                let clip = surf.effective_clip();
+                f(&surf.pixels, surf.width, surf.height, clip, true, &tf.camera)
+            }),
+            gfx_state::ActiveTarget::Layer(slot) => gfx_state::LAYERS.with(|layers| {
+                let bank = layers.borrow();
+                let lay = bank.get(slot)?;
+                let clip = lay.surface.effective_clip();
+                f(
+                    &lay.surface.pixels,
+                    lay.surface.width,
+                    lay.surface.height,
+                    clip,
+                    true,
+                    &tf.camera,
+                )
+            }),
+        },
+        None => {
+            let cam = gfx_state::ROOT_CAMERA.with(|c| *c.borrow());
+            gfx_state::FRAME.with(|w| {
+                let b = w.borrow();
+                let st = b.as_ref().ok_or_else(|| "No active gfx window".to_string())?;
+                let clip = crate::surface::effective_clip(st.width, st.height, st.clip);
+                f(&st.buffer, st.width, st.height, clip, false, &cam)
+            })
+        }
+    }
+}
+
+fn with_active_target_mut<R>(
+    f: impl FnOnce(&mut [u32], i32, i32, ClipRect, bool, &crate::camera::Camera2D) -> Result<R, String>,
+) -> Result<R, String> {
+    let top = gfx_state::TARGET_STACK.with(|st| st.borrow().last().copied());
+    match top {
+        Some(tf) => match tf.target {
+            gfx_state::ActiveTarget::Surface(slot) => gfx_state::SURFACES.with(|surfs| {
+                let mut list = surfs.borrow_mut();
+                let surf = list
+                    .get_mut(slot)
+                    .and_then(|o| o.as_mut())
+                    .ok_or_else(|| "Active target surface was freed".to_string())?;
+                let clip = surf.effective_clip();
+                f(&mut surf.pixels, surf.width, surf.height, clip, true, &tf.camera)
+            }),
+            gfx_state::ActiveTarget::Layer(slot) => gfx_state::LAYERS.with(|layers| {
+                let mut bank = layers.borrow_mut();
+                let lay = bank.get_mut(slot)?;
+                let clip = lay.surface.effective_clip();
+                f(
+                    &mut lay.surface.pixels,
+                    lay.surface.width,
+                    lay.surface.height,
+                    clip,
+                    true,
+                    &tf.camera,
+                )
+            }),
+        },
+        None => {
+            let cam = gfx_state::ROOT_CAMERA.with(|c| *c.borrow());
+            gfx_state::FRAME.with(|w| {
+                let mut b = w.borrow_mut();
+                let st = b.as_mut().ok_or_else(|| "No active gfx window".to_string())?;
+                let clip = crate::surface::effective_clip(st.width, st.height, st.clip);
+                f(&mut st.buffer, st.width, st.height, clip, false, &cam)
+            })
+        }
+    }
+}
+
+fn set_active_clip(clip: Option<ClipRect>) -> Result<(), String> {
+    let top = gfx_state::TARGET_STACK.with(|st| st.borrow().last().copied());
+    match top {
+        Some(tf) => match tf.target {
+            gfx_state::ActiveTarget::Surface(slot) => gfx_state::SURFACES.with(|surfs| {
+                let mut list = surfs.borrow_mut();
+                let surf = list
+                    .get_mut(slot)
+                    .and_then(|o| o.as_mut())
+                    .ok_or_else(|| "Active target surface was freed".to_string())?;
+                surf.clip = clip;
+                Ok(())
+            }),
+            gfx_state::ActiveTarget::Layer(slot) => gfx_state::LAYERS.with(|layers| {
+                let mut bank = layers.borrow_mut();
+                let lay = bank.get_mut(slot)?;
+                lay.surface.clip = clip;
+                Ok(())
+            }),
+        },
+        None => gfx_state::FRAME.with(|w| {
+            let mut b = w.borrow_mut();
+            let st = b.as_mut().ok_or_else(|| "No active gfx window".to_string())?;
+            st.clip = clip;
+            Ok(())
+        }),
+    }
+}
+
+fn is_target_active_on_stack(target: gfx_state::ActiveTarget) -> bool {
+    gfx_state::TARGET_STACK.with(|st| st.borrow().iter().any(|tf| tf.target == target))
+}
+
+#[inline]
+fn target_solid_color(rgb_col: u32, is_offscreen: bool) -> u32 {
+    if is_offscreen {
+        0xFF00_0000 | (rgb_col & 0x00FF_FFFF)
+    } else {
+        rgb_col & 0x00FF_FFFF
+    }
+}
+
 fn gfx_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 {
         return Err("gfx.clear() expects 3 arguments (r, g, b)".to_string());
@@ -795,15 +1101,49 @@ fn gfx_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[1], "clear")?,
         as_int(&args[2], "clear")?,
     );
-    gfx_state::FRAME.with(|w| {
-        let mut borrow = w.borrow_mut();
-        let state = borrow
-            .as_mut()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        state.buffer.fill(color);
-        state.texts.clear();
-        Ok(Value::Unit)
-    })
+    let top = gfx_state::TARGET_STACK.with(|st| st.borrow().last().copied());
+    match top {
+        Some(tf) => match tf.target {
+            gfx_state::ActiveTarget::Surface(slot) => gfx_state::SURFACES.with(|surfs| {
+                let mut list = surfs.borrow_mut();
+                let surf = list
+                    .get_mut(slot)
+                    .and_then(|o| o.as_mut())
+                    .ok_or_else(|| "Active target surface was freed".to_string())?;
+                surf.clear_rgba(0xFF00_0000 | color);
+                Ok(Value::Unit)
+            }),
+            gfx_state::ActiveTarget::Layer(slot) => gfx_state::LAYERS.with(|layers| {
+                let mut bank = layers.borrow_mut();
+                let lay = bank.get_mut(slot)?;
+                lay.surface.clear_rgba(0xFF00_0000 | color);
+                Ok(Value::Unit)
+            }),
+        },
+        None => gfx_state::FRAME.with(|w| {
+            let mut borrow = w.borrow_mut();
+            let state = borrow
+                .as_mut()
+                .ok_or_else(|| "No active gfx window".to_string())?;
+            if let Some(clip) = state.clip {
+                let eff = crate::surface::effective_clip(state.width, state.height, Some(clip));
+                crate::surface::fill_rect_clipped(
+                    &mut state.buffer,
+                    state.width,
+                    eff,
+                    eff.x0,
+                    eff.y0,
+                    eff.x1 - eff.x0,
+                    eff.y1 - eff.y0,
+                    color,
+                );
+            } else {
+                state.buffer.fill(color);
+            }
+            state.texts.clear();
+            Ok(Value::Unit)
+        }),
+    }
 }
 
 fn gfx_pixel(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -817,15 +1157,15 @@ fn gfx_pixel(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[3], "pixel")?,
         as_int(&args[4], "pixel")?,
     );
-    gfx_state::FRAME.with(|w| {
-        let mut borrow = w.borrow_mut();
-        let state = borrow
-            .as_mut()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        if x >= 0 && y >= 0 && x < state.width && y < state.height {
-            let idx = (y * state.width + x) as usize;
-            state.buffer[idx] = color;
-        }
+    with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+        let solid = target_solid_color(color, is_offscreen);
+        let (px, py) = if cam.is_identity_rect() {
+            (x, y)
+        } else {
+            let (sx, sy) = cam.world_to_screen(x as f64, y as f64, w, h);
+            (sx.round() as i32, sy.round() as i32)
+        };
+        crate::surface::put_pixel_clipped(buf, w, clip, px, py, solid);
         Ok(Value::Unit)
     })
 }
@@ -838,32 +1178,89 @@ fn rect_fill_impl(
     color: u32,
     alpha: Option<u32>,
 ) -> Result<(), String> {
-    gfx_state::FRAME.with(|w| {
-        let mut borrow = w.borrow_mut();
-        let state = borrow
-            .as_mut()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        if alpha == Some(0) {
+    with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+        if rw <= 0 || rh <= 0 || alpha == Some(0) {
             return Ok(());
         }
-        let x0 = x.max(0);
-        let y0 = y.max(0);
-        let x1 = x.saturating_add(rw).min(state.width);
-        let y1 = y.saturating_add(rh).min(state.height);
-        if let Some(a) = alpha.filter(|&a| a < 255) {
-            let src = (a << 24) | color;
-            for py in y0..y1 {
-                let row = (py * state.width) as usize;
-                for px in x0..x1 {
-                    let idx = row + px as usize;
-                    state.buffer[idx] = blend_argb(src, state.buffer[idx]);
-                }
+        let preserve_dst_alpha = !is_offscreen;
+        if cam.is_identity_rect() {
+            match alpha.filter(|&a| a < 255) {
+                Some(a) => crate::surface::fill_rect_alpha_clipped(
+                    buf,
+                    w,
+                    clip,
+                    x,
+                    y,
+                    rw,
+                    rh,
+                    color,
+                    a,
+                    preserve_dst_alpha,
+                ),
+                None => crate::surface::fill_rect_clipped(
+                    buf,
+                    w,
+                    clip,
+                    x,
+                    y,
+                    rw,
+                    rh,
+                    target_solid_color(color, is_offscreen),
+                ),
             }
-        } else {
-            for py in y0..y1 {
-                let row = (py * state.width) as usize;
-                for px in x0..x1 {
-                    state.buffer[row + px as usize] = color;
+            return Ok(());
+        }
+        if cam.angle == 0.0 {
+            let (sx, sy) = cam.world_to_screen(x as f64, y as f64, w, h);
+            let sw = ((rw as f64) * cam.zoom).round().max(0.0) as i32;
+            let sh = ((rh as f64) * cam.zoom).round().max(0.0) as i32;
+            let dx = sx.round() as i32;
+            let dy = sy.round() as i32;
+            match alpha.filter(|&a| a < 255) {
+                Some(a) => crate::surface::fill_rect_alpha_clipped(
+                    buf,
+                    w,
+                    clip,
+                    dx,
+                    dy,
+                    sw,
+                    sh,
+                    color,
+                    a,
+                    preserve_dst_alpha,
+                ),
+                None => crate::surface::fill_rect_clipped(
+                    buf,
+                    w,
+                    clip,
+                    dx,
+                    dy,
+                    sw,
+                    sh,
+                    target_solid_color(color, is_offscreen),
+                ),
+            }
+            return Ok(());
+        }
+        let corners = [
+            cam.world_to_screen(x as f64, y as f64, w, h),
+            cam.world_to_screen((x + rw) as f64, y as f64, w, h),
+            cam.world_to_screen(x as f64, (y + rh) as f64, w, h),
+            cam.world_to_screen((x + rw) as f64, (y + rh) as f64, w, h),
+        ];
+        let min_x = (corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min).floor() as i32).max(clip.x0);
+        let min_y = (corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min).floor() as i32).max(clip.y0);
+        let max_x = (corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max).ceil() as i32).min(clip.x1);
+        let max_y = (corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max).ceil() as i32).min(clip.y1);
+        let a = alpha.unwrap_or(255);
+        let wu = w as usize;
+        for py in min_y..max_y {
+            let row = (py as usize) * wu;
+            for px in min_x..max_x {
+                let (wx, wy) = cam.screen_to_world(px as f64 + 0.5, py as f64 + 0.5, w, h);
+                if wx >= x as f64 && wx < (x + rw) as f64 && wy >= y as f64 && wy < (y + rh) as f64 {
+                    let slot = &mut buf[row + px as usize];
+                    *slot = crate::surface::blend_rgb_alpha_on(*slot, color, a, preserve_dst_alpha);
                 }
             }
         }
@@ -913,45 +1310,28 @@ fn circle_fill_impl(
     color: u32,
     alpha: Option<u32>,
 ) -> Result<(), String> {
-    gfx_state::FRAME.with(|w| {
-        let mut borrow = w.borrow_mut();
-        let state = borrow
-            .as_mut()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        if rad < 0 || alpha == Some(0) {
+    with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+        if rad <= 0 || alpha == Some(0) {
             return Ok(());
         }
-        let rad = rad.min(4096) as i32;
-        let x0 = (cx - rad).max(0);
-        let y0 = (cy - rad).max(0);
-        let x1 = (cx + rad).min(state.width - 1);
-        let y1 = (cy + rad).min(state.height - 1);
-        let r2 = rad * rad;
-        if let Some(a) = alpha.filter(|&a| a < 255) {
-            let src = (a << 24) | color;
-            for py in y0..=y1 {
-                let dy = py - cy;
-                let row = (py * state.width) as usize;
-                for px in x0..=x1 {
-                    let dx = px - cx;
-                    if dx * dx + dy * dy <= r2 {
-                        let idx = row + px as usize;
-                        state.buffer[idx] = blend_argb(src, state.buffer[idx]);
-                    }
-                }
-            }
+        let (scx, scy, srad) = if cam.is_identity_rect() {
+            (cx, cy, rad.min(4096) as i32)
         } else {
-            for py in y0..=y1 {
-                let dy = py - cy;
-                let row = (py * state.width) as usize;
-                for px in x0..=x1 {
-                    let dx = px - cx;
-                    if dx * dx + dy * dy <= r2 {
-                        state.buffer[row + px as usize] = color;
-                    }
-                }
-            }
-        }
+            let (sx, sy) = cam.world_to_screen(cx as f64, cy as f64, w, h);
+            let sr = ((rad.min(4096) as f64) * cam.zoom).round().clamp(0.0, 4096.0) as i32;
+            (sx.round() as i32, sy.round() as i32, sr)
+        };
+        crate::surface::fill_circle_clipped(
+            buf,
+            w,
+            clip,
+            scx,
+            scy,
+            srad,
+            color,
+            alpha.unwrap_or(255),
+            !is_offscreen,
+        );
         Ok(())
     })
 }
@@ -995,76 +1375,71 @@ fn gfx_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.width() expects 0 arguments".to_string());
     }
-    gfx_state::FRAME.with(|w| {
-        let borrow = w.borrow();
-        let state = borrow
-            .as_ref()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        Ok(Value::Int(state.width as i64))
-    })
+    with_active_target(|_buf, w, _h, _clip, _off, _cam| Ok(Value::Int(w as i64)))
 }
 
 fn gfx_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.height() expects 0 arguments".to_string());
     }
-    gfx_state::FRAME.with(|w| {
-        let borrow = w.borrow();
-        let state = borrow
-            .as_ref()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        Ok(Value::Int(state.height as i64))
-    })
+    with_active_target(|_buf, _w, h, _clip, _off, _cam| Ok(Value::Int(h as i64)))
 }
 
 fn gfx_line(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() != 7 {
         return Err("gfx.line() expects 7 arguments (x1, y1, x2, y2, r, g, b)".to_string());
     }
-    let mut x0 = as_int(&args[0], "line")? as i32;
-    let mut y0 = as_int(&args[1], "line")? as i32;
-    let x1 = as_int(&args[2], "line")? as i32;
-    let y1 = as_int(&args[3], "line")? as i32;
+    let ax = as_int(&args[0], "line")? as i32;
+    let ay = as_int(&args[1], "line")? as i32;
+    let bx = as_int(&args[2], "line")? as i32;
+    let by = as_int(&args[3], "line")? as i32;
     let color = rgb(
         as_int(&args[4], "line")?,
         as_int(&args[5], "line")?,
         as_int(&args[6], "line")?,
     );
-    gfx_state::FRAME.with(|w| {
-        let mut borrow = w.borrow_mut();
-        let state = borrow
-            .as_mut()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        loop {
-            if x0 >= 0 && y0 >= 0 && x0 < state.width && y0 < state.height {
-                state.buffer[(y0 * state.width + x0) as usize] = color;
-            }
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
-        }
+    with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+        let solid = target_solid_color(color, is_offscreen);
+        let (x0, y0, x1, y1) = if cam.is_identity_rect() {
+            (ax, ay, bx, by)
+        } else {
+            let (sx0, sy0) = cam.world_to_screen(ax as f64, ay as f64, w, h);
+            let (sx1, sy1) = cam.world_to_screen(bx as f64, by as f64, w, h);
+            (
+                sx0.round() as i32,
+                sy0.round() as i32,
+                sx1.round() as i32,
+                sy1.round() as i32,
+            )
+        };
+        crate::surface::stroke_line_clipped(buf, w, clip, x0, y0, x1, y1, solid);
         Ok(Value::Unit)
     })
 }
 
-fn gfx_present(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+fn gfx_present(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("gfx.present() expects 0 arguments".to_string());
     }
+    let dt_opt = if vm.is_deterministic() {
+        Some(1.0 / 60.0)
+    } else {
+        None
+    };
+    gfx_state::TARGET_STACK.with(|st| {
+        if let Some(top) = st.borrow_mut().last_mut() {
+            if let Some(dt) = dt_opt {
+                top.camera.tick_shake(dt);
+            }
+        } else {
+            gfx_state::ROOT_CAMERA.with(|c| {
+                let mut cam = c.borrow_mut();
+                if let Some(dt) = dt_opt {
+                    cam.tick_shake(dt);
+                }
+            });
+        }
+    });
     match gfx_state::is_frame_headless() {
         Some(true) => {
             gfx_state::PREV_KEYS.with(|pk| *pk.borrow_mut() = [false; 256]);
@@ -1184,6 +1559,12 @@ fn gfx_text(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let g = as_int(&args[4], "text")?.clamp(0, 255) as u32;
     let b = as_int(&args[5], "text")?.clamp(0, 255) as u32;
     let color_bgr = (b << 16) | (g << 8) | r;
+    if !gfx_state::TARGET_STACK.with(|st| st.borrow().is_empty()) {
+        return Err(
+            "gfx.text() only targets the main window; use gfx.draw_text() for surfaces/layers"
+                .to_string(),
+        );
+    }
     gfx_state::FRAME.with(|w| {
         let mut borrow = w.borrow_mut();
         let state = borrow
@@ -1339,29 +1720,31 @@ fn gfx_rect_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[5], "rect_outline")?,
         as_int(&args[6], "rect_outline")?,
     );
-    gfx_state::FRAME.with(|w| {
-        let mut borrow = w.borrow_mut();
-        let state = borrow
-            .as_mut()
-            .ok_or_else(|| "No active gfx window".to_string())?;
+    with_active_target_mut(|buf, w, _h, clip, is_offscreen, cam| {
         if rw <= 0 || rh <= 0 {
             return Ok(Value::Unit);
         }
-        let mut put = |px: i32, py: i32| {
-            if px >= 0 && py >= 0 && px < state.width && py < state.height {
-                let idx = (py * state.width + px) as usize;
-                state.buffer[idx] = color;
-            }
+        let solid = target_solid_color(color, is_offscreen);
+        let (dx, dy, dw, dh) = if cam.is_identity_rect() {
+            (x, y, rw, rh)
+        } else {
+            let (sx, sy) = cam.world_to_screen(x as f64, y as f64, w, _h);
+            (
+                sx.round() as i32,
+                sy.round() as i32,
+                ((rw as f64) * cam.zoom).round().max(1.0) as i32,
+                ((rh as f64) * cam.zoom).round().max(1.0) as i32,
+            )
         };
-        let x2 = x.saturating_add(rw - 1);
-        let y2 = y.saturating_add(rh - 1);
-        for px in x..=x2 {
-            put(px, y);
-            put(px, y2);
+        let x2 = dx.saturating_add(dw - 1);
+        let y2 = dy.saturating_add(dh - 1);
+        for px in dx..=x2 {
+            crate::surface::put_pixel_clipped(buf, w, clip, px, dy, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, px, y2, solid);
         }
-        for py in y..=y2 {
-            put(x, py);
-            put(x2, py);
+        for py in dy..=y2 {
+            crate::surface::put_pixel_clipped(buf, w, clip, dx, py, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, x2, py, solid);
         }
         Ok(Value::Unit)
     })
@@ -1381,29 +1764,27 @@ fn gfx_circle_outline(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         as_int(&args[4], "circle_outline")?,
         as_int(&args[5], "circle_outline")?,
     );
-    gfx_state::FRAME.with(|w| {
-        let mut borrow = w.borrow_mut();
-        let state = borrow
-            .as_mut()
-            .ok_or_else(|| "No active gfx window".to_string())?;
-        let mut put = |px: i32, py: i32| {
-            if px >= 0 && py >= 0 && px < state.width && py < state.height {
-                let idx = (py * state.width + px) as usize;
-                state.buffer[idx] = color;
-            }
+    with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+        let solid = target_solid_color(color, is_offscreen);
+        let (scx, scy, srad) = if cam.is_identity_rect() {
+            (cx, cy, radius)
+        } else {
+            let (sx, sy) = cam.world_to_screen(cx as f64, cy as f64, w, h);
+            let sr = ((radius as f64) * cam.zoom).round().clamp(0.0, 4096.0) as i32;
+            (sx.round() as i32, sy.round() as i32, sr)
         };
-        let mut x = radius;
+        let mut x = srad;
         let mut y = 0;
-        let mut err = 1 - radius;
+        let mut err = 1 - srad;
         while x >= y {
-            put(cx + x, cy + y);
-            put(cx + y, cy + x);
-            put(cx - y, cy + x);
-            put(cx - x, cy + y);
-            put(cx - x, cy - y);
-            put(cx - y, cy - x);
-            put(cx + y, cy - x);
-            put(cx + x, cy - y);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx + x, scy + y, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx + y, scy + x, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx - y, scy + x, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx - x, scy + y, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx - x, scy - y, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx - y, scy - x, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx + y, scy - x, solid);
+            crate::surface::put_pixel_clipped(buf, w, clip, scx + x, scy - y, solid);
             y += 1;
             if err < 0 {
                 err += 2 * y + 1;
@@ -1503,24 +1884,30 @@ fn draw_image_impl(img_id: i64, dx: i32, dy: i32, key: Option<u32>) -> Result<()
         let img = list
             .get(img_id as usize)
             .ok_or_else(|| "Invalid image handle".to_string())?;
-        gfx_state::FRAME.with(|w| {
-            let mut borrow = w.borrow_mut();
-            let state = borrow
-                .as_mut()
-                .ok_or_else(|| "No active gfx window".to_string())?;
+        with_active_target_mut(|buf, w, _h, clip, is_offscreen, cam| {
+            let (ox, oy) = if cam.is_identity_rect() {
+                (dx, dy)
+            } else {
+                let (sx, sy) = cam.world_to_screen(dx as f64, dy as f64, w, _h);
+                (sx.round() as i32, sy.round() as i32)
+            };
             for sy in 0..img.height {
-                let py = dy.saturating_add(sy);
-                if py < 0 || py >= state.height {
+                let py = oy.saturating_add(sy);
+                if py < clip.y0 || py >= clip.y1 {
                     continue;
                 }
                 for sx in 0..img.width {
-                    let px = dx.saturating_add(sx);
-                    if px < 0 || px >= state.width {
+                    let px = ox.saturating_add(sx);
+                    if px < clip.x0 || px >= clip.x1 {
                         continue;
                     }
                     let color = img.pixels[(sy * img.width + sx) as usize];
-                    let dst_idx = (py * state.width + px) as usize;
-                    blit_pixel(&mut state.buffer[dst_idx], color, img.has_alpha, key);
+                    let dst_idx = (py * w + px) as usize;
+                    if is_offscreen && !img.has_alpha {
+                        blit_pixel(&mut buf[dst_idx], 0xFF00_0000 | color, true, key);
+                    } else {
+                        blit_pixel(&mut buf[dst_idx], color, img.has_alpha, key);
+                    }
                 }
             }
             Ok(())
@@ -1619,24 +2006,26 @@ fn gfx_draw_sprite_frame(_vm: &mut VM, args: &[Value]) -> Result<Value, String> 
         let dest_w = ((frame_w as f64) * scale).round().max(1.0) as i32;
         let dest_h = ((frame_h as f64) * scale).round().max(1.0) as i32;
 
-        gfx_state::FRAME.with(|w| {
-            let mut borrow = w.borrow_mut();
-            let state = borrow
-                .as_mut()
-                .ok_or_else(|| "No active gfx window".to_string())?;
-            let x0 = dx.max(0);
-            let y0 = dy.max(0);
-            let x1 = dx.saturating_add(dest_w).min(state.width);
-            let y1 = dy.saturating_add(dest_h).min(state.height);
+        with_active_target_mut(|buf, w, _h, clip, _is_offscreen, cam| {
+            let (ox, oy) = if cam.is_identity_rect() {
+                (dx, dy)
+            } else {
+                let (sx, sy) = cam.world_to_screen(dx as f64, dy as f64, w, _h);
+                (sx.round() as i32, sy.round() as i32)
+            };
+            let x0 = ox.max(clip.x0);
+            let y0 = oy.max(clip.y0);
+            let x1 = ox.saturating_add(dest_w).min(clip.x1);
+            let y1 = oy.saturating_add(dest_h).min(clip.y1);
             for py in y0..y1 {
-                let sy = (((py - dy) as f64 / scale) as i32).clamp(0, frame_h - 1);
+                let sy = (((py - oy) as f64 / scale) as i32).clamp(0, frame_h - 1);
                 let src_row = ((src_y0 + sy) * img.width + src_x0) as usize;
-                let dst_row = (py * state.width) as usize;
+                let dst_row = (py * w) as usize;
                 for px in x0..x1 {
-                    let sx = (((px - dx) as f64 / scale) as i32).clamp(0, frame_w - 1);
+                    let sx = (((px - ox) as f64 / scale) as i32).clamp(0, frame_w - 1);
                     let color = img.pixels[src_row + sx as usize];
                     blit_pixel(
-                        &mut state.buffer[dst_row + px as usize],
+                        &mut buf[dst_row + px as usize],
                         color,
                         img.has_alpha,
                         None,
@@ -1999,4 +2388,1067 @@ pub(crate) fn decode_png(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {
     }
 
     Ok((width as i32, height as i32, pixels))
+}
+
+fn as_f64_gfx(v: &Value, fn_name: &str) -> Result<f64, String> {
+    match v {
+        Value::Int(i) => Ok(*i as f64),
+        Value::Float(f) if f.is_finite() => Ok(*f),
+        Value::Float(_) => Err(format!("gfx.{}(): float argument must be finite", fn_name)),
+        other => Err(format!(
+            "gfx.{}() expects a number, got '{}'",
+            fn_name,
+            other.type_name()
+        )),
+    }
+}
+
+fn as_handle_raw(v: &Value, fn_name: &str) -> Result<i64, String> {
+    match v {
+        Value::Int(i) => Ok(*i),
+        other => Err(format!(
+            "gfx.{}() expects integer handle, got '{}'",
+            fn_name,
+            other.type_name()
+        )),
+    }
+}
+
+fn surface_slot(handle: i64) -> Result<usize, String> {
+    if !(SURFACE_ID_BASE..LAYER_ID_BASE).contains(&handle) {
+        return Err(format!("Invalid surface handle {}", handle));
+    }
+    Ok((handle - SURFACE_ID_BASE) as usize)
+}
+
+fn layer_slot(handle: i64) -> Result<usize, String> {
+    if handle < LAYER_ID_BASE {
+        return Err(format!("Invalid layer handle {}", handle));
+    }
+    Ok((handle - LAYER_ID_BASE) as usize)
+}
+
+fn parse_color_argb(val: &Value) -> Result<u32, String> {
+    match val {
+        Value::Int(n) => {
+            let u = *n as u64;
+            if u <= 0x00FF_FFFF {
+                Ok(0xFF00_0000 | (u as u32))
+            } else {
+                Ok(u as u32)
+            }
+        }
+        Value::Str(s) => {
+            let t = s.trim();
+            if let Some(hex) = t.strip_prefix('#') {
+                if hex.len() == 8 {
+                    return u32::from_str_radix(hex, 16)
+                        .map_err(|_| format!("Invalid #AARRGGBB color '{}'", s));
+                }
+            }
+            let rgb = crate::modules::ui::parse_color_str(
+                t,
+                &crate::modules::ui::Theme::default(),
+            )?;
+            Ok(0xFF00_0000 | (rgb & 0x00FF_FFFF))
+        }
+        Value::List(items) => {
+            let b = items.borrow();
+            if b.len() != 3 && b.len() != 4 {
+                return Err("Color list must have 3 [r,g,b] or 4 [r,g,b,a] elements".to_string());
+            }
+            let r = as_int(&b[0], "color[0]")?.clamp(0, 255) as u32;
+            let g = as_int(&b[1], "color[1]")?.clamp(0, 255) as u32;
+            let bl = as_int(&b[2], "color[2]")?.clamp(0, 255) as u32;
+            let a = if b.len() == 4 {
+                as_int(&b[3], "color[3]")?.clamp(0, 255) as u32
+            } else {
+                255
+            };
+            Ok((a << 24) | (r << 16) | (g << 8) | bl)
+        }
+        other => Err(format!(
+            "gfx.draw_text() expects color int, '#RRGGBB'/'#AARRGGBB', or [r,g,b(,a)], got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+fn gfx_clip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err("gfx.clip() expects 4 arguments (x, y, w, h)".to_string());
+    }
+    let x = as_int(&args[0], "clip")? as i32;
+    let y = as_int(&args[1], "clip")? as i32;
+    let w = (as_int(&args[2], "clip")? as i32).max(0);
+    let h = (as_int(&args[3], "clip")? as i32).max(0);
+    set_active_clip(Some(ClipRect {
+        x0: x,
+        y0: y,
+        x1: x.saturating_add(w),
+        y1: y.saturating_add(h),
+    }))?;
+    Ok(Value::Unit)
+}
+
+fn gfx_reset_clip(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.reset_clip() expects 0 arguments".to_string());
+    }
+    set_active_clip(None)?;
+    Ok(Value::Unit)
+}
+
+fn gfx_surface_new(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.surface_new() expects 2 arguments (width, height)".to_string());
+    }
+    let w = as_int(&args[0], "surface_new")? as i32;
+    let h = as_int(&args[1], "surface_new")? as i32;
+    if !(1..=crate::surface::MAX_USER_SURFACE_DIM).contains(&w)
+        || !(1..=crate::surface::MAX_USER_SURFACE_DIM).contains(&h)
+    {
+        return Err(format!(
+            "gfx.surface_new() dimensions must be in 1..={}",
+            crate::surface::MAX_USER_SURFACE_DIM
+        ));
+    }
+    gfx_state::bind_budget(vm.budget_core());
+    gfx_state::SURFACES.with(|surfs| {
+        let mut list = surfs.borrow_mut();
+        let active = list.iter().filter(|s| s.is_some()).count();
+        if active >= crate::surface::MAX_SURFACES {
+            return Err(format!(
+                "gfx.surface_new(): maximum surfaces ({}) reached",
+                crate::surface::MAX_SURFACES
+            ));
+        }
+        let surf = crate::surface::Surface::new_rgba8(w, h, 0x0000_0000, Some(vm.budget_core()))?;
+        let slot = if let Some(idx) = list.iter().position(|s| s.is_none()) {
+            list[idx] = Some(surf);
+            idx
+        } else {
+            list.push(Some(surf));
+            list.len() - 1
+        };
+        Ok(Value::Int(SURFACE_ID_BASE + slot as i64))
+    })
+}
+
+fn gfx_surface_free(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.surface_free() expects 1 argument (surface)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "surface_free")?;
+    let slot = surface_slot(handle)?;
+    if is_target_active_on_stack(gfx_state::ActiveTarget::Surface(slot)) {
+        return Err("gfx.surface_free(): cannot free surface while active in draw_to".to_string());
+    }
+    gfx_state::bind_budget(vm.budget_core());
+    gfx_state::SURFACES.with(|surfs| {
+        let mut list = surfs.borrow_mut();
+        let Some(entry) = list.get_mut(slot) else {
+            return Err(format!("Invalid or freed surface handle {}", handle));
+        };
+        let Some(mut surf) = entry.take() else {
+            return Err(format!("Invalid or freed surface handle {}", handle));
+        };
+        surf.refund_to(Some(vm.budget_core()));
+        Ok(Value::Unit)
+    })
+}
+
+fn gfx_surface_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.surface_width() expects 1 argument (surface)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "surface_width")?;
+    let slot = surface_slot(handle)?;
+    gfx_state::SURFACES.with(|surfs| {
+        let list = surfs.borrow();
+        let surf = list
+            .get(slot)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+        Ok(Value::Int(surf.width as i64))
+    })
+}
+
+fn gfx_surface_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.surface_height() expects 1 argument (surface)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "surface_height")?;
+    let slot = surface_slot(handle)?;
+    gfx_state::SURFACES.with(|surfs| {
+        let list = surfs.borrow();
+        let surf = list
+            .get(slot)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+        Ok(Value::Int(surf.height as i64))
+    })
+}
+
+fn gfx_surface_from_image(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.surface_from_image() expects 1 argument (img)".to_string());
+    }
+    let img_id = as_handle_raw(&args[0], "surface_from_image")?;
+    if !(0..SURFACE_ID_BASE).contains(&img_id) {
+        return Err(format!("Invalid image handle {}", img_id));
+    }
+    let (w, h, pixels) = gfx_state::IMAGES.with(|imgs| {
+        let list = imgs.borrow();
+        let img = list
+            .get(img_id as usize)
+            .ok_or_else(|| format!("Invalid image handle {}", img_id))?;
+        let px = if img.has_alpha {
+            img.pixels.clone()
+        } else {
+            img.pixels.iter().map(|&p| p | 0xFF00_0000).collect()
+        };
+        Ok::<_, String>((img.width, img.height, px))
+    })?;
+    gfx_state::bind_budget(vm.budget_core());
+    gfx_state::SURFACES.with(|surfs| {
+        let mut list = surfs.borrow_mut();
+        let active = list.iter().filter(|s| s.is_some()).count();
+        if active >= crate::surface::MAX_SURFACES {
+            return Err(format!(
+                "gfx.surface_from_image(): maximum surfaces ({}) reached",
+                crate::surface::MAX_SURFACES
+            ));
+        }
+        let surf = crate::surface::Surface::from_rgba_pixels(w, h, pixels, Some(vm.budget_core()))?;
+        let slot = if let Some(idx) = list.iter().position(|s| s.is_none()) {
+            list[idx] = Some(surf);
+            idx
+        } else {
+            list.push(Some(surf));
+            list.len() - 1
+        };
+        Ok(Value::Int(SURFACE_ID_BASE + slot as i64))
+    })
+}
+
+struct TargetPopGuard;
+impl Drop for TargetPopGuard {
+    fn drop(&mut self) {
+        gfx_state::TARGET_STACK.with(|st| {
+            st.borrow_mut().pop();
+        });
+    }
+}
+
+fn run_on_pushed_target(
+    vm: &mut VM,
+    target: gfx_state::ActiveTarget,
+    callback: Value,
+    ctx: &str,
+) -> Result<Value, String> {
+    if is_target_active_on_stack(target) {
+        return Err(format!(
+            "gfx.{}(): self-targeting active surface or layer is forbidden",
+            ctx
+        ));
+    }
+    let parent_cam = gfx_state::current_camera();
+    gfx_state::TARGET_STACK.with(|st| -> Result<(), String> {
+        let mut stack = st.borrow_mut();
+        if stack.len() >= crate::surface::MAX_TARGET_DEPTH {
+            return Err(format!(
+                "gfx.{}(): maximum target stack depth ({}) exceeded",
+                ctx,
+                crate::surface::MAX_TARGET_DEPTH
+            ));
+        }
+        stack.push(gfx_state::TargetFrame {
+            target,
+            camera: parent_cam,
+        });
+        Ok(())
+    })?;
+    let _guard = TargetPopGuard;
+    vm.call_value(callback, &[])
+}
+
+fn gfx_draw_to(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.draw_to() expects 2 arguments (surface, callback)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "draw_to")?;
+    let slot = surface_slot(handle)?;
+    gfx_state::SURFACES.with(|surfs| {
+        let list = surfs.borrow();
+        if list.get(slot).and_then(|o| o.as_ref()).is_none() {
+            return Err(format!("Invalid or freed surface handle {}", handle));
+        }
+        Ok(())
+    })?;
+    run_on_pushed_target(vm, gfx_state::ActiveTarget::Surface(slot), args[1].clone(), "draw_to")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_surface_blit_to_buf(
+    dst: &mut [u32],
+    dst_w: i32,
+    dst_h: i32,
+    dst_clip: ClipRect,
+    preserve_dst_alpha: bool,
+    cam: &crate::camera::Camera2D,
+    src: &[u32],
+    src_w: i32,
+    src_h: i32,
+    dx: i32,
+    dy: i32,
+    sx: f64,
+    sy: f64,
+    key: Option<u32>,
+    alpha: u8,
+) {
+    if cam.is_identity_rect() {
+        crate::surface::blit_rgba_surface(
+            dst,
+            dst_w,
+            dst_clip,
+            preserve_dst_alpha,
+            src,
+            src_w,
+            src_h,
+            dx,
+            dy,
+            sx,
+            sy,
+            key,
+            alpha,
+        );
+        return;
+    }
+    if cam.angle == 0.0 {
+        let (tx, ty) = cam.world_to_screen(dx as f64, dy as f64, dst_w, dst_h);
+        crate::surface::blit_rgba_surface(
+            dst,
+            dst_w,
+            dst_clip,
+            preserve_dst_alpha,
+            src,
+            src_w,
+            src_h,
+            tx.round() as i32,
+            ty.round() as i32,
+            sx * cam.zoom,
+            sy * cam.zoom,
+            key,
+            alpha,
+        );
+        return;
+    }
+    let dw = (src_w as f64) * sx;
+    let dh = (src_h as f64) * sy;
+    let corners = [
+        cam.world_to_screen(dx as f64, dy as f64, dst_w, dst_h),
+        cam.world_to_screen(dx as f64 + dw, dy as f64, dst_w, dst_h),
+        cam.world_to_screen(dx as f64, dy as f64 + dh, dst_w, dst_h),
+        cam.world_to_screen(dx as f64 + dw, dy as f64 + dh, dst_w, dst_h),
+    ];
+    let min_x = (corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min).floor() as i32).max(dst_clip.x0);
+    let min_y = (corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min).floor() as i32).max(dst_clip.y0);
+    let max_x = (corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max).ceil() as i32).min(dst_clip.x1);
+    let max_y = (corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max).ceil() as i32).min(dst_clip.y1);
+    let dst_wu = dst_w as usize;
+    let src_wu = src_w as usize;
+    for py in min_y..max_y {
+        let drow = (py as usize) * dst_wu;
+        for px in min_x..max_x {
+            let (wx, wy) = cam.screen_to_world(px as f64 + 0.5, py as f64 + 0.5, dst_w, dst_h);
+            let lx = (wx - dx as f64) / sx;
+            let ly = (wy - dy as f64) / sy;
+            if lx >= 0.0 && lx < src_w as f64 && ly >= 0.0 && ly < src_h as f64 {
+                let sc = src[(ly as usize) * src_wu + (lx as usize)];
+                if let Some(k) = key {
+                    if (sc & 0x00FF_FFFF) == (k & 0x00FF_FFFF) {
+                        continue;
+                    }
+                }
+                let sa = (sc >> 24) & 0xFF;
+                let eff_a = if alpha == 255 {
+                    sa
+                } else {
+                    (sa * (alpha as u32) + 127) / 255
+                };
+                let d_idx = drow + px as usize;
+                dst[d_idx] = crate::surface::blend_straight_argb(
+                    dst[d_idx],
+                    (sc >> 16) & 0xFF,
+                    (sc >> 8) & 0xFF,
+                    sc & 0xFF,
+                    eff_a,
+                    preserve_dst_alpha,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_surface_impl(
+    vm: &mut VM,
+    handle: i64,
+    dx: i32,
+    dy: i32,
+    sx: f64,
+    sy: f64,
+    key: Option<u32>,
+    alpha: u8,
+) -> Result<Value, String> {
+    let slot = surface_slot(handle)?;
+    if is_target_active_on_stack(gfx_state::ActiveTarget::Surface(slot)) {
+        return Err("gfx.draw_surface(): self-targeting active surface is forbidden".to_string());
+    }
+    let top = gfx_state::TARGET_STACK.with(|st| st.borrow().last().copied());
+    let work_pixels = match top {
+        Some(tf) => match tf.target {
+            gfx_state::ActiveTarget::Surface(dst_slot) => {
+                debug_assert_ne!(slot, dst_slot);
+                gfx_state::SURFACES.with(|surfs| -> Result<u64, String> {
+                    let mut list = surfs.borrow_mut();
+                    let len = list.len();
+                    if slot >= len || dst_slot >= len {
+                        return Err(format!("Invalid surface handle {}", handle));
+                    }
+                    let (src_opt, dst_opt) = if slot < dst_slot {
+                        let (l, r) = list.split_at_mut(dst_slot);
+                        (&l[slot], &mut r[0])
+                    } else {
+                        let (l, r) = list.split_at_mut(slot);
+                        (&r[0], &mut l[dst_slot])
+                    };
+                    let src = src_opt
+                        .as_ref()
+                        .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+                    let dst = dst_opt
+                        .as_mut()
+                        .ok_or_else(|| "Active target surface was freed".to_string())?;
+                    let clip = dst.effective_clip();
+                    let px_work = (((src.width as f64) * sx).abs() * ((src.height as f64) * sy).abs())
+                        .round()
+                        .max(1.0) as u64;
+                    draw_surface_blit_to_buf(
+                        &mut dst.pixels,
+                        dst.width,
+                        dst.height,
+                        clip,
+                        false,
+                        &tf.camera,
+                        &src.pixels,
+                        src.width,
+                        src.height,
+                        dx,
+                        dy,
+                        sx,
+                        sy,
+                        key,
+                        alpha,
+                    );
+                    Ok(px_work)
+                })?
+            }
+            gfx_state::ActiveTarget::Layer(dst_slot) => gfx_state::SURFACES.with(|surfs| {
+                let list = surfs.borrow();
+                let src = list
+                    .get(slot)
+                    .and_then(|o| o.as_ref())
+                    .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+                let px_work = (((src.width as f64) * sx).abs() * ((src.height as f64) * sy).abs())
+                    .round()
+                    .max(1.0) as u64;
+                gfx_state::LAYERS.with(|layers| -> Result<u64, String> {
+                    let mut bank = layers.borrow_mut();
+                    let dst = bank.get_mut(dst_slot)?;
+                    let clip = dst.surface.effective_clip();
+                    draw_surface_blit_to_buf(
+                        &mut dst.surface.pixels,
+                        dst.surface.width,
+                        dst.surface.height,
+                        clip,
+                        false,
+                        &tf.camera,
+                        &src.pixels,
+                        src.width,
+                        src.height,
+                        dx,
+                        dy,
+                        sx,
+                        sy,
+                        key,
+                        alpha,
+                    );
+                    Ok(px_work)
+                })
+            })?,
+        },
+        None => gfx_state::SURFACES.with(|surfs| {
+            let list = surfs.borrow();
+            let src = list
+                .get(slot)
+                .and_then(|o| o.as_ref())
+                .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+            let px_work = (((src.width as f64) * sx).abs() * ((src.height as f64) * sy).abs())
+                .round()
+                .max(1.0) as u64;
+            let cam = gfx_state::ROOT_CAMERA.with(|c| *c.borrow());
+            gfx_state::FRAME.with(|w| -> Result<u64, String> {
+                let mut borrow = w.borrow_mut();
+                let state = borrow
+                    .as_mut()
+                    .ok_or_else(|| "No active gfx window".to_string())?;
+                let clip = crate::surface::effective_clip(state.width, state.height, state.clip);
+                draw_surface_blit_to_buf(
+                    &mut state.buffer,
+                    state.width,
+                    state.height,
+                    clip,
+                    true,
+                    &cam,
+                    &src.pixels,
+                    src.width,
+                    src.height,
+                    dx,
+                    dy,
+                    sx,
+                    sy,
+                    key,
+                    alpha,
+                );
+                Ok(px_work)
+            })
+        })?,
+    };
+    vm.charge_work((work_pixels / 64).max(1))?;
+    Ok(Value::Unit)
+}
+
+fn gfx_draw_surface(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("gfx.draw_surface() expects 3 arguments (surface, x, y)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "draw_surface")?;
+    let x = as_int(&args[1], "draw_surface")? as i32;
+    let y = as_int(&args[2], "draw_surface")? as i32;
+    draw_surface_impl(vm, handle, x, y, 1.0, 1.0, None, 255)
+}
+
+fn gfx_draw_surface_scaled(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 5 {
+        return Err("gfx.draw_surface_scaled() expects 5 arguments (surface, x, y, sx, sy)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "draw_surface_scaled")?;
+    let x = as_int(&args[1], "draw_surface_scaled")? as i32;
+    let y = as_int(&args[2], "draw_surface_scaled")? as i32;
+    let sx = as_f64_gfx(&args[3], "draw_surface_scaled")?;
+    let sy = as_f64_gfx(&args[4], "draw_surface_scaled")?;
+    if sx <= 0.0 || sx > 64.0 || sy <= 0.0 || sy > 64.0 {
+        return Err("gfx.draw_surface_scaled() scales must be in (0, 64]".to_string());
+    }
+    draw_surface_impl(vm, handle, x, y, sx, sy, None, 255)
+}
+
+fn gfx_draw_surface_keyed(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 6 {
+        return Err(
+            "gfx.draw_surface_keyed() expects 6 arguments (surface, x, y, r, g, b)".to_string(),
+        );
+    }
+    let handle = as_handle_raw(&args[0], "draw_surface_keyed")?;
+    let x = as_int(&args[1], "draw_surface_keyed")? as i32;
+    let y = as_int(&args[2], "draw_surface_keyed")? as i32;
+    let key = rgb(
+        as_int(&args[3], "draw_surface_keyed")?,
+        as_int(&args[4], "draw_surface_keyed")?,
+        as_int(&args[5], "draw_surface_keyed")?,
+    );
+    draw_surface_impl(vm, handle, x, y, 1.0, 1.0, Some(key), 255)
+}
+
+fn gfx_draw_surface_alpha(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err("gfx.draw_surface_alpha() expects 4 arguments (surface, x, y, alpha)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "draw_surface_alpha")?;
+    let x = as_int(&args[1], "draw_surface_alpha")? as i32;
+    let y = as_int(&args[2], "draw_surface_alpha")? as i32;
+    let alpha = as_int(&args[3], "draw_surface_alpha")?.clamp(0, 255) as u8;
+    draw_surface_impl(vm, handle, x, y, 1.0, 1.0, None, alpha)
+}
+
+fn gfx_read_pixel(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.read_pixel() expects 2 arguments (x, y)".to_string());
+    }
+    let x = as_int(&args[0], "read_pixel")? as i32;
+    let y = as_int(&args[1], "read_pixel")? as i32;
+    with_active_target(|buf, w, h, _clip, _off, _cam| {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return Err(format!("gfx.read_pixel({}, {}) out of bounds {}x{}", x, y, w, h));
+        }
+        Ok(Value::Int(buf[(y as usize) * (w as usize) + (x as usize)] as i64))
+    })
+}
+
+fn gfx_frame_hash(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.frame_hash() expects 0 arguments".to_string());
+    }
+    with_active_target(|buf, w, h, _clip, _off, _cam| {
+        Ok(Value::from_str(crate::surface::hash_rgba_buffer(w, h, buf)))
+    })
+}
+
+fn gfx_layer_new(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.layer_new() expects 2 arguments (width, height)".to_string());
+    }
+    let w = as_int(&args[0], "layer_new")? as i32;
+    let h = as_int(&args[1], "layer_new")? as i32;
+    if !(1..=crate::surface::MAX_USER_SURFACE_DIM).contains(&w)
+        || !(1..=crate::surface::MAX_USER_SURFACE_DIM).contains(&h)
+    {
+        return Err(format!(
+            "gfx.layer_new() dimensions must be in 1..={}",
+            crate::surface::MAX_USER_SURFACE_DIM
+        ));
+    }
+    gfx_state::bind_budget(vm.budget_core());
+    gfx_state::LAYERS.with(|layers| {
+        let slot = layers.borrow_mut().create(w, h, Some(vm.budget_core()))?;
+        Ok(Value::Int(LAYER_ID_BASE + slot as i64))
+    })
+}
+
+fn gfx_layer_free(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.layer_free() expects 1 argument (layer)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "layer_free")?;
+    let slot = layer_slot(handle)?;
+    if is_target_active_on_stack(gfx_state::ActiveTarget::Layer(slot)) {
+        return Err("gfx.layer_free(): cannot free layer while active in draw_to_layer".to_string());
+    }
+    gfx_state::bind_budget(vm.budget_core());
+    gfx_state::LAYERS.with(|layers| {
+        layers.borrow_mut().free(slot, Some(vm.budget_core()))?;
+        Ok(Value::Unit)
+    })
+}
+
+fn gfx_layer_mode(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.layer_mode() expects 2 arguments (layer, mode)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "layer_mode")?;
+    let slot = layer_slot(handle)?;
+    let Value::Str(m) = &args[1] else {
+        return Err("gfx.layer_mode() mode must be string ('normal'|'add'|'multiply')".to_string());
+    };
+    let mode = crate::layers::BlendMode::from_str(m.as_str())?;
+    gfx_state::LAYERS.with(|layers| {
+        layers.borrow_mut().get_mut(slot)?.mode = mode;
+        Ok(Value::Unit)
+    })
+}
+
+fn gfx_layer_visible(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.layer_visible() expects 2 arguments (layer, visible)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "layer_visible")?;
+    let slot = layer_slot(handle)?;
+    let Value::Bool(v) = args[1] else {
+        return Err("gfx.layer_visible() expects bool visibility".to_string());
+    };
+    gfx_state::LAYERS.with(|layers| {
+        layers.borrow_mut().get_mut(slot)?.visible = v;
+        Ok(Value::Unit)
+    })
+}
+
+fn gfx_layer_z(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.layer_z() expects 2 arguments (layer, z_order)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "layer_z")?;
+    let slot = layer_slot(handle)?;
+    let z = as_int(&args[1], "layer_z")? as i32;
+    gfx_state::LAYERS.with(|layers| {
+        layers.borrow_mut().get_mut(slot)?.z_order = z;
+        Ok(Value::Unit)
+    })
+}
+
+fn gfx_layer_parallax(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("gfx.layer_parallax() expects 3 arguments (layer, px, py)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "layer_parallax")?;
+    let slot = layer_slot(handle)?;
+    let px = as_f64_gfx(&args[1], "layer_parallax")?;
+    let py = as_f64_gfx(&args[2], "layer_parallax")?;
+    if !(-4.0..=4.0).contains(&px) || !(-4.0..=4.0).contains(&py) {
+        return Err("gfx.layer_parallax() factors must be in -4.0..=4.0".to_string());
+    }
+    gfx_state::LAYERS.with(|layers| {
+        let mut bank = layers.borrow_mut();
+        let lay = bank.get_mut(slot)?;
+        lay.parallax_x = px;
+        lay.parallax_y = py;
+        Ok(Value::Unit)
+    })
+}
+
+fn gfx_draw_to_layer(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.draw_to_layer() expects 2 arguments (layer, callback)".to_string());
+    }
+    let handle = as_handle_raw(&args[0], "draw_to_layer")?;
+    let slot = layer_slot(handle)?;
+    gfx_state::LAYERS.with(|layers| {
+        let _ = layers.borrow().get(slot)?;
+        Ok::<_, String>(())
+    })?;
+    run_on_pushed_target(vm, gfx_state::ActiveTarget::Layer(slot), args[1].clone(), "draw_to_layer")
+}
+
+fn gfx_compose_layers(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.compose_layers() expects 0 arguments".to_string());
+    }
+    let layer_active = gfx_state::TARGET_STACK.with(|st| {
+        st.borrow()
+            .iter()
+            .any(|tf| matches!(tf.target, gfx_state::ActiveTarget::Layer(_)))
+    });
+    if layer_active {
+        return Err("gfx.compose_layers() cannot be called inside draw_to_layer".to_string());
+    }
+    let visited = gfx_state::LAYERS.with(|layers| {
+        let bank = layers.borrow();
+        with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+            Ok(crate::compose::compose_layers(
+                buf,
+                w,
+                h,
+                clip,
+                is_offscreen,
+                &bank,
+                cam,
+            ))
+        })
+    })?;
+    vm.charge_work((visited / 64).max(1))?;
+    Ok(Value::Unit)
+}
+
+fn gfx_set_camera(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err("gfx.set_camera() expects (x, y, [zoom], [angle])".to_string());
+    }
+    let x = as_f64_gfx(&args[0], "set_camera")?;
+    let y = as_f64_gfx(&args[1], "set_camera")?;
+    let zoom = if args.len() >= 3 {
+        as_f64_gfx(&args[2], "set_camera")?
+    } else {
+        gfx_state::current_camera().zoom
+    };
+    let angle = if args.len() >= 4 {
+        as_f64_gfx(&args[3], "set_camera")?
+    } else {
+        gfx_state::current_camera().angle
+    };
+    let mut cam = gfx_state::current_camera();
+    cam.set(x, y, zoom, angle)?;
+    gfx_state::set_current_camera(cam);
+    Ok(Value::Unit)
+}
+
+fn gfx_camera(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.camera() expects 0 arguments".to_string());
+    }
+    vm.charge_alloc(192)?;
+    let cam = gfx_state::current_camera();
+    let mut map = crate::value::new_dict_with_capacity(6);
+    map.insert("enabled".to_string(), Value::Bool(cam.enabled));
+    map.insert("x".to_string(), Value::Float(cam.x));
+    map.insert("y".to_string(), Value::Float(cam.y));
+    map.insert("zoom".to_string(), Value::Float(cam.zoom));
+    map.insert("angle".to_string(), Value::Float(cam.angle));
+    map.insert("shake".to_string(), Value::Float(cam.current_shake_amp()));
+    Ok(Value::dict(map))
+}
+
+fn gfx_reset_camera(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.reset_camera() expects 0 arguments".to_string());
+    }
+    let mut cam = gfx_state::current_camera();
+    cam.reset();
+    gfx_state::set_current_camera(cam);
+    Ok(Value::Unit)
+}
+
+fn gfx_set_camera_shake(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.set_camera_shake() expects (intensity, duration)".to_string());
+    }
+    let intensity = as_f64_gfx(&args[0], "set_camera_shake")?;
+    let duration = as_f64_gfx(&args[1], "set_camera_shake")?;
+    let seed = if vm.is_deterministic() {
+        Some(0xA5A4_E202_0502_0001)
+    } else {
+        None
+    };
+    let mut cam = gfx_state::current_camera();
+    cam.set_shake(intensity, duration, seed)?;
+    gfx_state::set_current_camera(cam);
+    Ok(Value::Unit)
+}
+
+fn gfx_update_camera(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.update_camera() expects 1 argument (dt)".to_string());
+    }
+    let dt = as_f64_gfx(&args[0], "update_camera")?;
+    if dt < 0.0 {
+        return Err("gfx.update_camera() dt must be >= 0".to_string());
+    }
+    let mut cam = gfx_state::current_camera();
+    cam.tick_shake(dt);
+    gfx_state::set_current_camera(cam);
+    Ok(Value::Unit)
+}
+
+fn gfx_world_to_screen(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.world_to_screen() expects 2 arguments (wx, wy)".to_string());
+    }
+    let wx = as_f64_gfx(&args[0], "world_to_screen")?;
+    let wy = as_f64_gfx(&args[1], "world_to_screen")?;
+    with_active_target(|_buf, w, h, _clip, _off, cam| {
+        let (sx, sy) = cam.world_to_screen(wx, wy, w, h);
+        Ok(Value::Vec2(sx as f32, sy as f32))
+    })
+}
+
+fn gfx_screen_to_world(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.screen_to_world() expects 2 arguments (sx, sy)".to_string());
+    }
+    let sx = as_f64_gfx(&args[0], "screen_to_world")?;
+    let sy = as_f64_gfx(&args[1], "screen_to_world")?;
+    with_active_target(|_buf, w, h, _clip, _off, cam| {
+        let (wx, wy) = cam.screen_to_world(sx, sy, w, h);
+        Ok(Value::Vec2(wx as f32, wy as f32))
+    })
+}
+
+fn gfx_mouse_world(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.mouse_world() expects 0 arguments".to_string());
+    }
+    let (mx, my) = match gfx_state::is_frame_headless() {
+        Some(true) => (0.0, 0.0),
+        Some(false) => {
+            #[cfg(windows)]
+            {
+                let (x, y) = win32_gfx::mouse_pos()?;
+                (x as f64, y as f64)
+            }
+            #[cfg(not(windows))]
+            {
+                (0.0, 0.0)
+            }
+        }
+        None => return Err("No active gfx window".to_string()),
+    };
+    with_active_target(|_buf, w, h, _clip, _off, cam| {
+        let (wx, wy) = cam.screen_to_world(mx, my, w, h);
+        Ok(Value::Vec2(wx as f32, wy as f32))
+    })
+}
+
+fn gfx_font_bitmap(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("gfx.font_bitmap() expects 0 arguments".to_string());
+    }
+    Ok(Value::Int(0))
+}
+
+fn gfx_font_load_bmfont(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    use std::io::Read;
+    if args.len() != 1 {
+        return Err("gfx.font_load_bmfont() expects 1 argument (fnt_path)".to_string());
+    }
+    let path = match &args[0] {
+        Value::Str(s) => s.as_str(),
+        other => {
+            return Err(format!(
+                "gfx.font_load_bmfont() expects a string path, got '{}'",
+                other.type_name()
+            ));
+        }
+    };
+    gfx_state::bind_budget(vm.budget_core());
+    let fnt_resolved = vm.resolve_read_path(path)?;
+    let fnt_file = std::fs::File::open(&fnt_resolved)
+        .map_err(|e| format!("gfx.font_load_bmfont('{}'): {}", path, e))?;
+    let mut fnt_bytes = Vec::new();
+    fnt_file
+        .take(crate::font_bmfont::MAX_FNT_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut fnt_bytes)
+        .map_err(|e| format!("gfx.font_load_bmfont('{}'): {}", path, e))?;
+    if fnt_bytes.len() > crate::font_bmfont::MAX_FNT_FILE_BYTES {
+        return Err("gfx.font_load_bmfont(): .fnt file exceeds 2 MiB limit".to_string());
+    }
+    let fnt_text = std::str::from_utf8(&fnt_bytes)
+        .map_err(|_| "gfx.font_load_bmfont(): .fnt file must be valid UTF-8 ASCII".to_string())?;
+    let base_dir = fnt_resolved
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| vm.sandbox_root().clone());
+
+    let bmfont = crate::font_bmfont::parse_bmfont_ascii(fnt_text, Some(vm.budget_core()), |_, file| {
+        let resolved_page = vm.resolve_read_path_from(&base_dir, file)?;
+        let page_file = std::fs::File::open(&resolved_page)
+            .map_err(|e| format!("gfx.font_load_bmfont page '{}': {}", file, e))?;
+        const LIMIT: usize = 32 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        page_file
+            .take(LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("gfx.font_load_bmfont page '{}': {}", file, e))?;
+        if bytes.len() > LIMIT {
+            return Err("BMFont page image exceeds 32 MiB limit".to_string());
+        }
+        crate::font_bmfont::decode_page_bytes_r8(&bytes, &resolved_page)
+    })?;
+
+    gfx_state::FONTS.with(|fonts| {
+        let id = fonts.borrow_mut().register_bmfont(bmfont)?;
+        Ok(Value::Int(id as i64))
+    })
+}
+
+fn gfx_font_free(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("gfx.font_free() expects 1 argument (font_id)".to_string());
+    }
+    let id = as_handle_raw(&args[0], "font_free")?;
+    gfx_state::bind_budget(vm.budget_core());
+    gfx_state::FONTS.with(|fonts| {
+        fonts.borrow_mut().free_font(id, Some(vm.budget_core()))?;
+        Ok(Value::Unit)
+    })
+}
+
+fn gfx_draw_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 6 && args.len() != 7 {
+        return Err(
+            "gfx.draw_text() expects 6 or 7 arguments (font, x, y, text, size, color, [align])"
+                .to_string(),
+        );
+    }
+    let font_id = as_handle_raw(&args[0], "draw_text")?;
+    let x = as_int(&args[1], "draw_text")? as i32;
+    let y = as_int(&args[2], "draw_text")? as i32;
+    let text = format!("{}", args[3]);
+    let size = as_int(&args[4], "draw_text")? as i32;
+    let color_argb = parse_color_argb(&args[5])?;
+    let align = if let Some(a) = args.get(6) {
+        let Value::Str(s) = a else {
+            return Err("gfx.draw_text() align must be 'left', 'center', or 'right'".to_string());
+        };
+        match s.as_str() {
+            "left" | "center" | "right" => s.as_str().to_string(),
+            other => return Err(format!("gfx.draw_text() unknown align '{}'", other)),
+        }
+    } else {
+        "left".to_string()
+    };
+
+    gfx_state::bind_budget(vm.budget_core());
+    vm.charge_work(((text.chars().count() as u64) / 16).max(1))?;
+    gfx_state::FONTS.with(|fonts| {
+        let mut fs = fonts.borrow_mut();
+        with_active_target_mut(|buf, w, h, clip, is_offscreen, cam| {
+            fs.draw_text(
+                buf,
+                w,
+                h,
+                clip,
+                cam,
+                font_id,
+                size,
+                x,
+                y,
+                &text,
+                color_argb,
+                &align,
+                !is_offscreen,
+                Some(vm.budget_core()),
+            )?;
+            Ok(Value::Unit)
+        })
+    })
+}
+
+fn gfx_measure_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("gfx.measure_text() expects 3 arguments (font, text, size)".to_string());
+    }
+    let font_id = as_handle_raw(&args[0], "measure_text")?;
+    let text = format!("{}", args[1]);
+    let size = as_int(&args[2], "measure_text")? as i32;
+    let (w, h, lh, lines) = gfx_state::FONTS.with(|fonts| {
+        fonts.borrow().measure_text(font_id, size, &text)
+    })?;
+    vm.charge_alloc(128)?;
+    let mut map = crate::value::new_dict_with_capacity(4);
+    map.insert("width".to_string(), Value::Int(w as i64));
+    map.insert("height".to_string(), Value::Int(h as i64));
+    map.insert("line_height".to_string(), Value::Int(lh as i64));
+    map.insert("lines".to_string(), Value::Int(lines as i64));
+    Ok(Value::dict(map))
+}
+
+fn gfx_text_line_height(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("gfx.text_line_height() expects 2 arguments (font, size)".to_string());
+    }
+    let font_id = as_handle_raw(&args[0], "text_line_height")?;
+    let size = as_int(&args[1], "text_line_height")? as i32;
+    let lh = gfx_state::FONTS.with(|fonts| fonts.borrow().line_height(font_id, size))?;
+    Ok(Value::Int(lh as i64))
+}
+
+fn gfx_text_width(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("gfx.text_width() expects 3 arguments (font, text, size)".to_string());
+    }
+    let font_id = as_handle_raw(&args[0], "text_width")?;
+    let text = format!("{}", args[1]);
+    let size = as_int(&args[2], "text_width")? as i32;
+    let (w, _, _, _) = gfx_state::FONTS.with(|fonts| fonts.borrow().measure_text(font_id, size, &text))?;
+    Ok(Value::Int(w as i64))
+}
+
+#[cfg(test)]
+pub(crate) fn test_flush_font_atlas() -> u64 {
+    gfx_state::with_budget_opt(|b| {
+        gfx_state::FONTS.with(|fonts| {
+            let mut fs = fonts.borrow_mut();
+            fs.flush_atlas(b);
+            fs.flush_count
+        })
+    })
 }

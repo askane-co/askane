@@ -21,7 +21,7 @@ fn xml_escape(vm: &mut crate::vm::VM, args: &[Value]) -> Result<Value, String> {
     }
     let s = html::escape_str(&args[0].to_string());
     vm.charge_alloc(s.len())?;
-    Ok(Value::Str(s))
+    Ok(Value::from_str(s))
 }
 
 fn xml_unescape(vm: &mut crate::vm::VM, args: &[Value]) -> Result<Value, String> {
@@ -30,5 +30,5 @@ fn xml_unescape(vm: &mut crate::vm::VM, args: &[Value]) -> Result<Value, String>
     }
     let s = html::unescape_str(&args[0].to_string());
     vm.charge_alloc(s.len())?;
-    Ok(Value::Str(s))
+    Ok(Value::from_str(s))
 }

@@ -25,7 +25,7 @@ pub struct StructProto {
 pub enum Constant {
     Int(i64),
     Float(f64),
-    Str(String),
+    Str(Rc<String>),
     Bytes(Vec<u8>),
     Function(Rc<FunctionProto>),
     Struct(Rc<StructProto>),
@@ -36,7 +36,7 @@ impl fmt::Display for Constant {
         match self {
             Constant::Int(v) => write!(f, "{}", v),
             Constant::Float(v) => write!(f, "{}", v),
-            Constant::Str(s) => write!(f, "{:?}", s),
+            Constant::Str(s) => write!(f, "{:?}", s.as_str()),
             Constant::Bytes(b) => write!(f, "<bytes {}>", b.len()),
             Constant::Function(proto) => write!(f, "<fn {}>", proto.name),
             Constant::Struct(st) => write!(f, "<struct {}>", st.name),
@@ -139,6 +139,38 @@ pub enum Op {
     RunCleanups(u16),
 
     Return,
+
+    // 0.20.0 Stage 1 superinstructions (append-only cache tags 70..=77)
+    JumpIfLtLocalInt(u16, i32, usize),
+    JumpIfLeLocalInt(u16, i32, usize),
+    JumpIfLtLocals(u16, u16, usize),
+    JumpIfLeLocals(u16, u16, usize),
+    JumpIfGtLocalInt(u16, i32, usize),
+    GetIndexLocal(u16, u16),
+    SetIndexLocalPop(u16, u16),
+    AppendLocalStr(u16, u16),
+    AddLocalsPop(u16, u16),
+    SubLocalsPop(u16, u16),
+    MulLocals(u16, u16),
+}
+
+impl Op {
+    /// Original un-fused opcode step cost so `--max-steps` stays invariant across peephole fusion.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub const fn step_cost(&self) -> u64 {
+        match *self {
+            Op::JumpIfLtLocalInt(_, _, _)
+            | Op::JumpIfLeLocalInt(_, _, _)
+            | Op::JumpIfLtLocals(_, _, _) => 2,
+            Op::GetIndexLocal(_, _) | Op::MulLocals(_, _) => 3,
+            Op::JumpIfLeLocals(_, _, _)
+            | Op::JumpIfGtLocalInt(_, _, _)
+            | Op::SetIndexLocalPop(_, _) => 4,
+            Op::AppendLocalStr(_, _) | Op::AddLocalsPop(_, _) | Op::SubLocalsPop(_, _) => 5,
+            _ => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,12 +203,12 @@ impl Chunk {
     pub fn add_string_constant(&mut self, s: &str) -> u16 {
         for (i, c) in self.constants.iter().enumerate() {
             if let Constant::Str(existing) = c {
-                if existing == s {
+                if existing.as_str() == s {
                     return i as u16;
                 }
             }
         }
-        self.add_constant(Constant::Str(s.to_string()))
+        self.add_constant(Constant::Str(Rc::new(s.to_string())))
     }
 
     pub fn add_bytes_constant(&mut self, b: &[u8]) -> u16 {
@@ -216,6 +248,11 @@ impl Chunk {
             | Op::JumpIfTruePeek(target)
             | Op::JumpIfNotUnitPeek(target)
             | Op::JumpIfArgPresent(_, target)
+            | Op::JumpIfLtLocalInt(_, _, target)
+            | Op::JumpIfLeLocalInt(_, _, target)
+            | Op::JumpIfLtLocals(_, _, target)
+            | Op::JumpIfLeLocals(_, _, target)
+            | Op::JumpIfGtLocalInt(_, _, target)
             | Op::ForPrep(_, target)
             | Op::ForIter(_, target)
             | Op::SetupTry(target) => {
@@ -351,11 +388,45 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
                     ));
                 }
             }
-            Op::AddLocals(a, b) | Op::SubLocals(a, b) | Op::LtLocals(a, b) => {
+            Op::AddLocals(a, b)
+            | Op::SubLocals(a, b)
+            | Op::LtLocals(a, b)
+            | Op::GetIndexLocal(a, b)
+            | Op::SetIndexLocalPop(a, b)
+            | Op::AddLocalsPop(a, b)
+            | Op::SubLocalsPop(a, b)
+            | Op::MulLocals(a, b) => {
                 if a >= proto.local_count || b >= proto.local_count {
                     return Err(format!(
                         "Bytecode verification failed in '{}': local ({}, {}) out of bounds at ip {}",
                         proto.name, a, b, ip
+                    ));
+                }
+            }
+            Op::AppendLocalStr(idx, cidx) => {
+                if idx >= proto.local_count {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': local {} out of bounds at ip {}",
+                        proto.name, idx, ip
+                    ));
+                }
+                check_str(cidx, "AppendLocalStr")?;
+            }
+            Op::JumpIfLtLocalInt(idx, _, t)
+            | Op::JumpIfLeLocalInt(idx, _, t)
+            | Op::JumpIfGtLocalInt(idx, _, t) => {
+                if idx >= proto.local_count || t >= code_len {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': invalid local jump ({}, {}) at ip {}",
+                        proto.name, idx, t, ip
+                    ));
+                }
+            }
+            Op::JumpIfLtLocals(a, b, t) | Op::JumpIfLeLocals(a, b, t) => {
+                if a >= proto.local_count || b >= proto.local_count || t >= code_len {
+                    return Err(format!(
+                        "Bytecode verification failed in '{}': invalid locals jump ({}, {}, {}) at ip {}",
+                        proto.name, a, b, t, ip
                     ));
                 }
             }
@@ -496,7 +567,7 @@ fn verify_proto_depth(proto: &FunctionProto, depth: usize) -> Result<(), String>
 }
 
 pub const BYTECODE_CACHE_MAGIC: &[u8; 4] = b"ASKC";
-pub const BYTECODE_CACHE_FORMAT_VERSION: u16 = 1;
+pub const BYTECODE_CACHE_FORMAT_VERSION: u16 = 2;
 const MAX_CACHE_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHE_CODE_LEN: usize = 1_000_000;
 const MAX_CACHE_CONST_LEN: usize = 65_536;
@@ -833,6 +904,66 @@ fn write_op(w: &mut CacheWriter, op: &Op) -> Result<(), String> {
             w.u16(a);
         }
         Op::Return => w.u8(69),
+        Op::JumpIfLtLocalInt(slot, imm, t) => {
+            w.u8(70);
+            w.u16(slot);
+            w.i32(imm);
+            w.usize32(t)?;
+        }
+        Op::JumpIfLeLocalInt(slot, imm, t) => {
+            w.u8(71);
+            w.u16(slot);
+            w.i32(imm);
+            w.usize32(t)?;
+        }
+        Op::JumpIfLtLocals(a, b, t) => {
+            w.u8(72);
+            w.u16(a);
+            w.u16(b);
+            w.usize32(t)?;
+        }
+        Op::JumpIfLeLocals(a, b, t) => {
+            w.u8(73);
+            w.u16(a);
+            w.u16(b);
+            w.usize32(t)?;
+        }
+        Op::JumpIfGtLocalInt(slot, imm, t) => {
+            w.u8(74);
+            w.u16(slot);
+            w.i32(imm);
+            w.usize32(t)?;
+        }
+        Op::GetIndexLocal(a, b) => {
+            w.u8(75);
+            w.u16(a);
+            w.u16(b);
+        }
+        Op::SetIndexLocalPop(a, b) => {
+            w.u8(76);
+            w.u16(a);
+            w.u16(b);
+        }
+        Op::AppendLocalStr(slot, cidx) => {
+            w.u8(77);
+            w.u16(slot);
+            w.u16(cidx);
+        }
+        Op::AddLocalsPop(a, b) => {
+            w.u8(78);
+            w.u16(a);
+            w.u16(b);
+        }
+        Op::SubLocalsPop(a, b) => {
+            w.u8(79);
+            w.u16(a);
+            w.u16(b);
+        }
+        Op::MulLocals(a, b) => {
+            w.u8(80);
+            w.u16(a);
+            w.u16(b);
+        }
     }
     Ok(())
 }
@@ -910,6 +1041,17 @@ fn read_op(r: &mut CacheReader<'_>) -> Result<Op, String> {
         67 => Op::EnterSandbox(r.u16()?),
         68 => Op::RunCleanups(r.u16()?),
         69 => Op::Return,
+        70 => Op::JumpIfLtLocalInt(r.u16()?, r.i32()?, r.u32()? as usize),
+        71 => Op::JumpIfLeLocalInt(r.u16()?, r.i32()?, r.u32()? as usize),
+        72 => Op::JumpIfLtLocals(r.u16()?, r.u16()?, r.u32()? as usize),
+        73 => Op::JumpIfLeLocals(r.u16()?, r.u16()?, r.u32()? as usize),
+        74 => Op::JumpIfGtLocalInt(r.u16()?, r.i32()?, r.u32()? as usize),
+        75 => Op::GetIndexLocal(r.u16()?, r.u16()?),
+        76 => Op::SetIndexLocalPop(r.u16()?, r.u16()?),
+        77 => Op::AppendLocalStr(r.u16()?, r.u16()?),
+        78 => Op::AddLocalsPop(r.u16()?, r.u16()?),
+        79 => Op::SubLocalsPop(r.u16()?, r.u16()?),
+        80 => Op::MulLocals(r.u16()?, r.u16()?),
         _ => return Err(format!("Unknown opcode tag {} in bytecode cache", tag)),
     })
 }
@@ -1028,7 +1170,7 @@ fn read_proto_cache(r: &mut CacheReader<'_>, depth: usize) -> Result<FunctionPro
         let c = match tag {
             0 => Constant::Int(r.i64()?),
             1 => Constant::Float(r.f64()?),
-            2 => Constant::Str(r.str()?),
+            2 => Constant::Str(Rc::new(r.str()?)),
             3 => Constant::Bytes(r.bytes()?),
             4 => Constant::Function(Rc::new(read_proto_cache(r, depth + 1)?)),
             5 => {
@@ -1222,5 +1364,155 @@ pub fn try_save_cached_proto(
         }
     } else {
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_cache_roundtrip_and_version_check_before_body() {
+        let all_ops = vec![
+            Op::Constant(3),
+            Op::ConstInt(-42),
+            Op::Unit,
+            Op::True,
+            Op::False,
+            Op::Pop,
+            Op::Dup,
+            Op::Dup2,
+            Op::GetLocal(1),
+            Op::SetLocal(2),
+            Op::AddLocalInt(1, 5),
+            Op::SubLocalInt(2, -3),
+            Op::LtLocalInt(1, 10),
+            Op::LeLocalInt(2, 20),
+            Op::AddLocals(1, 2),
+            Op::SubLocals(2, 1),
+            Op::LtLocals(1, 2),
+            Op::IncLocalPop(1, -1),
+            Op::GetUpvalue(0),
+            Op::SetUpvalue(1),
+            Op::CloseUpvalue,
+            Op::GetGlobal(0),
+            Op::DefineGlobal(1),
+            Op::SetGlobal(2),
+            Op::Add,
+            Op::Sub,
+            Op::Mul,
+            Op::Div,
+            Op::Mod,
+            Op::Neg,
+            Op::Not,
+            Op::Eq,
+            Op::Ne,
+            Op::Lt,
+            Op::Le,
+            Op::Gt,
+            Op::Ge,
+            Op::In,
+            Op::IsNumeric,
+            Op::Jump(4),
+            Op::JumpIfFalsePop(5),
+            Op::JumpIfFalsePeek(6),
+            Op::JumpIfTruePeek(7),
+            Op::JumpIfNotUnitPeek(8),
+            Op::JumpIfArgPresent(0, 9),
+            Op::Call(2),
+            Op::TailCall(1),
+            Op::CallNamed(1, 0),
+            Op::Closure(0, 0),
+            Op::ForPrep(1, 12),
+            Op::ForIter(1, 12),
+            Op::MakeList(3),
+            Op::MakeDict(2),
+            Op::MakeStructDef(0),
+            Op::InitStruct(1, 0),
+            Op::GetIndex,
+            Op::Slice(true),
+            Op::SetIndex,
+            Op::GetAttr(0),
+            Op::SetAttr(1),
+            Op::OptGetAttr(2),
+            Op::Import(0, true),
+            Op::MakeModule(0, 1),
+            Op::SetupTry(10),
+            Op::PopTry,
+            Op::Throw,
+            Op::PushDefer(1),
+            Op::EnterSandbox(2),
+            Op::RunCleanups(0),
+            Op::Return,
+            Op::JumpIfLtLocalInt(1, 100, 11),
+            Op::JumpIfLeLocalInt(1, 100, 11),
+            Op::JumpIfLtLocals(1, 2, 11),
+            Op::JumpIfLeLocals(1, 2, 11),
+            Op::JumpIfGtLocalInt(1, 0, 11),
+            Op::GetIndexLocal(1, 2),
+            Op::SetIndexLocalPop(1, 2),
+            Op::AppendLocalStr(1, 0),
+            Op::AddLocalsPop(1, 2),
+            Op::SubLocalsPop(1, 2),
+            Op::MulLocals(1, 2),
+        ];
+
+        let mut w = CacheWriter::new();
+        for op in &all_ops {
+            write_op(&mut w, op).unwrap();
+        }
+        let mut r = CacheReader::new(&w.buf);
+        for orig in &all_ops {
+            let dec = read_op(&mut r).unwrap();
+            assert_eq!(format!("{:?}", orig), format!("{:?}", dec));
+            assert_eq!(orig.step_cost(), dec.step_cost());
+        }
+        assert_eq!(r.pos, w.buf.len());
+
+        // v1 cache MUST be rejected strictly by format version before parsing body
+        let mut fake_v1 = Vec::new();
+        fake_v1.extend_from_slice(BYTECODE_CACHE_MAGIC);
+        fake_v1.extend_from_slice(&1u16.to_le_bytes());
+        fake_v1.extend_from_slice(&[0xFF; 16]); // garbage tail after v1 header
+        let err = decode_cached_proto(&fake_v1, &[0u8; 32], false, false).unwrap_err();
+        assert!(err.contains("version mismatch"), "got: {}", err);
+    }
+
+    #[test]
+    fn verify_proto_rejects_bad_superinstruction_operands() {
+        let mk = |op: Op, constants: Vec<Constant>| FunctionProto {
+            ic_id: 1,
+            name: "bad".to_string(),
+            arity: 0,
+            min_arity: 0,
+            is_variadic: false,
+            param_names: vec![],
+            local_count: 3,
+            upvalue_count: 0,
+            is_main: true,
+            chunk: Chunk {
+                code: vec![op, Op::Return],
+                constants,
+                lines: vec![1, 1],
+                upvalue_lists: vec![],
+                kw_lists: vec![],
+                limit_exceeded: false,
+            },
+        };
+        assert!(verify_proto(&mk(Op::GetIndexLocal(9, 1), vec![])).is_err());
+        assert!(verify_proto(&mk(Op::SetIndexLocalPop(1, 9), vec![])).is_err());
+        assert!(verify_proto(&mk(Op::AddLocalsPop(1, 9), vec![])).is_err());
+        assert!(verify_proto(&mk(Op::SubLocalsPop(9, 1), vec![])).is_err());
+        assert!(verify_proto(&mk(Op::MulLocals(1, 9), vec![])).is_err());
+        assert!(verify_proto(&mk(Op::JumpIfLtLocalInt(1, 0, 99), vec![])).is_err());
+        assert!(verify_proto(&mk(Op::JumpIfLeLocals(9, 1, 1), vec![])).is_err());
+        assert!(verify_proto(&mk(Op::AppendLocalStr(1, 0), vec![Constant::Int(1)])).is_err());
+        assert!(
+            verify_proto(&mk(
+                Op::AppendLocalStr(1, 0),
+                vec![Constant::Str(Rc::new("ok".to_string()))]
+            ))
+            .is_ok()
+        );
     }
 }

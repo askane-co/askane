@@ -1,9 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::modules::{NativeFnPtr, build_module};
-use crate::value::{NativeFunction, StructDef, StructInstance, Value};
+use crate::value::{
+    DictMap, FastMap, StructDef, StructInstance, Value, new_dict_map, new_dict_with_capacity,
+};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -38,18 +39,16 @@ fn make_struct_def(
     methods: &[(&'static str, NativeFnPtr)],
 ) -> Rc<StructDef> {
     let field_names: Vec<String> = fields.iter().map(|s| (*s).to_string()).collect();
-    let mut field_index = HashMap::new();
+    let mut field_index = FastMap::default();
+    field_index.reserve(field_names.len());
     let mut field_defaults = Vec::new();
     for (i, f) in field_names.iter().enumerate() {
         field_index.insert(f.clone(), i);
         field_defaults.push(None);
     }
-    let mut method_map = HashMap::new();
+    let mut method_map = new_dict_with_capacity(methods.len());
     for &(mname, func) in methods {
-        method_map.insert(
-            mname.to_string(),
-            Value::NativeFn(NativeFunction { name: mname, func }),
-        );
+        method_map.insert(mname.to_string(), Value::native_fn(mname, func));
     }
     Rc::new(StructDef {
         ic_id: crate::bytecode::next_ic_id(),
@@ -79,13 +78,13 @@ fn extract_items(vm: &mut VM, val: &Value, ctx: &str) -> Result<Vec<Value>, Stri
             vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
             Ok(s.borrow().items.clone())
         }
-        Value::Range { start, end } => {
-            let len = end.saturating_sub(*start).max(0) as usize;
+        Value::Range(r) => {
+            let len = r.end.saturating_sub(r.start).max(0) as usize;
             if len > 1_000_000 {
                 return Err(format!("{}: range exceeds 1,000,000 items", ctx));
             }
             vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>()))?;
-            Ok((*start..*end).map(Value::Int).collect())
+            Ok((r.start..r.end).map(Value::Int).collect())
         }
         Value::Bytes(b) => {
             if b.len() > 1_000_000 {
@@ -100,7 +99,7 @@ fn extract_items(vm: &mut VM, val: &Value, ctx: &str) -> Result<Vec<Value>, Stri
                 return Err(format!("{}: string exceeds 1,000,000 characters", ctx));
             }
             vm.charge_alloc(len.saturating_mul(std::mem::size_of::<Value>().saturating_add(24)))?;
-            Ok(s.chars().map(|c| Value::Str(c.to_string())).collect())
+            Ok(s.chars().map(|c| Value::from_str(c.to_string())).collect())
         }
         other => Err(format!(
             "{} expects iterable, got '{}'",
@@ -281,7 +280,7 @@ fn col_counter(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() > 1 {
         return Err("collections.counter() expects 0 or 1 iterable argument".to_string());
     }
-    let mut counts: HashMap<String, Value> = HashMap::new();
+    let mut counts = new_dict_map();
     if args.len() == 1 && !matches!(args[0], Value::Unit) {
         let items = extract_items(vm, &args[0], "collections.counter")?;
         for item in items {
@@ -307,11 +306,11 @@ fn col_counter(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     );
     Ok(Value::StructInstance(Rc::new(StructInstance {
         def,
-        fields: RefCell::new(vec![Value::Dict(Rc::new(RefCell::new(counts)))]),
+        fields: RefCell::new(vec![Value::dict(counts)]),
     })))
 }
 
-fn as_counter(v: &Value, ctx: &str) -> Result<Rc<RefCell<HashMap<String, Value>>>, String> {
+fn as_counter(v: &Value, ctx: &str) -> Result<Rc<RefCell<DictMap>>, String> {
     let Value::StructInstance(inst) = v else {
         return Err(format!("{} expects Counter receiver", ctx));
     };
@@ -386,7 +385,12 @@ fn counter_most_common(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let out: Vec<Value> = pairs
         .into_iter()
-        .map(|(k, n)| Value::List(Rc::new(RefCell::new(vec![Value::Str(k), Value::Int(n)]))))
+        .map(|(k, n)| {
+            Value::List(Rc::new(RefCell::new(vec![
+                Value::from_str(k),
+                Value::Int(n),
+            ])))
+        })
         .collect();
     vm.charge_alloc(out.len().saturating_mul(std::mem::size_of::<Value>()))?;
     Ok(Value::List(Rc::new(RefCell::new(out))))
@@ -413,7 +417,7 @@ fn counter_to_dict(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let d_rc = as_counter(&args[0], "Counter.to_dict")?;
     let count = d_rc.borrow().len();
     vm.charge_alloc(count.saturating_mul(64))?;
-    Ok(Value::Dict(Rc::new(RefCell::new(d_rc.borrow().clone()))))
+    Ok(Value::dict(d_rc.borrow().clone()))
 }
 
 fn col_priority_queue(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -597,7 +601,7 @@ fn col_groupby(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let items = extract_items(vm, &args[0], "collections.groupby")?;
     let key_fn = args[1].clone();
-    let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut groups: FastMap<String, Vec<Value>> = FastMap::default();
     for (i, item) in items.into_iter().enumerate() {
         if (i & 1023) == 0 {
             vm.check_timeout()?;
@@ -606,11 +610,11 @@ fn col_groupby(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         groups.entry(k).or_default().push(item);
     }
     vm.charge_alloc(groups.len().saturating_mul(64))?;
-    let mut out = HashMap::with_capacity(groups.len());
+    let mut out = new_dict_with_capacity(groups.len());
     for (k, v) in groups {
         out.insert(k, Value::List(Rc::new(RefCell::new(v))));
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::dict(out))
 }
 
 fn col_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

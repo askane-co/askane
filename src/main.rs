@@ -1,13 +1,41 @@
+#[forbid(unsafe_code)]
 mod ast;
+#[forbid(unsafe_code)]
+mod budget;
+#[forbid(unsafe_code)]
+mod buffer;
+#[forbid(unsafe_code)]
 mod bytecode;
+#[forbid(unsafe_code)]
+mod camera;
+#[forbid(unsafe_code)]
 mod compiler;
+#[forbid(unsafe_code)]
+mod compose;
+#[forbid(unsafe_code)]
 mod diag;
+#[forbid(unsafe_code)]
+mod font_atlas;
+#[forbid(unsafe_code)]
+mod font_bitmap;
+#[forbid(unsafe_code)]
+mod font_bmfont;
 mod gui;
+#[forbid(unsafe_code)]
+mod layers;
+#[forbid(unsafe_code)]
 mod lexer;
 mod modules;
+#[forbid(unsafe_code)]
 mod parser;
+#[forbid(unsafe_code)]
+mod scene;
 mod setup;
+#[forbid(unsafe_code)]
+mod surface;
+#[forbid(unsafe_code)]
 mod value;
+#[forbid(unsafe_code)]
 mod vm;
 
 use std::env;
@@ -21,7 +49,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.19.0";
+const VERSION: &str = "0.20.0-prerelease";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -3915,7 +3943,7 @@ mod tests {
             parsed.name + ":" + str(parsed["hp"]) + ":" + str(len(parsed.items))
             "#,
         );
-        assert!(val.equals(&Value::Str("Askane:85:2".to_string())));
+        assert!(val.equals(&Value::from_str("Askane:85:2")));
     }
 
     #[test]
@@ -3927,7 +3955,7 @@ mod tests {
             type_of(http.get) + ":" + type_of(gfx.window)
             "#,
         );
-        assert!(val.equals(&Value::Str("fn:fn".to_string())));
+        assert!(val.equals(&Value::from_str("fn:fn")));
     }
 
     #[test]
@@ -3944,7 +3972,7 @@ mod tests {
             str(a)
             "#,
         );
-        assert!(val.equals(&Value::Str("[1, [...]]".to_string())));
+        assert!(val.equals(&Value::from_str("[1, [...]]")));
     }
 
     #[test]
@@ -3970,7 +3998,7 @@ mod tests {
             "${player.name}:${status}:${mana}:${total + zero_fn()}"
             "#,
         );
-        assert!(val.equals(&Value::Str("Askane:critical:50:63".to_string())));
+        assert!(val.equals(&Value::from_str("Askane:critical:50:63")));
     }
 
     #[test]
@@ -4116,7 +4144,7 @@ mod tests {
             json.parse("\"\\uD83D\\uDE00\"")
             "#,
         );
-        assert!(val.equals(&Value::Str("😀".to_string())));
+        assert!(val.equals(&Value::from_str("😀")));
 
         // 3. fs.list_dir / fs.is_dir in sandboxed VM
         let val = eval(
@@ -4738,7 +4766,7 @@ line2""";
         vm_ok.set_permissions(perms_ok);
         let out = vm_ok.run(proto_ok).expect("process.run should succeed");
         assert!(
-            out.equals(&Value::Str("job-ok".to_string())),
+            out.equals(&Value::from_str("job-ok")),
             "got: {:?}",
             out
         );
@@ -6047,12 +6075,12 @@ let custom = html_tag"<p>${user}:${x}</p>";
             panic!("expected dict");
         };
         let map = map_rc.borrow();
-        assert!(map["replaced"].equals(&Value::Str("bonono".to_string())));
+        assert!(map["replaced"].equals(&Value::from_str("bonono")));
         assert!(map["paired"].equals(&Value::Int(33)));
         assert!(map["hits"].equals(&Value::Int(1)));
         assert!(map["u1"].equals(&Value::Unit));
         assert!(map["u2"].equals(&Value::Int(42)));
-        assert!(map["u3"].equals(&Value::Str("HI".to_string())));
+        assert!(map["u3"].equals(&Value::from_str("HI")));
         assert!(map["boom"].equals(&Value::Int(0)));
         assert!(map["scaled"].equals(&Value::List(Rc::new(RefCell::new(vec![
             Value::Int(10),
@@ -6062,8 +6090,8 @@ let custom = html_tag"<p>${user}:${x}</p>";
         ])))));
         assert!(
             map["cleaned"].equals(&Value::List(Rc::new(RefCell::new(vec![
-                Value::Str("a".to_string()),
-                Value::Str("b".to_string()),
+                Value::from_str("a"),
+                Value::from_str("b"),
             ]))))
         );
         assert!(map["items"].equals(&Value::List(Rc::new(RefCell::new(vec![
@@ -6071,11 +6099,11 @@ let custom = html_tag"<p>${user}:${x}</p>";
             Value::Int(2),
             Value::Int(3),
         ])))));
-        assert!(map["d_text"].equals(&Value::Str("OK".to_string())));
+        assert!(map["d_text"].equals(&Value::from_str("OK")));
         assert!(map["r1_ok"].equals(&Value::Bool(true)));
-        assert!(map["r2"].equals(&Value::Str("OK".to_string())));
+        assert!(map["r2"].equals(&Value::from_str("OK")));
         assert!(map["r3"].equals(&Value::Int(99)));
-        assert!(map["dbg"].equals(&Value::Str("x=42 and a + 2=7".to_string())));
+        assert!(map["dbg"].equals(&Value::from_str("x=42 and a + 2=7")));
         let Value::Str(lmsg) = &map["log_msg"] else {
             panic!("expected log string");
         };
@@ -6083,16 +6111,18 @@ let custom = html_tag"<p>${user}:${x}</p>";
         assert!(!lmsg.contains("abc123"));
         assert!(lmsg.contains("alice"));
         assert!(lmsg.contains("[REDACTED]"));
-        assert!(map["sql_query"].equals(&Value::Str(
-            "SELECT * FROM users WHERE name = ? AND x = ?".to_string()
-        )));
+        assert!(
+            map["sql_query"].equals(&Value::from_str(
+                "SELECT * FROM users WHERE name = ? AND x = ?"
+            ))
+        );
         assert!(
             map["sql_params"].equals(&Value::List(Rc::new(RefCell::new(vec![
-                Value::Str("alice".to_string()),
+                Value::from_str("alice"),
                 Value::Int(42),
             ]))))
         );
-        assert!(map["custom"].equals(&Value::Str("<p>[alice]:[42]</p>".to_string())));
+        assert!(map["custom"].equals(&Value::from_str("<p>[alice]:[42]</p>")));
     }
 
     #[test]
@@ -6213,8 +6243,8 @@ let after_v = after 2ms { ticks + 100 };
         };
         let c = c_rc.borrow();
         assert!(c["ret_v"].equals(&Value::Int(10)));
-        assert!(c["w1"].equals(&Value::Str("ok".to_string())));
-        assert!(c["w2"].equals(&Value::Str("rec".to_string())));
+        assert!(c["w1"].equals(&Value::from_str("ok")));
+        assert!(c["w2"].equals(&Value::from_str("rec")));
         assert!(c["d_sum"].equals(&Value::Int(61_510)));
         assert!(c["ticks"].equals(&Value::Int(3)));
         assert!(c["after_v"].equals(&Value::Int(103)));
@@ -6427,11 +6457,11 @@ log.json(false);
             panic!("expected dict");
         };
         let m = m_rc.borrow();
-        assert!(m["title"].equals(&Value::Str("Askane".to_string())));
+        assert!(m["title"].equals(&Value::from_str("Askane")));
         assert!(m["port"].equals(&Value::Int(8080)));
         assert!(m["be_u32"].equals(&Value::Int(305419896)));
         assert!(m["dq_front"].equals(&Value::Int(1)));
-        assert!(m["pq_first"].equals(&Value::Str("high".to_string())));
+        assert!(m["pq_first"].equals(&Value::from_str("high")));
         assert!(m["win_len"].equals(&Value::Int(3)));
         assert!(m["z_ok"].equals(&Value::Bool(true)));
         assert!(m["g_ok"].equals(&Value::Bool(true)));
@@ -6440,16 +6470,16 @@ log.json(false);
         assert!(m["adler_ok"].equals(&Value::Bool(true)));
         assert!(m["zip_cnt"].equals(&Value::Int(2)));
         assert!(m["zip_text"].equals(&Value::Bytes(std::rc::Rc::new(b"world!".to_vec()))));
-        assert!(m["ext_a"].equals(&Value::Str("alpha".to_string())));
-        assert!(m["ext_b"].equals(&Value::Str("beta".to_string())));
+        assert!(m["ext_a"].equals(&Value::from_str("alpha")));
+        assert!(m["ext_b"].equals(&Value::from_str("beta")));
         assert!(m["fam_ok"].equals(&Value::Bool(true)));
         assert!(m["cli_v"].equals(&Value::Bool(true)));
-        assert!(m["cli_out"].equals(&Value::Str("dist".to_string())));
+        assert!(m["cli_out"].equals(&Value::from_str("dist")));
         assert!(m["has_diff"].equals(&Value::Bool(true)));
         assert!(m["diff_added"].equals(&Value::Bool(true)));
         assert!(m["has_pp"].equals(&Value::Bool(true)));
-        assert!(m["h_txt"].equals(&Value::Str("Hi & Bye".to_string())));
-        assert!(m["x_txt"].equals(&Value::Str("ok".to_string())));
+        assert!(m["h_txt"].equals(&Value::from_str("Hi & Bye")));
+        assert!(m["x_txt"].equals(&Value::from_str("ok")));
         assert!(m["log_redacted"].equals(&Value::Bool(true)));
 
         // Zip bomb guard + Zip Slip rejection
@@ -6566,7 +6596,7 @@ archive.extract(bad, "extracted");
                     .unwrap(),
             )
             .unwrap();
-        assert!(ok_needs.equals(&Value::Str("a".to_string())));
+        assert!(ok_needs.equals(&Value::from_str("a")));
 
         // 3. ui module headless window, layout, themes, events, widgets & callbacks
         modules::reset_runtime_state();
@@ -6648,9 +6678,9 @@ ui.close();
             (Value::Int(ly), Value::Int(by)) if by > ly
         ));
         assert!(u["clicks"].equals(&Value::Int(1)));
-        assert!(u["submitted"].equals(&Value::Str("hi".to_string())));
+        assert!(u["submitted"].equals(&Value::from_str("hi")));
         assert!(u["chk_state"].equals(&Value::Bool(true)));
-        assert!(u["inp_state"].equals(&Value::Str("hi".to_string())));
+        assert!(u["inp_state"].equals(&Value::from_str("hi")));
         assert!(u["sel_state"].equals(&Value::Int(1)));
         assert!(matches!(&u["ev_count"], Value::Int(n) if *n >= 5));
         assert!(u["new_w"].equals(&Value::Int(1024)));
@@ -6752,10 +6782,10 @@ let split_wr = sandbox(write: ["sub"], read: true) {
         assert!(b[0].equals(&Value::Bool(true)));
         assert!(b[1].equals(&Value::Bool(true)));
         assert!(b[2].equals(&Value::Bool(true)));
-        assert!(b[3].equals(&Value::Str("sub".to_string())));
-        assert!(b[4].equals(&Value::Str("blocked".to_string())));
-        assert!(b[5].equals(&Value::Str("root".to_string())));
-        assert!(b[6].equals(&Value::Str("blocked".to_string())));
+        assert!(b[3].equals(&Value::from_str("sub")));
+        assert!(b[4].equals(&Value::from_str("blocked")));
+        assert!(b[5].equals(&Value::from_str("root")));
+        assert!(b[6].equals(&Value::from_str("blocked")));
 
         let mut cwd_vm = VM::new_with_sandbox(true);
         let canon2 = fs::canonicalize(&dir).unwrap();
@@ -6777,7 +6807,7 @@ let blocked_cwd = sandbox(read: false) { try { os.cwd(); false } catch e { true 
         let Value::List(cl) = cwd_res else {
             panic!("expected list");
         };
-        assert!(cl.borrow()[0].equals(&Value::Str(".".to_string())));
+        assert!(cl.borrow()[0].equals(&Value::from_str(".")));
         assert!(cl.borrow()[1].equals(&Value::Bool(true)));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6841,11 +6871,11 @@ log_list
         };
         let items = l.borrow();
         assert_eq!(items.len(), 8);
-        assert!(items[0].equals(&Value::Str("inside_try".to_string())));
-        assert!(items[1].equals(&Value::Str("inner_defer_boom".to_string())));
+        assert!(items[0].equals(&Value::from_str("inside_try")));
+        assert!(items[1].equals(&Value::from_str("inner_defer_boom")));
         assert!(items[2].equals(&Value::Bool(true)));
-        assert!(items[3].equals(&Value::Str("outer_defer".to_string())));
-        assert!(items[4].equals(&Value::Str("with_body".to_string())));
+        assert!(items[3].equals(&Value::from_str("outer_defer")));
+        assert!(items[4].equals(&Value::from_str("with_body")));
         assert!(
             items[5].to_string().contains("close_boom"),
             "unexpected items[5]: {}",
@@ -6878,10 +6908,10 @@ let x = xml.parse("<root attr=\"1\"");
         let Value::List(l) = html_res else {
             panic!("expected list");
         };
-        assert!(l.borrow()[0].equals(&Value::Str("#document".to_string())));
-        assert!(l.borrow()[1].equals(&Value::Str("<div class=\"x\"".to_string())));
-        assert!(l.borrow()[2].equals(&Value::Str("#document".to_string())));
-        assert!(l.borrow()[3].equals(&Value::Str("<root attr=\"1\"".to_string())));
+        assert!(l.borrow()[0].equals(&Value::from_str("#document")));
+        assert!(l.borrow()[1].equals(&Value::from_str("<div class=\"x\"")));
+        assert!(l.borrow()[2].equals(&Value::from_str("#document")));
+        assert!(l.borrow()[3].equals(&Value::from_str("<root attr=\"1\"")));
 
         let tag_res = eval(
             r#"
@@ -6908,7 +6938,7 @@ f(42)
 try { 42 |> throw _; "no" } catch e { "${e}" }
 "#,
         );
-        assert!(throw_pipe.equals(&Value::Str("42".to_string())));
+        assert!(throw_pipe.equals(&Value::from_str("42")));
 
         let brace_block = eval(
             r#"
@@ -7010,7 +7040,7 @@ cli.parse(["run", "-1.5", "-a", "--name=ok"])
             panic!("expected positional");
         };
         assert_eq!(pos.borrow().len(), 2);
-        assert!(pos.borrow()[1].equals(&Value::Str("-1.5".to_string())));
+        assert!(pos.borrow()[1].equals(&Value::from_str("-1.5")));
 
         let toml_res = eval(
             r#"
@@ -7019,7 +7049,7 @@ let t = toml.parse("\"a=b\" = \"val\"");
 t["a=b"]
 "#,
         );
-        assert!(toml_res.equals(&Value::Str("val".to_string())));
+        assert!(toml_res.equals(&Value::from_str("val")));
         assert!(run_err(
             "import toml;\ntoml.parse(\"a = \\\"\\\\uZZZZ\\\"\")"
         ));
@@ -7628,7 +7658,7 @@ sum_tail(5000, 0)
         let tco_res = VM::new().run(compile_source(tco_src).unwrap()).unwrap();
         assert!(tco_res.equals(&Value::Int(5000)));
 
-        assert_eq!(modules::BUILTIN_MODULE_NAMES.len(), 49);
+        assert_eq!(modules::BUILTIN_MODULE_NAMES.len(), 51);
         for &m in modules::BUILTIN_MODULE_NAMES {
             assert!(
                 modules::get_builtin_module(m).is_some(),
@@ -8688,5 +8718,787 @@ gfx.present();
         drop(gvm);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_v020_stage1_p0_budget_buffer_and_vm() {
+        // 1. P0: 16B Value ABI + Vec2 + as_range
+        assert_eq!(std::mem::size_of::<crate::value::Value>(), 16);
+        let v_vec = crate::value::Value::Vec2(1.5, -2.5);
+        assert!(v_vec.is_truthy());
+        assert_eq!(v_vec.type_name(), "vec2");
+        assert!(!crate::value::Value::Vec2(0.0, 0.0).is_truthy());
+        assert_eq!(crate::value::Value::range(3, 9).as_range(), Some((3, 9)));
+        assert_eq!(v_vec.as_range(), None);
+
+        // 2. P0: diag::ALL_CODES parity + zero `unsafe` in core engine files
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let diag_src = std::fs::read_to_string(manifest_dir.join("src").join("diag.rs")).unwrap();
+        let mut found_codes = Vec::new();
+        for win in diag_src.as_bytes().windows(7) {
+            if win[0] == b'"'
+                && (win[1] == b'E' || win[1] == b'W')
+                && win[2..6].iter().all(|b| b.is_ascii_digit())
+                && win[6] == b'"'
+            {
+                found_codes.push(std::str::from_utf8(&win[1..6]).unwrap().to_string());
+            }
+        }
+        assert!(!found_codes.is_empty());
+        for code in &found_codes {
+            assert!(
+                crate::diag::ALL_CODES.contains(&code.as_str()),
+                "diag::ALL_CODES missing '{}'",
+                code
+            );
+        }
+        let main_src = std::fs::read_to_string(manifest_dir.join("src").join("main.rs")).unwrap();
+        for core_mod in [
+            "ast", "budget", "buffer", "bytecode", "compiler", "diag", "lexer", "parser", "value",
+            "vm",
+        ] {
+            let expected = format!("#[forbid(unsafe_code)]\nmod {};", core_mod);
+            assert!(
+                main_src.replace("\r\n", "\n").contains(&expected),
+                "Missing #[forbid(unsafe_code)] on mod {}",
+                core_mod
+            );
+            let mod_src = std::fs::read_to_string(
+                manifest_dir.join("src").join(format!("{}.rs", core_mod)),
+            )
+            .unwrap();
+            assert!(
+                !mod_src.contains("unsafe {") && !mod_src.contains("unsafe fn"),
+                "Unexpected unsafe code in src/{}.rs",
+                core_mod
+            );
+        }
+
+        // 3. Stage 1: BudgetCore + TempCharge + VM snapshot helpers
+        let core = crate::budget::BudgetCore::new(Some(1024), Some(512));
+        core.charge_alloc(256).unwrap();
+        core.charge_alloc(256).unwrap();
+        assert_eq!(core.used_bytes(), 512);
+        assert_eq!(core.peak_bytes(), 512);
+        assert!(core.charge_alloc(600).is_err());
+        assert_eq!(core.used_bytes(), 512);
+        let temp_err: Result<(), String> =
+            core.with_temp_charge(128, || Err("transient failure".to_string()));
+        assert!(temp_err.is_err());
+        assert_eq!(core.used_bytes(), 512);
+        assert_eq!(core.peak_bytes(), 640);
+        core.refund_alloc(512);
+        assert_eq!(core.used_bytes(), 0);
+        assert_eq!(core.peak_bytes(), 640);
+
+        let mut vm = VM::new_with_sandbox(true);
+        vm.charge_alloc(128).unwrap();
+        assert_eq!(vm.budget_snapshot().0, 128);
+        let ok_res = vm.with_temp_charge(64, || Ok(42usize)).unwrap();
+        assert_eq!(ok_res, 42);
+        assert_eq!(vm.budget_snapshot().0, 128);
+        vm.refund_alloc(128);
+        assert_eq!(vm.budget_snapshot().0, 0);
+        let snap_full = vm.budget_snapshot_full();
+        assert_eq!(snap_full.memory_limit, vm.budget_snapshot().1);
+        assert_eq!(snap_full.io_limit, vm.budget_snapshot().3);
+        assert!(snap_full.memory_peak >= 192);
+
+        // 4. Stage 1: Typed Buffer (`BufData` direct + `import buffer` + drop auto-refund + self-alias)
+        let mut raw_buf = crate::buffer::BufData::new_zeroed(crate::buffer::Elem::U32, 4, None)
+            .unwrap();
+        assert!(raw_buf.write_u32_at(2, 0xDEAD_BEEF));
+        assert!(!raw_buf.write_u32_at(4, 1));
+        assert_eq!(raw_buf.read_u32_at(2), Some(0xDEAD_BEEF));
+        assert_eq!(raw_buf.read_u32_at(4), None);
+
+        let buf_script = r#"
+import buffer;
+import sys;
+import test;
+
+let b_u8 = buffer.new("u8", 6);
+test.assert_eq(buffer.len(b_u8), 6);
+test.assert_eq(buffer.byte_len(b_u8), 6);
+test.assert_eq(buffer.elem_type(b_u8), "u8");
+for i in range(6) {
+    buffer.set(b_u8, i, i + 10);
+}
+test.assert_eq(buffer.get(b_u8, -1), 15);
+buffer.copy_from(b_u8, 2, b_u8, 0, 4);
+test.assert_eq(buffer.get(b_u8, 2), 10);
+test.assert_eq(buffer.get(b_u8, 5), 13);
+
+let b_i32 = buffer.new("i32", 3);
+buffer.set(b_i32, 0, -42);
+test.assert_eq(buffer.get(b_i32, 0), -42);
+
+let b_f32 = buffer.new("f32", 2);
+buffer.fill(b_f32, 1.5);
+test.assert(buffer.get(b_f32, 1) == 1.5);
+
+let img = buffer.new("u32", 16);
+buffer.fill_rgba(img, 287454020);
+buffer.set(img, 0, 2864434397);
+buffer.blit(img, 4, 4, 2, 2, img, 4, 4, 0, 0, 2, 2);
+test.assert_eq(buffer.get(img, 10), 2864434397);
+
+let sub = buffer.slice(b_u8, 1, 4);
+let cloned = buffer.clone(sub);
+let raw = buffer.as_bytes(cloned);
+let restored = buffer.from_bytes(raw, "u8");
+test.assert_eq(buffer.len(restored), 3);
+test.assert_eq(buffer.get(restored, 0), 11);
+
+// Automatic BudgetCore refund on drop
+let b0 = sys.budget();
+let big = buffer.new("u8", 8192);
+let b1 = sys.budget();
+test.assert(b1.memory_used >= b0.memory_used + 8192);
+test.assert(b1.memory_peak >= b1.memory_used);
+test.assert(b1.work_steps > b0.work_steps);
+big = unit;
+let b2 = sys.budget();
+test.assert(b2.memory_used < b1.memory_used);
+test.assert(b2.memory_peak >= b1.memory_peak);
+"#;
+        let mut buf_vm = VM::new_with_sandbox(true);
+        buf_vm.run(compile_source(buf_script).unwrap()).unwrap();
+
+        // 5. Stage 1: superinstructions + CoW string + exact --max-steps invariance + --deterministic
+        let opt_script = r#"
+import random;
+import sys;
+import test;
+import time;
+
+fn run_ops(n) {
+    let arr = [0, 0, 0, 0, 0];
+    let i = 0;
+    let step = 2;
+    while i < 5 {
+        arr[i] = i * i;
+        i += 1;
+    }
+    let acc = 0;
+    let j = 0;
+    while j <= 4 {
+        let p = j;
+        let sq = p * p;
+        acc += arr[j];
+        acc += sq;
+        acc -= p;
+        j += 1;
+    }
+    if n > 0 {
+        let s = "hi";
+        let alias = s;
+        s += "!";
+        test.assert_eq(s, "hi!");
+        test.assert_eq(alias, "hi");
+    }
+    let a = 10;
+    let b = 3;
+    a += b;
+    a -= b;
+    let c = a * b;
+    return [acc, c, random.int(1, 100), time.elapsed_ms(), sys.budget().work_steps];
+}
+run_ops(1)
+"#;
+        let mut det1 = VM::new_with_sandbox(true);
+        det1.set_deterministic(true);
+        let r1 = det1.run(compile_source(opt_script).unwrap()).unwrap();
+        let mut det2 = VM::new_with_sandbox(true);
+        det2.set_deterministic(true);
+        let r2 = det2.run(compile_source(opt_script).unwrap()).unwrap();
+        assert!(matches!(r1, crate::value::Value::List(_)));
+        assert!(r1.equals_vm(&r2, &mut det1).unwrap());
+
+        // Exact step budget enforcement on tight superinstruction loop (70..=80)
+        let loop_src = r#"
+fn sum_sieve() {
+    let arr = [1, 2, 3, 4, 5, 6];
+    let limit = 5;
+    let j = 0;
+    let p = 1;
+    let acc = 0;
+    while j <= limit {
+        arr[j] = 0;
+        let k = j * p;
+        acc += k;
+        j += p;
+    }
+    return acc;
+}
+sum_sieve()
+"#;
+        let proto = compile_source(loop_src).unwrap();
+        let mut measure_vm = VM::new_with_sandbox(true);
+        assert!(matches!(measure_vm.run(proto.clone()).unwrap(), crate::value::Value::Int(15)));
+        let used_steps = measure_vm.budget_snapshot_full().work_steps;
+        assert!(used_steps > 0);
+
+        let mut perms_exact = Permissions::sandboxed();
+        perms_exact.max_instructions = Some(used_steps);
+        let mut exact_vm = VM::new_with_sandbox(true);
+        exact_vm.set_permissions(perms_exact);
+        assert!(exact_vm.run(proto.clone()).is_ok());
+
+        let mut perms_short = Permissions::sandboxed();
+        perms_short.max_instructions = Some(used_steps - 1);
+        let mut short_vm = VM::new_with_sandbox(true);
+        short_vm.set_permissions(perms_short);
+        let err = short_vm.run(proto).unwrap_err();
+        assert!(err.contains("Sandbox instruction limit exceeded"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_v020_stage2_surface_layers_camera_geom_fonts_and_ui() {
+        modules::reset_runtime_state();
+
+        let make_test_png = |w: i32, h: i32, rgba: &[u8]| -> Vec<u8> {
+            fn crc32(data: &[u8]) -> u32 {
+                let mut crc = 0xFFFF_FFFFu32;
+                for &b in data {
+                    crc ^= b as u32;
+                    for _ in 0..8 {
+                        crc = if (crc & 1) != 0 {
+                            (crc >> 1) ^ 0xEDB8_8320
+                        } else {
+                            crc >> 1
+                        };
+                    }
+                }
+                !crc
+            }
+            fn adler32(data: &[u8]) -> u32 {
+                let mut s1 = 1u32;
+                let mut s2 = 0u32;
+                for &b in data {
+                    s1 = (s1 + b as u32) % 65521;
+                    s2 = (s2 + s1) % 65521;
+                }
+                (s2 << 16) | s1
+            }
+            fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                out.extend_from_slice(tag);
+                out.extend_from_slice(payload);
+                let mut crc_in = Vec::with_capacity(4 + payload.len());
+                crc_in.extend_from_slice(tag);
+                crc_in.extend_from_slice(payload);
+                out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
+            }
+            let row_bytes = (w as usize) * 4;
+            let mut raw = Vec::with_capacity((row_bytes + 1) * (h as usize));
+            for y in 0..h as usize {
+                raw.push(0); // filter 0
+                raw.extend_from_slice(&rgba[y * row_bytes..(y + 1) * row_bytes]);
+            }
+            let mut zlib = Vec::with_capacity(raw.len() + 11);
+            zlib.push(0x78);
+            zlib.push(0x01);
+            zlib.push(0x01); // final stored block
+            let len = raw.len() as u16;
+            zlib.extend_from_slice(&len.to_le_bytes());
+            zlib.extend_from_slice(&(!len).to_le_bytes());
+            zlib.extend_from_slice(&raw);
+            zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+            let mut ihdr = Vec::with_capacity(13);
+            ihdr.extend_from_slice(&w.to_be_bytes());
+            ihdr.extend_from_slice(&h.to_be_bytes());
+            ihdr.push(8); // bit depth
+            ihdr.push(6); // RGBA
+            ihdr.push(0);
+            ihdr.push(0);
+            ihdr.push(0);
+
+            let mut out = Vec::from(*b"\x89PNG\r\n\x1a\n");
+            push_chunk(&mut out, b"IHDR", &ihdr);
+            push_chunk(&mut out, b"IDAT", &zlib);
+            push_chunk(&mut out, b"IEND", &[]);
+            out
+        };
+
+        // 1. P0 #[forbid(unsafe_code)] + Value ABI 16B on all Stage 2 modules
+        assert_eq!(std::mem::size_of::<crate::value::Value>(), 16);
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main_src = std::fs::read_to_string(manifest_dir.join("src").join("main.rs")).unwrap();
+        for s2_mod in [
+            "camera",
+            "compose",
+            "font_atlas",
+            "font_bitmap",
+            "font_bmfont",
+            "layers",
+            "scene",
+            "surface",
+        ] {
+            let expected = format!("#[forbid(unsafe_code)]\nmod {};", s2_mod);
+            assert!(
+                main_src.replace("\r\n", "\n").contains(&expected),
+                "Missing #[forbid(unsafe_code)] on mod {}",
+                s2_mod
+            );
+        }
+
+        // 2. DepthBuffer NDC [0.0, 1.0] + BudgetCore charge/refund
+        let depth_budget = crate::budget::BudgetCore::new(Some(65_536), Some(65_536));
+        let mut depth = crate::surface::DepthBuffer::new(16, 16, Some(&depth_budget)).unwrap();
+        assert_eq!(depth_budget.used_bytes(), 16 * 16 * 4);
+        assert_eq!(depth.peek(0, 0), Some(1.0));
+        assert!(depth.test_and_set(3, 4, 0.5));
+        assert!(!depth.test_and_set(3, 4, 0.5));
+        assert!(!depth.test_and_set(3, 4, 0.7));
+        assert!(depth.test_and_set(3, 4, 0.25));
+        assert!(!depth.test_and_set(3, 4, -0.1));
+        assert!(!depth.test_and_set(3, 4, 1.1));
+        depth.clear();
+        assert_eq!(depth.peek(3, 4), Some(1.0));
+        depth.refund_to(Some(&depth_budget));
+        assert_eq!(depth_budget.used_bytes(), 0);
+
+        let mut test_surf = crate::surface::Surface::new_rgba8(8, 8, 0, Some(&depth_budget)).unwrap();
+        test_surf.attach_depth(Some(&depth_budget)).unwrap();
+        assert_eq!(test_surf.peek_pixel(0, 0), Some(0));
+        test_surf.refund_to(Some(&depth_budget));
+        assert_eq!(depth_budget.used_bytes(), 0);
+
+        // 3. Golden #24 + Surface clip/unwind/depth-9/self-target + Layers blend/visibility/parallax + BudgetCore refund
+        let s2_gfx_script = r#"
+import gfx;
+import math;
+import sys;
+import test;
+
+gfx.headless(true, 64, 64);
+
+// Golden #24 scene: clear -> rect -> circle -> present
+gfx.clear(10, 20, 30);
+gfx.rect(8, 8, 12, 10, 200, 50, 40);
+gfx.circle(32, 32, 6, 40, 200, 100);
+gfx.present();
+let ghash = gfx.frame_hash();
+test.assert_eq(gfx.read_pixel(10, 10), (200 * 65536) + (50 * 256) + 40);
+test.assert_eq(gfx.read_pixel(32, 32), (40 * 65536) + (200 * 256) + 100);
+test.assert_eq(gfx.read_pixel(0, 0), (10 * 65536) + (20 * 256) + 30);
+
+// Repeat golden #24 must match hash identically
+gfx.clear(10, 20, 30);
+gfx.rect(8, 8, 12, 10, 200, 50, 40);
+gfx.circle(32, 32, 6, 40, 200, 100);
+gfx.present();
+test.assert_eq(gfx.frame_hash(), ghash);
+
+// Clip test on offscreen surface
+let b_before = sys.budget().memory_used;
+let s = gfx.surface_new(32, 32);
+test.assert_eq(gfx.surface_width(s), 32);
+test.assert_eq(gfx.surface_height(s), 32);
+gfx.draw_to(s, fn() {
+    gfx.clip(4, 4, 8, 8);
+    gfx.rect(0, 0, 20, 20, 255, 0, 0);
+    gfx.reset_clip();
+    test.assert_eq(gfx.read_pixel(2, 2), 0);
+    test.assert_eq(gfx.read_pixel(6, 6), 4294901760);
+    test.assert_eq(gfx.read_pixel(12, 12), 0);
+});
+gfx.surface_free(s);
+test.assert(sys.budget().memory_used <= b_before + 256);
+
+// Target stack unwind on error inside draw_to
+let s_err = gfx.surface_new(16, 16);
+let caught = false;
+try {
+    gfx.draw_to(s_err, fn() {
+        gfx.set_camera(99, 99, 3.0, 0.5);
+        throw "inner boom";
+    });
+} catch e {
+    caught = true;
+}
+test.assert(caught);
+test.assert_eq(gfx.width(), 64);
+test.assert(!gfx.camera().enabled);
+
+// Self-target draw_to and draw_surface rejected
+let self_err = false;
+try {
+    gfx.draw_to(s_err, fn() { gfx.draw_to(s_err, fn() {}); });
+} catch e {
+    self_err = true;
+}
+test.assert(self_err);
+
+let sample_self_err = false;
+try {
+    gfx.draw_to(s_err, fn() { gfx.draw_surface(s_err, 0, 0); });
+} catch e {
+    sample_self_err = true;
+}
+test.assert(sample_self_err);
+gfx.surface_free(s_err);
+
+// Target stack depth > 8 rejected & unwound cleanly
+let ring = [];
+for i in range(9) {
+    ring.push(gfx.surface_new(8, 8));
+}
+let depth_err = false;
+fn dive(idx) {
+    if idx >= 9 { return 0; }
+    gfx.draw_to(ring[idx], fn() { dive(idx + 1); });
+}
+try {
+    dive(0);
+} catch e {
+    depth_err = true;
+}
+test.assert(depth_err);
+test.assert_eq(gfx.width(), 64);
+for sh in ring { gfx.surface_free(sh); }
+
+// Layers: normal, add, multiply integer math, z-order, visibility skip
+gfx.clear(100, 100, 100);
+let l0 = gfx.layer_new(64, 64);
+let l1 = gfx.layer_new(64, 64);
+let l2 = gfx.layer_new(64, 64);
+let l_hidden = gfx.layer_new(64, 64);
+
+gfx.layer_z(l1, 5);
+gfx.layer_z(l0, 10);
+gfx.layer_z(l2, 20);
+gfx.layer_mode(l0, "normal");
+gfx.layer_mode(l1, "add");
+gfx.layer_mode(l2, "multiply");
+gfx.layer_visible(l_hidden, false);
+
+gfx.draw_to_layer(l1, fn() { gfx.rect_alpha(10, 10, 4, 4, 200, 50, 25, 255); });
+gfx.draw_to_layer(l0, fn() { gfx.rect_alpha(20, 20, 4, 4, 200, 0, 0, 128); });
+gfx.draw_to_layer(l2, fn() { gfx.rect_alpha(30, 30, 4, 4, 128, 255, 0, 255); });
+gfx.draw_to_layer(l_hidden, fn() { gfx.rect(0, 0, 64, 64, 255, 255, 255); });
+
+gfx.compose_layers();
+// Normal (dst=100, src=200, alpha=128) -> (200*128 + 100*127 + 127)/255 = 150
+let px_norm = gfx.read_pixel(20, 20);
+test.assert_eq((px_norm / 65536) % 256, 150);
+// Add (dst=100 + 200 clamped to 255, g=150, b=125)
+let px_add = gfx.read_pixel(10, 10);
+test.assert_eq((px_add / 65536) % 256, 255);
+test.assert_eq((px_add / 256) % 256, 150);
+// Multiply (dst=100, src=(128,255,0)) -> r = (128*100+127)/255 = 50, g = 100, b = 0
+let px_mul = gfx.read_pixel(30, 30);
+test.assert_eq((px_mul / 65536) % 256, 50);
+test.assert_eq((px_mul / 256) % 256, 100);
+test.assert_eq(px_mul % 256, 0);
+// Hidden layer did NOT overwrite pixel (0, 0)
+test.assert_eq(gfx.read_pixel(0, 0), (100 * 65536) + (100 * 256) + 100);
+
+// Parallax 0.5 displaces layer by half of camera movement
+gfx.layer_visible(l0, false);
+gfx.layer_visible(l1, false);
+gfx.layer_visible(l2, false);
+let l_para = gfx.layer_new(64, 64);
+gfx.layer_parallax(l_para, 0.5, 0.0);
+gfx.draw_to_layer(l_para, fn() { gfx.rect(30, 10, 4, 4, 250, 10, 10); });
+gfx.clear(0, 0, 0);
+gfx.set_camera(40, 0, 1.0, 0.0);
+gfx.compose_layers();
+gfx.reset_camera();
+// Moved by -40 * 0.5 = -20 -> pixel (30 - 20, 10) = (10, 10)
+test.assert_eq((gfx.read_pixel(10, 10) / 65536) % 256, 250);
+test.assert_eq(gfx.read_pixel(30, 10), 0);
+
+gfx.layer_free(l0);
+gfx.layer_free(l1);
+gfx.layer_free(l2);
+gfx.layer_free(l_hidden);
+gfx.layer_free(l_para);
+
+// Camera2D roundtrip & rotation
+gfx.set_camera(100.0, 50.0, 2.5, 0.73);
+let scr = gfx.world_to_screen(123.5, 19.25);
+let wrd = gfx.screen_to_world(scr.x, scr.y);
+test.assert(math.abs(wrd.x - 123.5) < 0.001);
+test.assert(math.abs(wrd.y - 19.25) < 0.001);
+gfx.reset_camera();
+"#;
+        let mut gvm = VM::new_with_sandbox(true);
+        gvm.set_deterministic(true);
+        gvm.run(compile_source(s2_gfx_script).unwrap()).unwrap();
+        assert_eq!(modules::gfx::test_peek_pixel(0, 0), Some(0));
+
+        // 4. Camera shake deterministic linear decay across two VMs
+        let shake_script = r#"
+import gfx;
+import math;
+import test;
+gfx.headless(true, 64, 64);
+gfx.set_camera(0.0, 0.0, 1.0, 0.0);
+gfx.set_camera_shake(10.0, 1.0);
+let a0 = gfx.camera().shake;
+let s0 = gfx.world_to_screen(0.0, 0.0);
+gfx.update_camera(0.5);
+let a1 = gfx.camera().shake;
+let s1 = gfx.world_to_screen(0.0, 0.0);
+gfx.update_camera(0.5);
+let a2 = gfx.camera().shake;
+let s2 = gfx.world_to_screen(0.0, 0.0);
+test.assert(math.abs(a0 - 10.0) < 0.0001);
+test.assert(math.abs(a1 - 5.0) < 0.0001);
+test.assert(math.abs(a2) < 0.0001);
+test.assert(math.abs(s2.x - 32.0) < 0.001);
+[s0.x, s0.y, s1.x, s1.y]
+"#;
+        let mut svm1 = VM::new_with_sandbox(true);
+        svm1.set_deterministic(true);
+        let sh1 = svm1.run(compile_source(shake_script).unwrap()).unwrap();
+        modules::reset_runtime_state();
+        let mut svm2 = VM::new_with_sandbox(true);
+        svm2.set_deterministic(true);
+        let sh2 = svm2.run(compile_source(shake_script).unwrap()).unwrap();
+        assert!(sh1.equals_vm(&sh2, &mut svm1).unwrap());
+        modules::reset_runtime_state();
+
+        // 5. Coordinate canon, geom types, VM operators, JSON, NDC [0, 1] frustum
+        let geom_script = r#"
+import geom;
+import math;
+import json;
+import test;
+
+let v2 = geom.vec2(1.0, 0.0);
+let v2r = geom.rot90(v2, 1);
+test.assert_eq(v2r.x, 0.0);
+test.assert_eq(v2r.y, 1.0);
+test.assert((geom.vec2(2.0, 3.0) + geom.vec2(1.0, 2.0)) == geom.vec2(3.0, 5.0));
+test.assert((geom.vec2(4.0, 6.0) / 2) == geom.vec2(2.0, 3.0));
+test.assert(-geom.vec3(1.0, -2.0, 3.0) == geom.vec3(-1.0, 2.0, -3.0));
+
+let a = geom.vec3(1.0, 2.0, 3.0);
+let b = geom.vec3(4.0, 5.0, 6.0);
+test.assert((a + b * 2) == geom.vec3(9.0, 12.0, 15.0));
+test.assert((b - a) == geom.vec3(3.0, 3.0, 3.0));
+test.assert_eq(geom.cross(geom.vec3(1, 0, 0), geom.vec3(0, 1, 0)), geom.vec3(0, 0, 1));
+
+// Quaternion rotation (90 deg around Y maps +X -> -Z in RH coordinates!)
+let q = geom.quat_axis_angle(geom.vec3(0.0, 1.0, 0.0), geom.deg_to_rad(90.0));
+let rotated = q * geom.vec3(1.0, 0.0, 0.0);
+test.assert(math.abs(rotated.x) < 0.0001);
+test.assert(math.abs(rotated.y) < 0.0001);
+test.assert(math.abs(rotated.z + 1.0) < 0.0001);
+
+// NDC [0, 1] perspective check: -near -> z_ndc 0.0, -far -> z_ndc 1.0
+let proj = geom.mat4_perspective(geom.deg_to_rad(60.0), 1.5, 1.0, 100.0);
+let p_near = proj * geom.vec4(0.0, 0.0, -1.0, 1.0);
+let p_far = proj * geom.vec4(0.0, 0.0, -100.0, 1.0);
+test.assert(math.abs(p_near.z / p_near.w) < 0.0001);
+test.assert(math.abs((p_far.z / p_far.w) - 1.0) < 0.0001);
+
+let view = geom.mat4_look_at(geom.vec3(0, 0, 0), geom.vec3(0, 0, -1), geom.vec3(0, 1, 0));
+let fr = geom.frustum_from_mat4(proj * view);
+test.assert(geom.frustum_contains_point(fr, geom.vec3(0.0, 0.0, -10.0)));
+test.assert(!geom.frustum_contains_point(fr, geom.vec3(0.0, 0.0, -0.5)));
+test.assert(!geom.frustum_contains_point(fr, geom.vec3(0.0, 0.0, -150.0)));
+
+let box = geom.aabb(geom.vec3(-1, -1, -1), geom.vec3(1, 1, 1));
+let ray = geom.ray(geom.vec3(0, 0, 5), geom.vec3(0, 0, -1));
+let hit = geom.ray_aabb(ray, box);
+test.assert(math.abs(hit - 4.0) < 0.0001);
+
+let tr = geom.transform(geom.vec3(10, 0, 0), geom.quat_identity(), geom.vec3(2, 2, 2));
+test.assert_eq(geom.transform_point(tr, geom.vec3(1, 2, 3)), geom.vec3(12, 4, 6));
+test.assert(json.stringify(geom.vec2(1, 2)).contains("[1,2]"));
+"#;
+        VM::new_with_sandbox(true)
+            .run(compile_source(geom_script).unwrap())
+            .unwrap();
+
+        // 6. Latin+Cyrillic Bitmap Font, FontAtlas cache/flush hash invariance, BMFont + chromatic reject
+        let font_dir = std::env::temp_dir().join(format!("askane_v020_font_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&font_dir);
+        std::fs::create_dir_all(&font_dir).unwrap();
+
+        // Valid grayscale white-alpha 8x8 PNG page with 'A' (65) and 'B' (66)
+        let mut mask_rgba = vec![0u8; 8 * 8 * 4];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let idx = (y * 8 + x) * 4;
+                mask_rgba[idx] = 255;
+                mask_rgba[idx + 1] = 255;
+                mask_rgba[idx + 2] = 255;
+                mask_rgba[idx + 3] = 255;
+            }
+        }
+        std::fs::write(font_dir.join("gray_page.png"), make_test_png(8, 8, &mask_rgba)).unwrap();
+        let valid_fnt = "\
+info face=\"Test\" size=16
+common lineHeight=16 base=12 scaleW=8 scaleH=8 pages=1
+page id=0 file=\"gray_page.png\"
+chars count=2
+char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=2 xadvance=6 page=0 chnl=15
+char id=66 x=0 y=0 width=4 height=4 xoffset=0 yoffset=2 xadvance=6 page=0 chnl=15
+kerning first=65 second=66 amount=-1
+";
+        std::fs::write(font_dir.join("test.fnt"), valid_fnt).unwrap();
+
+        // Chromatic RGB PNG page must be rejected loudly!
+        let mut color_rgba = mask_rgba.clone();
+        color_rgba[0] = 255;
+        color_rgba[1] = 20;
+        color_rgba[2] = 10;
+        color_rgba[3] = 255;
+        std::fs::write(font_dir.join("color_page.png"), make_test_png(8, 8, &color_rgba)).unwrap();
+        let bad_fnt = valid_fnt.replace("gray_page.png", "color_page.png");
+        std::fs::write(font_dir.join("bad_color.fnt"), bad_fnt).unwrap();
+
+        let mut fvm = VM::new_with_sandbox(true);
+        fvm.set_permissions(Permissions::sandboxed());
+        fvm.set_current_dir(font_dir.clone());
+        fvm.set_sandbox_root(font_dir.clone());
+
+        let font_miss_script = r##"
+import gfx;
+import test;
+
+gfx.headless(true, 160, 48);
+let f0 = gfx.font_bitmap();
+test.assert_eq(f0, 0);
+gfx.clear(0, 0, 0);
+gfx.draw_text(f0, 4, 4, "Привет, Mir! Ёё", 16, "#FFFFFF");
+let cyr_w = gfx.text_width(f0, "Привет", 16);
+test.assert_eq(cyr_w, 6 * 8);
+test.assert_eq(gfx.text_line_height(f0, 16), 16);
+// Unknown codepoint uses fallback box matching exact measured width
+let unk_m = gfx.measure_text(f0, "☃", 16);
+test.assert_eq(unk_m.width, 8);
+gfx.frame_hash()
+"##;
+        let hash_miss = fvm.run(compile_source(font_miss_script).unwrap()).unwrap();
+        // Second run: cache hit -> identical hash!
+        let hash_hit = fvm
+            .run(compile_source(
+                r##"
+import gfx;
+gfx.clear(0, 0, 0);
+gfx.draw_text(gfx.font_bitmap(), 4, 4, "Привет, Mir! Ёё", 16, "#FFFFFF");
+gfx.frame_hash()
+"##,
+            )
+            .unwrap())
+            .unwrap();
+        assert!(hash_miss.equals(&hash_hit));
+        assert_eq!(modules::gfx::test_flush_font_atlas(), 1);
+        // Third run after atlas flush -> misses cleanly & reproduces bit-identical hash!
+        let hash_after_flush = fvm
+            .run(compile_source(
+                r##"
+import gfx;
+gfx.clear(0, 0, 0);
+gfx.draw_text(gfx.font_bitmap(), 4, 4, "Привет, Mir! Ёё", 16, "#FFFFFF");
+gfx.frame_hash()
+"##,
+            )
+            .unwrap())
+            .unwrap();
+        assert!(hash_miss.equals(&hash_after_flush));
+
+        let bmfont_script = r#"
+import gfx;
+import test;
+
+let bm = gfx.font_load_bmfont("test.fnt");
+test.assert(bm >= 1);
+test.assert_eq(gfx.text_width(bm, "AB", 16), 11); // 6 + 6 - 1 kerning
+gfx.clear(0, 0, 0);
+gfx.draw_text(bm, 2, 2, "AB", 16, [255, 255, 255]);
+test.assert_eq(gfx.read_pixel(2, 4), 16777215);
+gfx.font_free(bm);
+
+let rejected = false;
+try {
+    gfx.font_load_bmfont("bad_color.fnt");
+} catch e {
+    rejected = true;
+}
+test.assert(rejected);
+"#;
+        fvm.run(compile_source(bmfont_script).unwrap()).unwrap();
+        modules::reset_runtime_state();
+        let _ = std::fs::remove_dir_all(&font_dir);
+
+        // 7. ui extensions: rect, image, nine_slice, icon_button
+        let ui_dir = std::env::temp_dir().join(format!("askane_v020_ui_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ui_dir);
+        std::fs::create_dir_all(&ui_dir).unwrap();
+        let mut icon_rgba = vec![0u8; 6 * 6 * 4];
+        for y in 0..6usize {
+            for x in 0..6usize {
+                let idx = (y * 6 + x) * 4;
+                let border = x == 0 || y == 0 || x == 5 || y == 5;
+                icon_rgba[idx] = if border { 255 } else { 10 };
+                icon_rgba[idx + 1] = if border { 0 } else { 240 };
+                icon_rgba[idx + 2] = if border { 0 } else { 20 };
+                icon_rgba[idx + 3] = 255;
+            }
+        }
+        std::fs::write(ui_dir.join("panel.png"), make_test_png(6, 6, &icon_rgba)).unwrap();
+
+        let ui_script = r##"
+import gfx;
+import ui;
+import test;
+
+gfx.headless(true, 32, 32);
+let img = gfx.load_image("panel.png");
+let surf = gfx.surface_new(8, 8);
+gfx.draw_to(surf, fn() { gfx.clear(12, 34, 56); });
+
+let th = #{padding: 8, spacing: 4};
+ui.window("Test", 240, 200, #{headless: true, theme: th});
+let clicked = false;
+let root = ui.column([
+    ui.rect(#{width: 24, height: 12, bg: "#AA1122"}),
+    ui.image(surf, #{width: 16, height: 16}),
+    ui.nine_slice(img, 1, 1, 1, 1, #{width: 20, height: 20}),
+    ui.icon_button(surf, "Play", #{id: "ib", width: 120, height: 36, on_click: fn(id) { clicked = true; }})
+]);
+let lay = ui.layout(root, 240, 200, th);
+let nodes = lay._nodes;
+test.assert_eq(len(nodes), 5);
+test.assert_eq(nodes[1].kind, "rect");
+test.assert_eq(nodes[2].kind, "image");
+test.assert_eq(nodes[3].kind, "nine_slice");
+test.assert_eq(nodes[4].kind, "icon_button");
+ui.inject_click(nodes[4].x + 10, nodes[4].y + 10);
+ui.render(root);
+test.assert(clicked);
+let evs = ui.events();
+test.assert_eq(len(evs), 1);
+test.assert_eq(evs[0].id, "ib");
+[nodes[1].x, nodes[1].y, nodes[3].x, nodes[3].y]
+"##;
+        let mut uvm = VM::new_with_sandbox(true);
+        uvm.set_permissions(Permissions::sandboxed());
+        uvm.set_current_dir(ui_dir.clone());
+        uvm.set_sandbox_root(ui_dir.clone());
+        let coords = uvm.run(compile_source(ui_script).unwrap()).unwrap();
+        let Value::List(cl) = coords else { panic!("expected list") };
+        let cv = cl.borrow();
+        let rx = match cv[0] { Value::Int(i) => i as i32, _ => unreachable!() };
+        let ry = match cv[1] { Value::Int(i) => i as i32, _ => unreachable!() };
+        let nx = match cv[2] { Value::Int(i) => i as i32, _ => unreachable!() };
+        let ny = match cv[3] { Value::Int(i) => i as i32, _ => unreachable!() };
+        // Rect pixel (#AA1122)
+        assert_eq!(modules::ui::test_peek_pixel(rx + 2, ry + 2), Some(0xAA1122));
+        // Nine-slice corner border = red (255,0,0), center = green (10,240,20)
+        assert_eq!(modules::ui::test_peek_pixel(nx, ny), Some(0xFF0000));
+        assert_eq!(modules::ui::test_peek_pixel(nx + 10, ny + 10), Some(0x0AF014));
+        drop(cv);
+        drop(uvm);
+        modules::reset_runtime_state();
+        let _ = std::fs::remove_dir_all(&ui_dir);
     }
 }

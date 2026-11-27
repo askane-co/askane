@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::modules::{NativeFnPtr, build_module};
-use crate::value::{NativeFunction, StructDef, StructInstance, Value};
+use crate::value::{FastMap, StructDef, StructInstance, Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 const MAX_NET_READ: usize = 16 * 1024 * 1024;
@@ -54,14 +54,11 @@ thread_local! {
 
 fn make_def(name: &str, methods_spec: &[(&'static str, NativeFnPtr)]) -> Rc<StructDef> {
     let field_names = vec!["__id".to_string()];
-    let mut field_index = HashMap::new();
+    let mut field_index = FastMap::default();
     field_index.insert("__id".to_string(), 0);
-    let mut methods = HashMap::new();
+    let mut methods = new_dict_with_capacity(methods_spec.len());
     for &(mname, func) in methods_spec {
-        methods.insert(
-            mname.to_string(),
-            Value::NativeFn(NativeFunction { name: mname, func }),
-        );
+        methods.insert(mname.to_string(), Value::native_fn(mname, func));
     }
     Rc::new(StructDef {
         ic_id: crate::bytecode::next_ic_id(),
@@ -402,10 +399,10 @@ fn net_udp_recv_from(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         if let Some((n, peer)) = res {
             buf.truncate(n);
             vm.charge_io(n)?;
-            let mut out = HashMap::new();
+            let mut out = new_dict_with_capacity(2);
             out.insert("data".to_string(), Value::Bytes(Rc::new(buf)));
-            out.insert("addr".to_string(), Value::Str(peer));
-            return Ok(Value::Dict(Rc::new(RefCell::new(out))));
+            out.insert("addr".to_string(), Value::from_str(peer));
+            return Ok(Value::dict(out));
         }
         if Instant::now() >= deadline {
             return Ok(Value::Unit);
@@ -426,7 +423,7 @@ fn net_local_addr(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             Some(NetHandle::UdpSocket(u)) => u.local_addr().map_err(|e| e.to_string())?,
             None => return Err("net.local_addr(): handle is closed".to_string()),
         };
-        Ok(Value::Str(addr.to_string()))
+        Ok(Value::from_str(addr.to_string()))
     })
 }
 
@@ -441,7 +438,7 @@ fn net_peer_addr(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             return Err("net.peer_addr(): stream is closed".to_string());
         };
         let addr = s.peer_addr().map_err(|e| e.to_string())?;
-        Ok(Value::Str(addr.to_string()))
+        Ok(Value::from_str(addr.to_string()))
     })
 }
 

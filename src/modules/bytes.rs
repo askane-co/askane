@@ -41,7 +41,7 @@ fn bytes_from_utf8(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     vm.charge_alloc(raw.len())?;
     let text = std::str::from_utf8(raw)
         .map_err(|_| "bytes.from_utf8(): invalid UTF-8 sequence".to_string())?;
-    Ok(Value::Str(text.to_string()))
+    Ok(Value::from_str(text))
 }
 
 fn bytes_from_utf8_lossy(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -51,7 +51,7 @@ fn bytes_from_utf8_lossy(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let raw = expect_bytes(&args[0], "from_utf8_lossy")?;
     vm.charge_work((raw.len() as u64) / 64 + 1)?;
     vm.charge_alloc(raw.len())?;
-    Ok(Value::Str(String::from_utf8_lossy(raw).into_owned()))
+    Ok(Value::from_str(String::from_utf8_lossy(raw).into_owned()))
 }
 
 fn bytes_to_utf8(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

@@ -1,13 +1,10 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 #[cfg(windows)]
@@ -356,18 +353,18 @@ fn proc_run(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     let stdout_bytes = &stdout[..stdout.len().min(MAX_OUT)];
     let stderr_bytes = &stderr[..stderr.len().min(MAX_OUT)];
 
-    let mut res = HashMap::new();
+    let mut res = new_dict_with_capacity(3);
     res.insert(
         "code".to_string(),
         Value::Int(status.code().unwrap_or(-1) as i64),
     );
     res.insert(
         "stdout".to_string(),
-        Value::Str(String::from_utf8_lossy(stdout_bytes).into_owned()),
+        Value::from_str(String::from_utf8_lossy(stdout_bytes).into_owned()),
     );
     res.insert(
         "stderr".to_string(),
-        Value::Str(String::from_utf8_lossy(stderr_bytes).into_owned()),
+        Value::from_str(String::from_utf8_lossy(stderr_bytes).into_owned()),
     );
-    Ok(Value::Dict(Rc::new(RefCell::new(res))))
+    Ok(Value::dict(res))
 }

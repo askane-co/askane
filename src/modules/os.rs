@@ -32,21 +32,21 @@ fn os_platform(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("os.platform() expects 0 arguments".to_string());
     }
-    Ok(Value::Str(env::consts::OS.to_string()))
+    Ok(Value::from_str(env::consts::OS))
 }
 
 fn os_arch(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("os.arch() expects 0 arguments".to_string());
     }
-    Ok(Value::Str(env::consts::ARCH.to_string()))
+    Ok(Value::from_str(env::consts::ARCH))
 }
 
 fn os_family(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("os.family() expects 0 arguments".to_string());
     }
-    Ok(Value::Str(env::consts::FAMILY.to_string()))
+    Ok(Value::from_str(env::consts::FAMILY))
 }
 
 fn os_cpu_count(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -70,7 +70,7 @@ fn os_sep(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err("os.sep() expects 0 arguments".to_string());
     }
-    Ok(Value::Str(std::path::MAIN_SEPARATOR.to_string()))
+    Ok(Value::from_str(std::path::MAIN_SEPARATOR.to_string()))
 }
 
 fn os_line_ending(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -78,9 +78,9 @@ fn os_line_ending(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("os.line_ending() expects 0 arguments".to_string());
     }
     #[cfg(windows)]
-    return Ok(Value::Str("\r\n".to_string()));
+    return Ok(Value::from_str("\r\n"));
     #[cfg(not(windows))]
-    return Ok(Value::Str("\n".to_string()));
+    return Ok(Value::from_str("\n"));
 }
 
 fn os_cwd(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -89,10 +89,10 @@ fn os_cwd(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     if vm.is_sandboxed() {
         vm.resolve_read_path(".")?;
-        return Ok(Value::Str(".".to_string()));
+        return Ok(Value::from_str("."));
     }
     let cur = env::current_dir().map_err(|e| format!("os.cwd(): {}", e))?;
-    Ok(Value::Str(cur.display().to_string()))
+    Ok(Value::from_str(cur.display().to_string()))
 }
 
 fn os_home_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -101,7 +101,7 @@ fn os_home_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     vm.check_env(key)?;
-    Ok(env::var(key).map(Value::Str).unwrap_or(Value::Unit))
+    Ok(env::var(key).map(Value::from_str).unwrap_or(Value::Unit))
 }
 
 fn os_temp_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -114,7 +114,7 @@ fn os_temp_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 .to_string(),
         );
     }
-    Ok(Value::Str(env::temp_dir().display().to_string()))
+    Ok(Value::from_str(env::temp_dir().display().to_string()))
 }
 
 fn os_env(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -125,7 +125,9 @@ fn os_env(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("os.env() expects string name".to_string());
     };
     vm.check_env(name)?;
-    Ok(env::var(name).map(Value::Str).unwrap_or(Value::Unit))
+    Ok(env::var(name.as_str())
+        .map(Value::from_str)
+        .unwrap_or(Value::Unit))
 }
 
 fn os_args(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
@@ -134,8 +136,8 @@ fn os_args(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     vm.check_sys_args()?;
     let list: Vec<Value> = match vm.script_args_slice() {
-        Some(args) => args.iter().cloned().map(Value::Str).collect(),
-        None => env::args().map(Value::Str).collect(),
+        Some(args) => args.iter().cloned().map(Value::from_str).collect(),
+        None => env::args().map(Value::from_str).collect(),
     };
     Ok(Value::List(Rc::new(RefCell::new(list))))
 }

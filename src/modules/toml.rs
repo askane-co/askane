@@ -1,9 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::modules::build_module;
-use crate::value::Value;
+use crate::value::{DictMap, Value, new_dict_map};
 use crate::vm::VM;
 
 pub fn module() -> Value {
@@ -266,7 +265,7 @@ fn parse_toml_value(vm: &mut VM, raw: &str, depth: usize) -> Result<Value, Strin
             inner = rest;
         }
         vm.charge_alloc(inner.len())?;
-        return Ok(Value::Str(inner.to_string()));
+        return Ok(Value::from_str(inner));
     }
     if s.starts_with("'''") {
         if !(s.ends_with("'''") && s.len() >= 6) {
@@ -279,17 +278,17 @@ fn parse_toml_value(vm: &mut VM, raw: &str, depth: usize) -> Result<Value, Strin
             inner = rest;
         }
         vm.charge_alloc(inner.len())?;
-        return Ok(Value::Str(inner.to_string()));
+        return Ok(Value::from_str(inner));
     }
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         let parsed = unquote_dq(s)?;
         vm.charge_alloc(parsed.len())?;
-        return Ok(Value::Str(parsed));
+        return Ok(Value::from_str(parsed));
     }
     if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
         let inner = &s[1..s.len() - 1];
         vm.charge_alloc(inner.len())?;
-        return Ok(Value::Str(inner.to_string()));
+        return Ok(Value::from_str(inner));
     }
     if s.starts_with('[') && s.ends_with(']') {
         let inner = s[1..s.len() - 1].trim();
@@ -308,7 +307,7 @@ fn parse_toml_value(vm: &mut VM, raw: &str, depth: usize) -> Result<Value, Strin
     }
     if s.starts_with('{') && s.ends_with('}') {
         let inner = s[1..s.len() - 1].trim();
-        let mut map = HashMap::new();
+        let mut map = new_dict_map();
         if !inner.is_empty() {
             for part in split_top_level(inner, ',')? {
                 let p = part.trim();
@@ -324,7 +323,7 @@ fn parse_toml_value(vm: &mut VM, raw: &str, depth: usize) -> Result<Value, Strin
             }
         }
         vm.charge_alloc(map.len().saturating_mul(64))?;
-        return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+        return Ok(Value::dict(map));
     }
     let clean_num = s.replace('_', "");
     if let Ok(i) = clean_num.parse::<i64>() {
@@ -348,16 +347,16 @@ const MAX_TOML_OUT: usize = 16 * 1024 * 1024;
 
 fn ensure_table(
     vm: &mut VM,
-    root: &mut HashMap<String, Value>,
+    root: &mut DictMap,
     path: &[String],
     is_array_elem: bool,
     base_depth: usize,
-) -> Result<(Rc<RefCell<HashMap<String, Value>>>, usize), String> {
+) -> Result<(Rc<RefCell<DictMap>>, usize), String> {
     let total_depth = base_depth.saturating_add(path.len());
     if total_depth > MAX_TOML_DEPTH {
         return Err("toml.parse(): table nesting depth limit exceeded".to_string());
     }
-    let mut cur_map_rc: Option<Rc<RefCell<HashMap<String, Value>>>> = None;
+    let mut cur_map_rc: Option<Rc<RefCell<DictMap>>> = None;
     for (idx, seg) in path.iter().enumerate() {
         let is_last = idx + 1 == path.len();
         let next_rc = if let Some(ref rc) = cur_map_rc {
@@ -371,14 +370,14 @@ fn ensure_table(
                     return Err(format!("TOML key '{}' is not an array of tables", seg));
                 };
                 vm.charge_alloc(if is_new_list { 128 } else { 64 })?;
-                let new_tab = Rc::new(RefCell::new(HashMap::new()));
+                let new_tab = Rc::new(RefCell::new(new_dict_map()));
                 list_rc.borrow_mut().push(Value::Dict(new_tab.clone()));
                 new_tab
             } else {
                 let existed = m.contains_key(seg);
                 let entry = m
                     .entry(seg.clone())
-                    .or_insert_with(|| Value::Dict(Rc::new(RefCell::new(HashMap::new()))));
+                    .or_insert_with(|| Value::dict(new_dict_map()));
                 if !existed {
                     vm.charge_alloc(64)?;
                 }
@@ -400,14 +399,14 @@ fn ensure_table(
                 return Err(format!("TOML key '{}' is not an array of tables", seg));
             };
             vm.charge_alloc(if is_new_list { 128 } else { 64 })?;
-            let new_tab = Rc::new(RefCell::new(HashMap::new()));
+            let new_tab = Rc::new(RefCell::new(new_dict_map()));
             list_rc.borrow_mut().push(Value::Dict(new_tab.clone()));
             new_tab
         } else {
             let existed = root.contains_key(seg);
             let entry = root
                 .entry(seg.clone())
-                .or_insert_with(|| Value::Dict(Rc::new(RefCell::new(HashMap::new()))));
+                .or_insert_with(|| Value::dict(new_dict_map()));
             if !existed {
                 vm.charge_alloc(64)?;
             }
@@ -429,7 +428,7 @@ fn ensure_table(
 
 fn insert_path(
     vm: &mut VM,
-    target: &mut HashMap<String, Value>,
+    target: &mut DictMap,
     path: &[String],
     val: Value,
     base_depth: usize,
@@ -473,8 +472,8 @@ fn toml_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("toml.parse(): input exceeds 16 MiB limit".to_string());
     }
     let text = text.clone();
-    let mut root: HashMap<String, Value> = HashMap::new();
-    let mut current_table: Option<(Rc<RefCell<HashMap<String, Value>>>, usize)> = None;
+    let mut root: DictMap = new_dict_map();
+    let mut current_table: Option<(Rc<RefCell<DictMap>>, usize)> = None;
     let lines: Vec<&str> = text.lines().collect();
     vm.charge_alloc(lines.len().saturating_mul(std::mem::size_of::<&str>()))?;
     let mut idx = 0usize;
@@ -550,7 +549,7 @@ fn toml_parse(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         }
     }
 
-    Ok(Value::Dict(Rc::new(RefCell::new(root))))
+    Ok(Value::dict(root))
 }
 
 fn format_toml_key(k: &str) -> String {
@@ -650,7 +649,7 @@ fn write_toml_scalar(
 fn write_toml_section(
     vm: &mut VM,
     prefix: &[String],
-    map: &HashMap<String, Value>,
+    map: &DictMap,
     out: &mut String,
     depth: usize,
     last_charged: &mut usize,
@@ -724,5 +723,5 @@ fn toml_stringify(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if rem > 0 {
         vm.charge_alloc(rem)?;
     }
-    Ok(Value::Str(out))
+    Ok(Value::from_str(out))
 }

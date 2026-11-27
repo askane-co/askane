@@ -182,7 +182,7 @@ fn dlg_open_file(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         match win32_dlg::file_dialog(false) {
             Some(p) => {
                 vm.resolve_read_path(&p)?;
-                Ok(Value::Str(p))
+                Ok(Value::from_str(p))
             }
             None => Ok(Value::Unit),
         }
@@ -203,7 +203,7 @@ fn dlg_save_file(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         match win32_dlg::file_dialog(true) {
             Some(p) => {
                 vm.resolve_write_path(&p)?;
-                Ok(Value::Str(p))
+                Ok(Value::from_str(p))
             }
             None => Ok(Value::Unit),
         }

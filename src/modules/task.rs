@@ -1,9 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::modules::{NativeFnPtr, build_module};
-use crate::value::{NativeFunction, StructDef, StructInstance, Value};
+use crate::value::{FastMap, StructDef, StructInstance, Value, new_dict_with_capacity};
 use crate::vm::VM;
 
 thread_local! {
@@ -24,14 +23,11 @@ thread_local! {
 
 fn make_def(name: &str, methods_spec: &[(&'static str, NativeFnPtr)]) -> Rc<StructDef> {
     let field_names = vec!["__id".to_string()];
-    let mut field_index = HashMap::new();
+    let mut field_index = FastMap::default();
     field_index.insert("__id".to_string(), 0);
-    let mut methods = HashMap::new();
+    let mut methods = new_dict_with_capacity(methods_spec.len());
     for &(mname, func) in methods_spec {
-        methods.insert(
-            mname.to_string(),
-            Value::NativeFn(NativeFunction { name: mname, func }),
-        );
+        methods.insert(mname.to_string(), Value::native_fn(mname, func));
     }
     Rc::new(StructDef {
         ic_id: crate::bytecode::next_ic_id(),
@@ -239,11 +235,11 @@ fn chan_try_recv(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     let id = extract_chan_id(&args[0], "channel.try_recv()")?;
     let (ok, val, closed) = vm.channel_try_recv(id)?;
-    let mut map = HashMap::new();
+    let mut map = new_dict_with_capacity(3);
     map.insert("ok".to_string(), Value::Bool(ok));
     map.insert("value".to_string(), val);
     map.insert("closed".to_string(), Value::Bool(closed));
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    Ok(Value::dict(map))
 }
 
 fn chan_close(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
