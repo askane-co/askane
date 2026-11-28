@@ -294,6 +294,7 @@ pub enum Value {
     Buffer(Rc<RefCell<BufData>>),
     Image(Rc<crate::media::image::MediaImage>),
     Texture(Rc<crate::media::image::TextureData>),
+    Sound(Rc<crate::media::audio::sound::SoundData>),
     Closure(Rc<Closure>),
     NativeFn(Rc<NativeFunction>),
     BoundMethod(Rc<BoundMethod>),
@@ -386,6 +387,7 @@ impl Value {
             Value::Buffer(_) => "buffer",
             Value::Image(_) => "image",
             Value::Texture(_) => "texture",
+            Value::Sound(_) => "sound",
             Value::Unit => "unit",
             Value::Closure(_) | Value::NativeFn(_) | Value::BoundMethod(_) => "fn",
             Value::StructDef(_) => "struct",
@@ -447,6 +449,7 @@ impl Value {
             (Value::Buffer(a), Value::Buffer(b)) => Rc::ptr_eq(a, b),
             (Value::Image(a), Value::Image(b)) => Rc::ptr_eq(a, b),
             (Value::Texture(a), Value::Texture(b)) => Rc::ptr_eq(a, b),
+            (Value::Sound(a), Value::Sound(b)) => Rc::ptr_eq(a, b),
             (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b),
             (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b),
             (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
@@ -550,6 +553,7 @@ impl Value {
                         && a.digest == b.digest)
             }
             (Value::Texture(a), Value::Texture(b)) => Rc::ptr_eq(a, b) || a.digest == b.digest,
+            (Value::Sound(a), Value::Sound(b)) => Rc::ptr_eq(a, b) || a.digest == b.digest,
             (Value::Unit, Value::Unit) => true,
             (Value::List(a), Value::List(b)) => {
                 if Rc::ptr_eq(a, b) {
@@ -873,6 +877,16 @@ impl Value {
                     tex.image.format.name(),
                     tex.wrap_u.name(),
                     tex.filter.name()
+                )
+            }
+            Value::Sound(snd) => {
+                budget.consume(40);
+                write!(
+                    f,
+                    "<sound {}f {}ms {}>",
+                    snd.frames,
+                    snd.duration_ms(),
+                    snd.digest.short_hex()
                 )
             }
             Value::Unit => {

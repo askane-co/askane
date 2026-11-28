@@ -400,6 +400,13 @@ pub fn read_asset_bytes(
     read_asset_bytes_inner(vm, path, true)
 }
 
+pub fn read_asset_bytes_temp(
+    vm: &mut VM,
+    path: &str,
+) -> Result<(Vec<u8>, Option<AssetManifestHint>, String), String> {
+    read_asset_bytes_inner(vm, path, false)
+}
+
 fn evict_lru_to_fit(reg: &mut AssetRegistry, incoming_bytes: usize) -> Result<(), String> {
     if incoming_bytes > reg.max_bytes && reg.max_bytes > 0 {
         return Err(err_limit(format!(

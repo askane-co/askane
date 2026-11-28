@@ -126,6 +126,7 @@ mod gfx_state {
         pub width: i32,
         pub height: i32,
         pub buffer: Vec<u32>,
+        pub depth: Option<crate::surface::DepthBuffer>,
         pub texts: Vec<TextDraw>,
         pub clip: Option<ClipRect>,
         pub open: bool,
@@ -193,6 +194,7 @@ mod gfx_state {
                 width,
                 height,
                 buffer,
+                depth: None,
                 texts: Vec::new(),
                 clip: None,
                 open: true,
@@ -202,9 +204,12 @@ mod gfx_state {
     }
 
     pub fn close_window(reset_headless: bool) {
-        FRAME.with(|f| {
-            *f.borrow_mut() = None;
-        });
+        let old_frame = FRAME.with(|f| f.borrow_mut().take());
+        if let Some(mut frame) = old_frame {
+            if let Some(mut d) = frame.depth.take() {
+                with_budget_opt(|b| d.refund_to(b));
+            }
+        }
         #[cfg(windows)]
         super::win32_gfx::destroy_native_window();
         TARGET_STACK.with(|st| st.borrow_mut().clear());
@@ -278,6 +283,179 @@ pub(crate) fn handle_dims(handle: i64) -> Option<(i32, i32)> {
     } else {
         None
     }
+}
+
+pub(crate) fn with_target_pixels_read<R>(
+    target: Option<&Value>,
+    f: impl FnOnce(&[u32], i32, i32) -> Result<R, String>,
+) -> Result<R, String> {
+    if let Some(val) = target {
+        if !matches!(val, Value::Unit) {
+            let Value::Int(handle) = val else {
+                return Err(format!("Expected surface/layer handle, got '{}'", val.type_name()));
+            };
+            if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(handle) {
+                let slot = (*handle - SURFACE_ID_BASE) as usize;
+                return gfx_state::SURFACES.with(|surfs| {
+                    let list = surfs.borrow();
+                    let surf = list
+                        .get(slot)
+                        .and_then(|s| s.as_ref())
+                        .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+                    f(&surf.pixels, surf.width, surf.height)
+                });
+            } else if *handle >= LAYER_ID_BASE {
+                let slot = (*handle - LAYER_ID_BASE) as usize;
+                return gfx_state::LAYERS.with(|layers| {
+                    let bank = layers.borrow();
+                    let lay = bank.get(slot)?;
+                    f(&lay.surface.pixels, lay.surface.width, lay.surface.height)
+                });
+            }
+            return Err(format!("Invalid surface or layer handle {}", handle));
+        }
+    }
+    with_active_target(|buf, w, h, _clip, _pda, _cam| f(buf, w, h))
+}
+
+pub(crate) fn with_target_pixels_mut<R>(
+    target: Option<&Value>,
+    need_depth: bool,
+    f: impl FnOnce(
+        &mut [u32],
+        Option<&mut crate::surface::DepthBuffer>,
+        i32,
+        i32,
+        ClipRect,
+        Option<&crate::budget::BudgetCore>,
+    ) -> Result<R, String>,
+) -> Result<R, String> {
+    gfx_state::with_budget_opt(|budget_opt| {
+        if let Some(val) = target {
+            if !matches!(val, Value::Unit) {
+                let Value::Int(handle) = val else {
+                    return Err(format!("Expected surface/layer handle, got '{}'", val.type_name()));
+                };
+                if (SURFACE_ID_BASE..LAYER_ID_BASE).contains(handle) {
+                    let slot = (*handle - SURFACE_ID_BASE) as usize;
+                    return gfx_state::SURFACES.with(|surfs| {
+                        let mut list = surfs.borrow_mut();
+                        let surf = list
+                            .get_mut(slot)
+                            .and_then(|s| s.as_mut())
+                            .ok_or_else(|| format!("Invalid or freed surface handle {}", handle))?;
+                        if need_depth && surf.depth.is_none() {
+                            surf.depth = Some(crate::surface::DepthBuffer::new(
+                                surf.width,
+                                surf.height,
+                                budget_opt,
+                            )?);
+                        }
+                        let clip = surf.effective_clip();
+                        let w = surf.width;
+                        let h = surf.height;
+                        let crate::surface::Surface {
+                            ref mut pixels,
+                            ref mut depth,
+                            ..
+                        } = *surf;
+                        f(pixels, depth.as_mut(), w, h, clip, budget_opt)
+                    });
+                } else if *handle >= LAYER_ID_BASE {
+                    let slot = (*handle - LAYER_ID_BASE) as usize;
+                    return gfx_state::LAYERS.with(|layers| {
+                        let mut bank = layers.borrow_mut();
+                        let lay = bank.get_mut(slot)?;
+                        if need_depth && lay.surface.depth.is_none() {
+                            lay.surface.depth = Some(crate::surface::DepthBuffer::new(
+                                lay.surface.width,
+                                lay.surface.height,
+                                budget_opt,
+                            )?);
+                        }
+                        let clip = lay.surface.effective_clip();
+                        let w = lay.surface.width;
+                        let h = lay.surface.height;
+                        let crate::surface::Surface {
+                            ref mut pixels,
+                            ref mut depth,
+                            ..
+                        } = lay.surface;
+                        f(pixels, depth.as_mut(), w, h, clip, budget_opt)
+                    });
+                }
+                return Err(format!("Invalid surface or layer handle {}", handle));
+            }
+        }
+        let top = gfx_state::TARGET_STACK.with(|st| st.borrow().last().copied());
+        match top {
+            Some(tf) => match tf.target {
+                gfx_state::ActiveTarget::Surface(slot) => gfx_state::SURFACES.with(|surfs| {
+                    let mut list = surfs.borrow_mut();
+                    let surf = list
+                        .get_mut(slot)
+                        .and_then(|s| s.as_mut())
+                        .ok_or_else(|| "Active target surface was freed".to_string())?;
+                    if need_depth && surf.depth.is_none() {
+                        surf.depth = Some(crate::surface::DepthBuffer::new(
+                            surf.width,
+                            surf.height,
+                            budget_opt,
+                        )?);
+                    }
+                    let clip = surf.effective_clip();
+                    let w = surf.width;
+                    let h = surf.height;
+                    let crate::surface::Surface {
+                        ref mut pixels,
+                        ref mut depth,
+                        ..
+                    } = *surf;
+                    f(pixels, depth.as_mut(), w, h, clip, budget_opt)
+                }),
+                gfx_state::ActiveTarget::Layer(slot) => gfx_state::LAYERS.with(|layers| {
+                    let mut bank = layers.borrow_mut();
+                    let lay = bank.get_mut(slot)?;
+                    if need_depth && lay.surface.depth.is_none() {
+                        lay.surface.depth = Some(crate::surface::DepthBuffer::new(
+                            lay.surface.width,
+                            lay.surface.height,
+                            budget_opt,
+                        )?);
+                    }
+                    let clip = lay.surface.effective_clip();
+                    let w = lay.surface.width;
+                    let h = lay.surface.height;
+                    let crate::surface::Surface {
+                        ref mut pixels,
+                        ref mut depth,
+                        ..
+                    } = lay.surface;
+                    f(pixels, depth.as_mut(), w, h, clip, budget_opt)
+                }),
+            },
+            None => gfx_state::FRAME.with(|w| {
+                let mut b = w.borrow_mut();
+                let st = b.as_mut().ok_or_else(|| "No active gfx window or target".to_string())?;
+                if need_depth && st.depth.is_none() {
+                    st.depth = Some(crate::surface::DepthBuffer::new(
+                        st.width,
+                        st.height,
+                        budget_opt,
+                    )?);
+                }
+                let clip = crate::surface::effective_clip(st.width, st.height, st.clip);
+                let fw = st.width;
+                let fh = st.height;
+                let gfx_state::FrameState {
+                    ref mut buffer,
+                    ref mut depth,
+                    ..
+                } = *st;
+                f(buffer, depth.as_mut(), fw, fh, clip, budget_opt)
+            }),
+        }
+    })
 }
 
 pub(crate) fn copy_handle_rgba(handle: i64) -> Result<(i32, i32, Vec<u32>), String> {
@@ -642,6 +820,7 @@ mod win32_gfx {
                     width,
                     height,
                     buffer,
+                    depth: None,
                     texts: Vec::new(),
                     clip: None,
                     open: true,
@@ -1060,6 +1239,9 @@ fn gfx_clear(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 state.buffer.fill(color);
             }
             state.texts.clear();
+            if let Some(d) = &mut state.depth {
+                d.clear();
+            }
             Ok(Value::Unit)
         }),
     }

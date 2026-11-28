@@ -604,12 +604,11 @@ fn mod_gzip_compress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Bytes(Rc::new(out)))
 }
 
-fn mod_gzip_decompress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
-    if args.is_empty() || args.len() > 2 {
-        return Err("compress.gzip_decompress() expects (bytes, max_size?)".to_string());
-    }
-    let max_out = max_out_arg(vm, args, 1)?;
-    let raw = args[0].as_bytes_cow("compress.gzip_decompress")?;
+pub(crate) fn inflate_gzip(
+    raw: &[u8],
+    max_output: usize,
+    vm: Option<&mut VM>,
+) -> Result<Vec<u8>, String> {
     if raw.len() < 18 || raw[0] != 0x1F || raw[1] != 0x8B || raw[2] != 8 {
         return Err("Invalid gzip header".to_string());
     }
@@ -643,12 +642,22 @@ fn mod_gzip_decompress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if pos + 8 > raw.len() {
         return Err("Truncated gzip stream".to_string());
     }
-    let out = inflate_raw(&raw[pos..raw.len() - 8], max_out, Some(vm))?;
+    let out = inflate_raw(&raw[pos..raw.len() - 8], max_output, vm)?;
     let expected_crc = u32::from_le_bytes(raw[raw.len() - 8..raw.len() - 4].try_into().unwrap());
     let expected_len = u32::from_le_bytes(raw[raw.len() - 4..].try_into().unwrap());
     if crc32_bytes(&out) != expected_crc || (out.len() as u32) != expected_len {
         return Err("gzip checksum or length mismatch".to_string());
     }
+    Ok(out)
+}
+
+fn mod_gzip_decompress(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err("compress.gzip_decompress() expects (bytes, max_size?)".to_string());
+    }
+    let max_out = max_out_arg(vm, args, 1)?;
+    let raw = args[0].as_bytes_cow("compress.gzip_decompress")?;
+    let out = inflate_gzip(&raw, max_out, Some(vm))?;
     Ok(Value::Bytes(Rc::new(out)))
 }
 

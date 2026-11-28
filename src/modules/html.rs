@@ -95,11 +95,11 @@ fn html_unescape(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
 }
 
 #[derive(Clone)]
-struct DomNode {
-    tag: String,
-    attrs: HashMap<String, String>,
-    text: String,
-    children: Vec<DomNode>,
+pub(crate) struct DomNode {
+    pub tag: String,
+    pub attrs: HashMap<String, String>,
+    pub text: String,
+    pub children: Vec<DomNode>,
 }
 
 impl DomNode {
@@ -204,6 +204,19 @@ fn parse_tag_attrs(raw: &str) -> (String, HashMap<String, String>, bool) {
 }
 
 fn parse_dom(vm: &mut VM, src: &str) -> Result<DomNode, String> {
+    parse_dom_mode(vm, src, false, 200_000)
+}
+
+pub(crate) fn parse_xml(vm: &mut VM, src: &str) -> Result<DomNode, String> {
+    parse_dom_mode(vm, src, true, 100_000)
+}
+
+fn parse_dom_mode(
+    vm: &mut VM,
+    src: &str,
+    strict_xml: bool,
+    max_nodes: usize,
+) -> Result<DomNode, String> {
     let mut stack = vec![DomNode {
         tag: "#document".to_string(),
         attrs: HashMap::new(),
@@ -216,7 +229,7 @@ fn parse_dom(vm: &mut VM, src: &str) -> Result<DomNode, String> {
     let mut est_alloc = 0usize;
     let mut steps = 0usize;
 
-    while i < bytes.len() && nodes_created < 200_000 {
+    while i < bytes.len() {
         steps += 1;
         if (steps & 1023) == 0 {
             vm.check_timeout()?;
@@ -228,6 +241,19 @@ fn parse_dom(vm: &mut VM, src: &str) -> Result<DomNode, String> {
                     continue;
                 }
                 break;
+            }
+            if src[i..].starts_with("<![CDATA[") {
+                let cstart = i + 9;
+                if let Some(cend) = src[cstart..].find("]]>") {
+                    if cend > 16 * 1024 * 1024 {
+                        return Err("E_ASSET_XML: CDATA section exceeds 16 MiB limit".to_string());
+                    }
+                    let cur = stack.last_mut().unwrap();
+                    cur.text.push_str(&src[cstart..cstart + cend]);
+                    i = cstart + cend + 3;
+                    continue;
+                }
+                return Err("E_ASSET_XML: unterminated CDATA section".to_string());
             }
             if src[i..].starts_with("<!") || src[i..].starts_with("<?") {
                 if let Some(end) = src[i + 2..].find('>') {
@@ -257,6 +283,18 @@ fn parse_dom(vm: &mut VM, src: &str) -> Result<DomNode, String> {
                     let (tag, attrs, self_close) = parse_tag_attrs(trimmed);
                     if !tag.is_empty() {
                         nodes_created += 1;
+                        if nodes_created > max_nodes {
+                            if strict_xml {
+                                return Err(format!(
+                                    "E_ASSET_XML: XML node limit ({}) exceeded",
+                                    max_nodes
+                                ));
+                            }
+                            break;
+                        }
+                        if strict_xml && stack.len() > 128 {
+                            return Err("E_ASSET_XML: XML nesting depth (128) exceeded".to_string());
+                        }
                         let attr_bytes: usize = attrs
                             .iter()
                             .map(|(k, v)| k.len().saturating_add(v.len()).saturating_add(48))
@@ -275,7 +313,8 @@ fn parse_dom(vm: &mut VM, src: &str) -> Result<DomNode, String> {
                             text: String::new(),
                             children: Vec::new(),
                         };
-                        if self_close || is_void_tag(&tag) || stack.len() > 256 {
+                        let void_html = !strict_xml && is_void_tag(&tag);
+                        if self_close || void_html || stack.len() > 256 {
                             stack.last_mut().unwrap().children.push(node);
                         } else {
                             stack.push(node);

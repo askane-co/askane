@@ -119,12 +119,41 @@ fn sample_to_u8(row: &[u8], x: usize, channel: usize, channels: usize, bit_depth
     }
 }
 
-pub fn decode_png(
+#[inline]
+fn sample_to_u16(row: &[u8], x: usize, channel: usize, channels: usize, bit_depth: u8) -> u16 {
+    match bit_depth {
+        16 => {
+            let p = (x * channels + channel) * 2;
+            u16::from_be_bytes([row[p], row[p + 1]])
+        }
+        8 => (row[x * channels + channel] as u16) * 257,
+        d => {
+            let s = unpack_sub_byte(row, x * channels + channel, d) as u32;
+            let max_v = ((1u32 << d) - 1).max(1);
+            ((s * 65535 + (max_v / 2)) / max_v) as u16
+        }
+    }
+}
+
+struct PreparedPng {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+    channels: usize,
+    bpp_filter: usize,
+    palette: Vec<[u8; 3]>,
+    trns: Vec<u8>,
+    passes: Vec<(usize, usize, usize, usize, usize, usize)>,
+    raw: Vec<u8>,
+}
+
+fn prepare_png<'a>(
     data: &[u8],
     strict_crc: bool,
-    budget: Option<&Arc<BudgetCore>>,
+    budget: Option<&'a Arc<BudgetCore>>,
     deadline_check: Option<&dyn Fn() -> Result<(), String>>,
-) -> Result<RawDecodedImage, String> {
+) -> Result<(PreparedPng, Option<crate::media::TempCharge<'a>>), String> {
     const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if data.len() < 8 || &data[..8] != SIG {
         return Err(err_corrupt("Invalid PNG signature"));
@@ -235,7 +264,6 @@ pub fn decode_png(
                 break;
             }
             other => {
-                // Critical PNG chunks (bit 5 of byte 0 == 0) must not be ignored silently.
                 if (other[0] & 0x20) == 0 {
                     return Err(err_unsupported(format!(
                         "Unsupported critical PNG chunk {:?}",
@@ -284,17 +312,11 @@ pub fn decode_png(
     let h = height as usize;
     let bits_per_pixel = channels * (bit_depth as usize);
     let bpp_filter = bits_per_pixel.div_ceil(8).max(1);
-
-    let out_format = match color_type {
-        0 if trns.is_empty() => PixelFormat::R8,
-        2 if trns.is_empty() => PixelFormat::Rgb8,
-        _ => PixelFormat::Rgba8,
-    };
-    let decoded_bytes = w
+    let max_out_bytes = w
         .checked_mul(h)
-        .and_then(|px| px.checked_mul(out_format.bpp()))
+        .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| err_limit("PNG output size overflow"))?;
-    if decoded_bytes > MAX_MEDIA_BYTES {
+    if max_out_bytes > MAX_MEDIA_BYTES {
         return Err(err_limit("Decoded PNG exceeds 64 MiB limit"));
     }
 
@@ -332,8 +354,7 @@ pub fn decode_png(
             .checked_add(pass_raw)
             .ok_or_else(|| err_limit("PNG total raw buffer overflow"))?;
     }
-    let raw_cap = (decoded_bytes.saturating_mul(2).saturating_add(65_536))
-        .min(MAX_INFLATE_TRANSIENT);
+    let raw_cap = (max_out_bytes.saturating_mul(2).saturating_add(65_536)).min(MAX_INFLATE_TRANSIENT);
     if expected_raw > raw_cap {
         return Err(err_limit(format!(
             "PNG raw scanline stream {} bytes exceeds {} cap",
@@ -341,7 +362,7 @@ pub fn decode_png(
         )));
     }
 
-    let _inflate_guard = temp_budget_guard(budget, expected_raw)?;
+    let inflate_guard = temp_budget_guard(budget, expected_raw)?;
     let raw = crate::modules::compress::inflate_zlib(&idat, expected_raw, None)
         .map_err(|e| err_corrupt(format!("PNG inflate failed: {}", e)))?;
     if raw.len() != expected_raw {
@@ -352,27 +373,70 @@ pub fn decode_png(
         )));
     }
 
-    let trns_gray: Option<u8> = if color_type == 0 && trns.len() >= 2 {
-        let v = u16::from_be_bytes([trns[0], trns[1]]);
-        Some(if bit_depth == 16 {
+    Ok((
+        PreparedPng {
+            width,
+            height,
+            bit_depth,
+            color_type,
+            channels,
+            bpp_filter,
+            palette,
+            trns,
+            passes,
+            raw,
+        },
+        inflate_guard,
+    ))
+}
+
+pub fn decode_png(
+    data: &[u8],
+    strict_crc: bool,
+    budget: Option<&Arc<BudgetCore>>,
+    deadline_check: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<RawDecodedImage, String> {
+    let (prep, _inflate_guard) = prepare_png(data, strict_crc, budget, deadline_check)?;
+    let w = prep.width as usize;
+    let h = prep.height as usize;
+    let out_format = match prep.color_type {
+        0 if prep.trns.is_empty() => PixelFormat::R8,
+        2 if prep.trns.is_empty() => PixelFormat::Rgb8,
+        _ => PixelFormat::Rgba8,
+    };
+    let decoded_bytes = w
+        .checked_mul(h)
+        .and_then(|px| px.checked_mul(out_format.bpp()))
+        .ok_or_else(|| err_limit("PNG output size overflow"))?;
+    if decoded_bytes > MAX_MEDIA_BYTES {
+        return Err(err_limit("Decoded PNG exceeds 64 MiB limit"));
+    }
+
+    let trns_gray: Option<u8> = if prep.color_type == 0 && prep.trns.len() >= 2 {
+        let v = u16::from_be_bytes([prep.trns[0], prep.trns[1]]);
+        Some(if prep.bit_depth == 16 {
             ((v as u32 + 128) >> 8).min(255) as u8
         } else {
-            let max_v = ((1u16 << bit_depth) - 1).max(1);
+            let max_v = ((1u16 << prep.bit_depth) - 1).max(1);
             ((v.min(max_v) * 255 + (max_v / 2)) / max_v) as u8
         })
     } else {
         None
     };
-    let trns_rgb: Option<[u8; 3]> = if color_type == 2 && trns.len() >= 6 {
+    let trns_rgb: Option<[u8; 3]> = if prep.color_type == 2 && prep.trns.len() >= 6 {
         let cvt = |hi: u8, lo: u8| {
             let v = u16::from_be_bytes([hi, lo]);
-            if bit_depth == 16 {
+            if prep.bit_depth == 16 {
                 ((v as u32 + 128) >> 8).min(255) as u8
             } else {
                 lo
             }
         };
-        Some([cvt(trns[0], trns[1]), cvt(trns[2], trns[3]), cvt(trns[4], trns[5])])
+        Some([
+            cvt(prep.trns[0], prep.trns[1]),
+            cvt(prep.trns[2], prep.trns[3]),
+            cvt(prep.trns[4], prep.trns[5]),
+        ])
     } else {
         None
     };
@@ -381,11 +445,15 @@ pub fn decode_png(
     let out_bpp = out_format.bpp();
     let mut raw_offset = 0usize;
 
-    for &(x0, dx, y0, dy, pw, row_bytes) in &passes {
+    for &(x0, dx, y0, dy, pw, row_bytes) in &prep.passes {
         let ph = (h - y0).div_ceil(dy);
         let pass_len = (1 + row_bytes) * ph;
-        let unfiltered =
-            unfilter_pass_scanlines(&raw[raw_offset..raw_offset + pass_len], row_bytes, ph, bpp_filter)?;
+        let unfiltered = unfilter_pass_scanlines(
+            &prep.raw[raw_offset..raw_offset + pass_len],
+            row_bytes,
+            ph,
+            prep.bpp_filter,
+        )?;
         raw_offset += pass_len;
 
         for py in 0..ph {
@@ -397,9 +465,9 @@ pub fn decode_png(
             for px in 0..pw {
                 let dst_x = x0 + px * dx;
                 let di = (dst_y * w + dst_x) * out_bpp;
-                match color_type {
+                match prep.color_type {
                     0 => {
-                        let gval = sample_to_u8(row, px, 0, 1, bit_depth);
+                        let gval = sample_to_u8(row, px, 0, 1, prep.bit_depth);
                         if out_format == PixelFormat::R8 {
                             out[di] = gval;
                         } else {
@@ -411,9 +479,9 @@ pub fn decode_png(
                         }
                     }
                     2 => {
-                        let r = sample_to_u8(row, px, 0, 3, bit_depth);
-                        let g = sample_to_u8(row, px, 1, 3, bit_depth);
-                        let b = sample_to_u8(row, px, 2, 3, bit_depth);
+                        let r = sample_to_u8(row, px, 0, 3, prep.bit_depth);
+                        let g = sample_to_u8(row, px, 1, 3, prep.bit_depth);
+                        let b = sample_to_u8(row, px, 2, 3, prep.bit_depth);
                         out[di] = r;
                         out[di + 1] = g;
                         out[di + 2] = b;
@@ -422,33 +490,34 @@ pub fn decode_png(
                         }
                     }
                     3 => {
-                        let idx = if bit_depth == 8 {
+                        let idx = if prep.bit_depth == 8 {
                             row[px] as usize
                         } else {
-                            unpack_sub_byte(row, px, bit_depth) as usize
+                            unpack_sub_byte(row, px, prep.bit_depth) as usize
                         };
-                        let c = *palette
+                        let c = *prep
+                            .palette
                             .get(idx)
                             .ok_or_else(|| err_corrupt("PNG palette index out of bounds"))?;
-                        let a = *trns.get(idx).unwrap_or(&255);
+                        let a = *prep.trns.get(idx).unwrap_or(&255);
                         out[di] = c[0];
                         out[di + 1] = c[1];
                         out[di + 2] = c[2];
                         out[di + 3] = a;
                     }
                     4 => {
-                        let gval = sample_to_u8(row, px, 0, 2, bit_depth);
-                        let a = sample_to_u8(row, px, 1, 2, bit_depth);
+                        let gval = sample_to_u8(row, px, 0, 2, prep.bit_depth);
+                        let a = sample_to_u8(row, px, 1, 2, prep.bit_depth);
                         out[di] = gval;
                         out[di + 1] = gval;
                         out[di + 2] = gval;
                         out[di + 3] = a;
                     }
                     6 => {
-                        out[di] = sample_to_u8(row, px, 0, 4, bit_depth);
-                        out[di + 1] = sample_to_u8(row, px, 1, 4, bit_depth);
-                        out[di + 2] = sample_to_u8(row, px, 2, 4, bit_depth);
-                        out[di + 3] = sample_to_u8(row, px, 3, 4, bit_depth);
+                        out[di] = sample_to_u8(row, px, 0, 4, prep.bit_depth);
+                        out[di + 1] = sample_to_u8(row, px, 1, 4, prep.bit_depth);
+                        out[di + 2] = sample_to_u8(row, px, 2, 4, prep.bit_depth);
+                        out[di + 3] = sample_to_u8(row, px, 3, 4, prep.bit_depth);
                     }
                     _ => unreachable!(),
                 }
@@ -457,8 +526,8 @@ pub fn decode_png(
     }
 
     Ok(RawDecodedImage {
-        width,
-        height,
+        width: prep.width,
+        height: prep.height,
         format: out_format,
         source: SourceFormat::Png,
         data: out,
@@ -466,6 +535,71 @@ pub fn decode_png(
         delays_ms: Vec::new(),
         loop_count: 0,
     })
+}
+
+/// Decodes a PNG image to exact 16-bit grayscale height samples `[0..=65535]`.
+pub fn decode_png_gray_u16(
+    data: &[u8],
+    strict_crc: bool,
+    budget: Option<&Arc<BudgetCore>>,
+    deadline_check: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<(u32, u32, Vec<u16>), String> {
+    let (prep, _inflate_guard) = prepare_png(data, strict_crc, budget, deadline_check)?;
+    let w = prep.width as usize;
+    let h = prep.height as usize;
+    let px_count = w
+        .checked_mul(h)
+        .ok_or_else(|| err_limit("PNG u16 output size overflow"))?;
+    let mut out = vec![0u16; px_count];
+    let mut raw_offset = 0usize;
+
+    for &(x0, dx, y0, dy, pw, row_bytes) in &prep.passes {
+        let ph = (h - y0).div_ceil(dy);
+        let pass_len = (1 + row_bytes) * ph;
+        let unfiltered = unfilter_pass_scanlines(
+            &prep.raw[raw_offset..raw_offset + pass_len],
+            row_bytes,
+            ph,
+            prep.bpp_filter,
+        )?;
+        raw_offset += pass_len;
+
+        for py in 0..ph {
+            if (py & 255) == 0 {
+                check_deadline(deadline_check)?;
+            }
+            let row = &unfiltered[py * row_bytes..(py + 1) * row_bytes];
+            let dst_y = y0 + py * dy;
+            for px in 0..pw {
+                let dst_x = x0 + px * dx;
+                let di = dst_y * w + dst_x;
+                out[di] = match prep.color_type {
+                    0 | 4 => sample_to_u16(row, px, 0, prep.channels, prep.bit_depth),
+                    2 | 6 => {
+                        let r = sample_to_u16(row, px, 0, prep.channels, prep.bit_depth) as u32;
+                        let g = sample_to_u16(row, px, 1, prep.channels, prep.bit_depth) as u32;
+                        let b = sample_to_u16(row, px, 2, prep.channels, prep.bit_depth) as u32;
+                        ((r * 77 + g * 150 + b * 29) >> 8) as u16
+                    }
+                    3 => {
+                        let idx = if prep.bit_depth == 8 {
+                            row[px] as usize
+                        } else {
+                            unpack_sub_byte(row, px, prep.bit_depth) as usize
+                        };
+                        let c = *prep
+                            .palette
+                            .get(idx)
+                            .ok_or_else(|| err_corrupt("PNG palette index out of bounds"))?;
+                        let luma = ((c[0] as u32) * 77 + (c[1] as u32) * 150 + (c[2] as u32) * 29) >> 8;
+                        (luma * 257) as u16
+                    }
+                    _ => unreachable!(),
+                };
+            }
+        }
+    }
+    Ok((prep.width, prep.height, out))
 }
 
 pub fn decode_png_argb(data: &[u8]) -> Result<(i32, i32, Vec<u32>), String> {

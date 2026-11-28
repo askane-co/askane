@@ -6,7 +6,9 @@ use crate::ast::{AssignTarget, Expr, MatchArm, Pattern, Program, Stmt};
 #[allow(dead_code)]
 pub const ALL_CODES: &[&str] = &[
     "E0101", "E0201", "E0202", "E0301", "E0302", "E0401", "E0402", "E0403", "E0404", "E0405",
-    "E0501", "E0502", "E0503", "E0504", "E0505", "W0101", "W0102",
+    "E0501", "E0502", "E0503", "E0504", "E0505", "E0506", "E0507", "E0508", "E0509", "E0510",
+    "E0511", "E0512", "E0513", "E0514", "E0515", "E0520", "E0521", "E0530", "E0531", "E0532",
+    "E0533", "E0540", "E0550", "E0551", "E0552", "W0101", "W0102",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +106,57 @@ fn parse_location_tag(err: &str) -> (Option<usize>, Option<usize>, &str) {
 
 pub(crate) fn classify_code(msg: &str) -> &'static str {
     let low = msg.to_ascii_lowercase();
-    if low.contains("unterminated ")
+    if msg.contains("E_MEDIA_LIMIT") {
+        "E0501"
+    } else if msg.contains("E_MEDIA_UNSUPPORTED") {
+        "E0502"
+    } else if msg.contains("E_MEDIA_CORRUPT") {
+        "E0503"
+    } else if msg.contains("E_MEDIA_BAD_OPT") {
+        "E0504"
+    } else if msg.contains("E_MEDIA_NONDET") {
+        "E0505"
+    } else if msg.contains("E_AUDIO_BACKPRESSURE") {
+        "E0506"
+    } else if msg.contains("E_AUDIO_STREAM_UNSUPPORTED") {
+        "E0507"
+    } else if msg.contains("E_AUDIO_NONDET") {
+        "E0508"
+    } else if msg.contains("E_CAP_AUDIO") {
+        "E0509"
+    } else if msg.contains("E_ASSET_JSON") {
+        "E0510"
+    } else if msg.contains("E_ASSET_XML") {
+        "E0511"
+    } else if msg.contains("E_MESH_LIMIT") {
+        "E0512"
+    } else if msg.contains("E_MESH_CORRUPT") {
+        "E0513"
+    } else if msg.contains("E_MESH_CYCLE") {
+        "E0514"
+    } else if msg.contains("E_MESH_UNSUPPORTED") {
+        "E0515"
+    } else if msg.contains("E_TILED_UNSUPPORTED") {
+        "E0520"
+    } else if msg.contains("E_TILED_CORRUPT") {
+        "E0521"
+    } else if msg.contains("E_TERRAIN_LIMIT") {
+        "E0530"
+    } else if msg.contains("E_TERRAIN_CORRUPT") {
+        "E0531"
+    } else if msg.contains("E_TERRAIN_BAD_OPT") {
+        "E0532"
+    } else if msg.contains("E_SPLAT_INVALID") {
+        "E0533"
+    } else if msg.contains("E_CUBEMAP_INVALID") {
+        "E0540"
+    } else if msg.contains("E_LUT_INVALID") {
+        "E0550"
+    } else if msg.contains("E_NAV_INVALID") {
+        "E0551"
+    } else if msg.contains("E_SCENE_INVALID") {
+        "E0552"
+    } else if low.contains("unterminated ")
         || low.contains("unexpected character")
         || low.contains("invalid escape")
         || low.contains("unknown escape sequence")
@@ -183,16 +235,6 @@ pub(crate) fn classify_code(msg: &str) -> &'static str {
         || low.contains("cannot index ")
     {
         "E0403"
-    } else if msg.contains("E_MEDIA_LIMIT") {
-        "E0501"
-    } else if msg.contains("E_MEDIA_UNSUPPORTED") {
-        "E0502"
-    } else if msg.contains("E_MEDIA_CORRUPT") {
-        "E0503"
-    } else if msg.contains("E_MEDIA_BAD_OPT") {
-        "E0504"
-    } else if msg.contains("E_MEDIA_NONDET") {
-        "E0505"
     } else {
         "E0404"
     }

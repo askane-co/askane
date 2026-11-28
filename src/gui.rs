@@ -18,6 +18,7 @@ pub(crate) struct PermissionFlagsState {
     pub allow_exec: bool,
     pub allow_input: bool,
     pub allow_clipboard: bool,
+    pub allow_audio: bool,
 }
 
 pub(crate) fn find_project_root_for(file: &Path) -> PathBuf {
@@ -154,6 +155,7 @@ pub(crate) fn gui_flag_allowed(flag: &str) -> bool {
             c == '"' || c == '\r' || c == '\n' || c == '&' || c == '|' || c == '<' || c == '>'
         })
         && (flag == "--allow-args"
+            || flag == "--allow-audio"
             || flag == "--allow-clipboard"
             || flag == "--allow-exec"
             || flag == "--allow-input"
@@ -212,6 +214,9 @@ pub(crate) fn compose_permission_flags(
     }
     if perms.allow_clipboard {
         out.push("--allow-clipboard".to_string());
+    }
+    if perms.allow_audio {
+        out.push("--allow-audio".to_string());
     }
     for flag in extra_flags.split_whitespace() {
         if !gui_flag_allowed(flag) {
@@ -1025,6 +1030,7 @@ mod win32_gui {
             allow_exec: is_checked(state.hwnd_chk_exec),
             allow_input: is_checked(state.hwnd_chk_input),
             allow_clipboard: is_checked(state.hwnd_chk_clip),
+            allow_audio: false,
         }
     }
 

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::media::audio::wav::decode_wav_sound;
 use crate::media::cache::{
     bundle_list_entries, cache_stats, load_image_cached, load_texture_cached, mount_bundle_bytes,
     mount_bundle_file, read_asset_bytes, reset_cache, run_cache_gc, set_cache_budget,
@@ -8,6 +9,7 @@ use crate::media::cache::{
 };
 use crate::media::err_bad_opt;
 use crate::media::image::{ColorSpace, DecodeOpts, Filter, WrapMode, parse_decode_opts};
+use crate::modules::audio::parse_loop_override_opt;
 use crate::modules::build_module;
 use crate::value::Value;
 use crate::vm::VM;
@@ -18,6 +20,8 @@ pub fn module() -> Value {
         &[
             ("load_image", assets_load_image),
             ("load_texture", assets_load_texture),
+            ("load_sound", assets_load_sound),
+            ("sound", assets_load_sound),
             ("read_bytes", assets_read_bytes),
             ("read_text", assets_read_text),
             ("exists", assets_exists),
@@ -159,6 +163,22 @@ fn assets_load_texture(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         opts.srgb,
     )?;
     Ok(Value::Texture(tex))
+}
+
+fn assets_load_sound(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(err_bad_opt("assets.load_sound() expects (path, [opts])"));
+    }
+    let path = expect_str(&args[0], "assets.load_sound()")?;
+    let loop_override = parse_loop_override_opt(args.get(1))?;
+    let (bytes, _, _) = read_asset_bytes(vm, path)?;
+    let snd = decode_wav_sound(
+        &bytes,
+        loop_override,
+        Some(vm.budget_core()),
+        Some(&|| vm.check_timeout()),
+    )?;
+    Ok(Value::Sound(Rc::new(snd)))
 }
 
 fn assets_read_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {

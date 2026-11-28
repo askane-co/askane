@@ -46,7 +46,7 @@ pub(crate) fn encode_bytes(input: &[u8], alphabet: &[u8; 64], pad: bool) -> Stri
     out
 }
 
-fn decode_str(input: &str, url_safe: bool) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_str(input: &str, url_safe: bool) -> Result<Vec<u8>, String> {
     let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if bytes.is_empty() {
         return Ok(Vec::new());

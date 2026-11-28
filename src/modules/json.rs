@@ -184,19 +184,55 @@ fn write_json_string(s: &str, out: &mut String) {
 
 const MAX_JSON_DEPTH: usize = 128;
 
+pub(crate) fn parse_limited(
+    raw: &str,
+    max_nodes: usize,
+    max_depth: usize,
+    max_scalar_bytes: usize,
+    deadline: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<Value, String> {
+    let mut parser = JsonParser::with_limits(raw, max_nodes, max_depth, max_scalar_bytes, deadline);
+    let val = parser.parse_value()?;
+    parser.skip_ws();
+    if !parser.is_eof() {
+        return Err("E_ASSET_JSON: trailing characters after JSON value".to_string());
+    }
+    Ok(val)
+}
+
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     depth: usize,
+    max_depth: usize,
+    nodes: usize,
+    max_nodes: usize,
+    max_scalar_bytes: usize,
+    deadline: Option<&'a dyn Fn() -> Result<(), String>>,
     intern_cache: FastMap<&'a str, Rc<String>>,
 }
 
 impl<'a> JsonParser<'a> {
     fn new(input: &'a str) -> Self {
+        Self::with_limits(input, usize::MAX, MAX_JSON_DEPTH, usize::MAX, None)
+    }
+
+    fn with_limits(
+        input: &'a str,
+        max_nodes: usize,
+        max_depth: usize,
+        max_scalar_bytes: usize,
+        deadline: Option<&'a dyn Fn() -> Result<(), String>>,
+    ) -> Self {
         Self {
             bytes: input.as_bytes(),
             pos: 0,
             depth: 0,
+            max_depth,
+            nodes: 0,
+            max_nodes,
+            max_scalar_bytes,
+            deadline,
             intern_cache: HashMap::with_hasher(FxBuildHasher),
         }
     }
@@ -241,11 +277,23 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_value(&mut self) -> Result<Value, String> {
-        self.depth += 1;
-        if self.depth > MAX_JSON_DEPTH {
+        self.nodes += 1;
+        if self.nodes > self.max_nodes {
             return Err(format!(
-                "json.parse(): maximum nesting depth ({}) exceeded",
-                MAX_JSON_DEPTH
+                "E_ASSET_JSON: maximum JSON node count ({}) exceeded",
+                self.max_nodes
+            ));
+        }
+        if (self.nodes & 4095) == 0 {
+            if let Some(check) = self.deadline {
+                check()?;
+            }
+        }
+        self.depth += 1;
+        if self.depth > self.max_depth {
+            return Err(format!(
+                "E_ASSET_JSON: maximum nesting depth ({}) exceeded",
+                self.max_depth
             ));
         }
         self.skip_ws();
@@ -257,6 +305,13 @@ impl<'a> JsonParser<'a> {
             b't' | b'f' => self.parse_bool(),
             b'"' => {
                 let s = self.parse_string_cow()?;
+                if s.len() > self.max_scalar_bytes {
+                    return Err(format!(
+                        "E_ASSET_JSON: string value ({} bytes) exceeds {} byte limit",
+                        s.len(),
+                        self.max_scalar_bytes
+                    ));
+                }
                 Ok(Value::Str(self.intern_str(s)))
             }
             b'[' => self.parse_array(),

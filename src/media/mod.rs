@@ -1,5 +1,6 @@
 pub mod anim;
 pub mod atlas;
+pub mod audio;
 pub mod cache;
 pub mod color;
 pub mod compose;

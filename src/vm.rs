@@ -269,6 +269,7 @@ pub struct Permissions {
     pub allow_sys_args: bool,
     pub allow_clipboard: bool,
     pub allow_input: bool,
+    pub allow_audio: bool,
     pub allow_exec: Option<Vec<String>>,
     pub max_instructions: Option<u64>,
     pub max_duration_ms: Option<u64>,
@@ -300,6 +301,7 @@ impl Permissions {
             allow_sys_args: false,
             allow_clipboard: false,
             allow_input: false,
+            allow_audio: false,
             allow_exec: None,
             max_instructions: Some(10_000_000),
             max_duration_ms: Some(30_000),
@@ -320,6 +322,7 @@ impl Permissions {
             allow_sys_args: true,
             allow_clipboard: true,
             allow_input: true,
+            allow_audio: true,
             allow_exec: Some(Vec::new()),
             max_instructions: None,
             max_duration_ms: None,
@@ -480,6 +483,11 @@ impl VM {
 
     pub fn set_bytecode_cache(&mut self, enabled: bool) {
         self.use_bytecode_cache = enabled;
+    }
+
+    #[inline]
+    pub fn use_bytecode_cache(&self) -> bool {
+        self.use_bytecode_cache
     }
 
     pub fn can_write_cache_for(&self, source_path: &Path) -> bool {
@@ -678,6 +686,12 @@ impl VM {
             }
         }
         Ok(())
+    }
+
+    pub fn remaining_timeout_ms(&self) -> Option<u64> {
+        self.permissions
+            .max_duration_ms
+            .map(|limit| limit.saturating_sub(self.current_clock_ms()))
     }
 
     #[inline]
@@ -902,6 +916,16 @@ impl VM {
                 "global input access is disabled in sandbox mode (pass --allow-input or --unsafe)"
                     .to_string(),
             )
+        }
+    }
+
+    pub fn check_audio(&self) -> Result<(), String> {
+        if self.permissions.allow_all || self.permissions.allow_audio {
+            Ok(())
+        } else {
+            Err(crate::media::audio::err_cap_audio(
+                "audio device access is disabled in sandbox mode (pass --allow-audio or --unsafe)",
+            ))
         }
     }
 
@@ -1769,7 +1793,7 @@ impl VM {
                     attr
                 )),
             },
-            Value::Str(_) | Value::List(_) | Value::Set(_) | Value::Bytes(_) => {
+            Value::Str(_) | Value::List(_) | Value::Set(_) | Value::Bytes(_) | Value::Sound(_) => {
                 if let Some((name, func)) = resolve_builtin_method(&obj, attr) {
                     Ok(Value::BoundMethod(Rc::new(BoundMethod {
                         receiver: obj,
@@ -4911,6 +4935,16 @@ impl VM {
                         }
                         _ => return Err("sandbox 'args' policy must be bool".to_string()),
                     },
+                    "audio" => match v {
+                        Value::Bool(false) | Value::Unit => next.allow_audio = false,
+                        Value::Bool(true) => {
+                            self.check_audio().map_err(|_| {
+                                "sandbox cannot escalate audio access".to_string()
+                            })?;
+                            next.allow_audio = true;
+                        }
+                        _ => return Err("sandbox 'audio' policy must be bool".to_string()),
+                    },
                     "timeout" => match v {
                         Value::Int(ms) if *ms > 0 => {
                             let elapsed = self.run_start.elapsed().as_millis() as u64;
@@ -7546,6 +7580,10 @@ fn native_check_needs(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 vm.check_sys_args()
                     .map_err(|e| format!("Contract failed ('needs args'): {}", e))?;
             }
+            "audio" => {
+                vm.check_audio()
+                    .map_err(|e| format!("Contract failed ('needs audio'): {}", e))?;
+            }
             other => {
                 return Err(format!(
                     "Unknown capability '{}' in 'needs' contract",
@@ -7576,6 +7614,10 @@ fn native_close_resource(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             {
                 vm.call_value(c, &[])?;
             }
+            Ok(Value::Unit)
+        }
+        Value::Sound(snd) => {
+            snd.close();
             Ok(Value::Unit)
         }
         _ => Ok(Value::Unit),
@@ -7908,6 +7950,15 @@ fn resolve_builtin_method(
             "get" => Some(("dict.get", native_get)),
             "remove" => Some(("dict.remove", native_remove)),
             "len" => Some(("dict.len", native_len)),
+            _ => None,
+        },
+        Value::Sound(_) => match attr {
+            "duration_ms" => Some(("sound.duration_ms", crate::modules::audio::snd_duration_ms)),
+            "sample_rate" => Some(("sound.sample_rate", crate::modules::audio::snd_sample_rate)),
+            "channels" => Some(("sound.channels", crate::modules::audio::snd_channels)),
+            "frames" => Some(("sound.frames", crate::modules::audio::snd_frames)),
+            "digest" => Some(("sound.digest", crate::modules::audio::snd_digest)),
+            "close" => Some(("sound.close", crate::modules::audio::snd_close)),
             _ => None,
         },
         _ => None,

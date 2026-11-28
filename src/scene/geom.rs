@@ -244,6 +244,11 @@ impl Vec3 {
     pub fn max(self, o: Self) -> Self {
         Self::new(self.x.max(o.x), self.y.max(o.y), self.z.max(o.z))
     }
+
+    #[inline]
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
 }
 
 /// 4D homogeneous vector.
@@ -789,6 +794,54 @@ impl Transform {
             rotation: self.rotation.mul(child.rotation).normalize(),
             scale: self.scale.mul_comp(child.scale),
         }
+    }
+
+    pub fn from_mat4(mat: &Mat4) -> Result<Self, String> {
+        let m = &mat.m;
+        if m.iter().any(|x| !x.is_finite()) {
+            return Err("E_MESH_CORRUPT: transform matrix contains non-finite value".to_string());
+        }
+        let pos = Vec3::new(m[12], m[13], m[14]);
+        let mut sx = Vec3::new(m[0], m[1], m[2]).len();
+        let sy = Vec3::new(m[4], m[5], m[6]).len();
+        let sz = Vec3::new(m[8], m[9], m[10]).len();
+        if sx <= 1e-7 || sy <= 1e-7 || sz <= 1e-7 {
+            return Err("E_MESH_CORRUPT: singular transform matrix scale".to_string());
+        }
+        let det3 = m[0] * (m[5] * m[10] - m[6] * m[9])
+            - m[4] * (m[1] * m[10] - m[2] * m[9])
+            + m[8] * (m[1] * m[6] - m[2] * m[5]);
+        if det3 < 0.0 {
+            sx = -sx;
+        }
+        let r00 = m[0] / sx;
+        let r10 = m[1] / sx;
+        let r20 = m[2] / sx;
+        let r01 = m[4] / sy;
+        let r11 = m[5] / sy;
+        let r21 = m[6] / sy;
+        let r02 = m[8] / sz;
+        let r12 = m[9] / sz;
+        let r22 = m[10] / sz;
+        let trace = r00 + r11 + r22;
+        let quat = if trace > 0.0 {
+            let s = (trace + 1.0).sqrt() * 2.0;
+            Quat::new((r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s, 0.25 * s)
+        } else if r00 > r11 && r00 > r22 {
+            let s = (1.0 + r00 - r11 - r22).sqrt() * 2.0;
+            Quat::new(0.25 * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s)
+        } else if r11 > r22 {
+            let s = (1.0 + r11 - r00 - r22).sqrt() * 2.0;
+            Quat::new((r01 + r10) / s, 0.25 * s, (r12 + r21) / s, (r02 - r20) / s)
+        } else {
+            let s = (1.0 + r22 - r00 - r11).sqrt() * 2.0;
+            Quat::new((r02 + r20) / s, (r12 + r21) / s, 0.25 * s, (r10 - r01) / s)
+        };
+        Ok(Self {
+            position: pos,
+            rotation: quat.normalize(),
+            scale: Vec3::new(sx, sy, sz),
+        })
     }
 }
 

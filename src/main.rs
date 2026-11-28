@@ -1,5 +1,6 @@
 #[forbid(unsafe_code)]
 mod ast;
+mod audio_backend;
 #[forbid(unsafe_code)]
 mod budget;
 #[forbid(unsafe_code)]
@@ -1024,7 +1025,9 @@ fn inspect_permissions_file(
                     "ui" => Some("ui (declarative 2D Win32 GUI window & widgets)"),
                     "process" => Some("process (blocked by default; requires --allow-exec[=cmd])"),
                     "dialog" => Some("dialog (Win32 modal message/file dialogs)"),
-                    "audio" => Some("audio (Win32 WAV playback, sandbox-checked)"),
+                    "audio" => Some(
+                        "audio (multi-channel mixer requires --allow-audio; legacy play(path)/stop() work under --allow-read [legacy])",
+                    ),
                     "mem" => Some("mem (requires --unsafe and ASKANE_ENABLE_UNSAFE_MEM=1)"),
                     "gfx" => Some("gfx (Win32 GUI window)"),
                     _ => None,
@@ -1884,6 +1887,7 @@ fn print_help() {
     println!("  --allow-args                        Allow sys.args() / os.args()");
     println!("  --allow-clipboard                   Allow clipboard.get_text() / set_text()");
     println!("  --allow-input                       Allow global keyboard/mouse state in input");
+    println!("  --allow-audio                       Allow multi-channel audio device/engine access");
     println!("  --allow-exec[=cmds]                 Allow process.run()");
     println!(
         "  --max-steps=N                       Override sandbox instruction budget (default 10000000)"
@@ -2090,7 +2094,12 @@ fn clean_dir_walk(
                 continue;
             }
             clean_dir_walk(&p, dry_run, include_snapshots, removed, depth + 1)?;
-            if name == "__askcache__" && !dry_run {
+            let is_assets_sub = p
+                .parent()
+                .and_then(|par| par.file_name())
+                .and_then(|fnm| fnm.to_str())
+                == Some("__askcache__");
+            if (name == "__askcache__" || is_assets_sub) && !dry_run {
                 if let Ok(mut rd) = fs::read_dir(&p) {
                     if rd.next().is_none() {
                         let _ = fs::remove_dir(&p);
@@ -2099,6 +2108,7 @@ fn clean_dir_walk(
             }
         } else if meta.is_file() {
             let is_tmp = name.ends_with(".askc")
+                || name.ends_with(".askas")
                 || name.starts_with("_askane_tmp_")
                 || (name.ends_with(".tmp") && name.starts_with("askane_"));
             if is_tmp {
@@ -3143,6 +3153,8 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
             perms.allow_clipboard = true;
         } else if arg == "--allow-input" {
             perms.allow_input = true;
+        } else if arg == "--allow-audio" {
+            perms.allow_audio = true;
         } else if arg == "--allow-exec" {
             append_csv(&mut perms.allow_exec, None);
         } else if let Some(val) = arg.strip_prefix("--allow-exec=") {
@@ -7211,6 +7223,7 @@ archive.extract(z, "out")
             allow_exec: false,
             allow_input: true,
             allow_clipboard: false,
+            allow_audio: false,
         };
         let flags = gui::compose_permission_flags(
             &perms,
@@ -7661,7 +7674,7 @@ sum_tail(5000, 0)
         let tco_res = VM::new().run(compile_source(tco_src).unwrap()).unwrap();
         assert!(tco_res.equals(&Value::Int(5000)));
 
-        assert_eq!(modules::BUILTIN_MODULE_NAMES.len(), 54);
+        assert_eq!(modules::BUILTIN_MODULE_NAMES.len(), 63);
         for &m in modules::BUILTIN_MODULE_NAMES {
             assert!(
                 modules::get_builtin_module(m).is_some(),
@@ -10409,5 +10422,592 @@ true
         fuzz_budget = std::sync::Arc::new(budget::BudgetCore::default());
         assert_eq!(fuzz_budget.used_bytes(), 0);
         modules::reset_runtime_state();
+    }
+
+    #[test]
+    fn test_v020_stage4_audio_codecs_mixer_synth_and_offline() {
+        use std::sync::Arc;
+
+        modules::reset_runtime_state();
+        assert_eq!(std::mem::size_of::<value::Value>(), 16);
+
+        // Diagnostic codes & classification for Stage 4 errors
+        for code in ["E0506", "E0507", "E0508", "E0509"] {
+            assert!(
+                diag::ALL_CODES.contains(&code),
+                "ALL_CODES missing Stage 4 code {}",
+                code
+            );
+        }
+        assert_eq!(diag::classify_code("E_AUDIO_BACKPRESSURE: queue full"), "E0506");
+        assert_eq!(
+            diag::classify_code("E_AUDIO_STREAM_UNSUPPORTED: ogg not supported"),
+            "E0507"
+        );
+        assert_eq!(diag::classify_code("E_AUDIO_NONDET: realtime sink"), "E0508");
+        assert_eq!(
+            diag::classify_code(
+                "E_CAP_AUDIO: audio device access is disabled in sandbox mode (pass --allow-audio or --unsafe)"
+            ),
+            "E0509"
+        );
+
+        // Helper: build valid RIFF/WAVE file from arbitrary format header + chunks
+        fn make_wav(
+            fmt_body: &[u8],
+            data_chunk: &[u8],
+            extra_chunks: &[(&[u8; 4], &[u8])],
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(b"WAVE");
+            body.extend_from_slice(b"fmt ");
+            body.extend_from_slice(&(fmt_body.len() as u32).to_le_bytes());
+            body.extend_from_slice(fmt_body);
+            if (fmt_body.len() & 1) == 1 {
+                body.push(0);
+            }
+            for (tag, payload) in extra_chunks {
+                body.extend_from_slice(*tag);
+                body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                body.extend_from_slice(payload);
+                if (payload.len() & 1) == 1 {
+                    body.push(0);
+                }
+            }
+            body.extend_from_slice(b"data");
+            body.extend_from_slice(&(data_chunk.len() as u32).to_le_bytes());
+            body.extend_from_slice(data_chunk);
+            if (data_chunk.len() & 1) == 1 {
+                body.push(0);
+            }
+            let mut out = Vec::with_capacity(8 + body.len());
+            out.extend_from_slice(b"RIFF");
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+            out
+        }
+
+        fn pcm_fmt(tag: u16, ch: u16, sr: u32, block_align: u16, bits: u16) -> Vec<u8> {
+            let mut b = Vec::with_capacity(16);
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ch.to_le_bytes());
+            b.extend_from_slice(&sr.to_le_bytes());
+            b.extend_from_slice(&(sr.saturating_mul(block_align as u32)).to_le_bytes());
+            b.extend_from_slice(&block_align.to_le_bytes());
+            b.extend_from_slice(&bits.to_le_bytes());
+            b
+        }
+
+        let budget = Arc::new(budget::BudgetCore::new(
+            Some(8 * 1024 * 1024),
+            Some(16 * 1024 * 1024),
+        ));
+
+        // 1) Decode PCM u8 (22050 Hz mono), s16 + smpl loop points (44100 stereo), s24, s32, f32, A-law, u-law, IMA ADPCM
+        {
+            let u8_data = [128u8, 200, 50, 128].repeat(50);
+            let u8_wav = make_wav(&pcm_fmt(1, 1, 22050, 1, 8), &u8_data, &[]);
+            let snd_u8 = crate::media::audio::wav::decode_wav_sound(
+                &u8_wav,
+                None,
+                Some(&budget),
+                None,
+            )
+            .unwrap();
+            assert!(snd_u8.frames > 300);
+            assert!(snd_u8.byte_len() > 0);
+            assert!(format!("{}", value::Value::Sound(std::rc::Rc::new(snd_u8))).starts_with("<sound "));
+
+            // smpl chunk with 1 loop: manufacturer=0, product=0, period=22675, unity=60, frac=0, fmt=0, ofs=0, num_loops=1, sampler_data=0
+            // loop: id=0, type=0, start=10, end=80, frac=0, play_count=0
+            let mut smpl = Vec::new();
+            for v in [0u32, 0, 22675, 60, 0, 0, 0, 1, 0, 0, 0, 10, 80, 0, 0] {
+                smpl.extend_from_slice(&v.to_le_bytes());
+            }
+            let s16_data: Vec<u8> = (0..400i32)
+                .flat_map(|i| {
+                    let s = (((i * 300) % 10000) as i16).to_le_bytes();
+                    [s[0], s[1], s[0], s[1]]
+                })
+                .collect();
+            let s16_wav = make_wav(&pcm_fmt(1, 2, 44100, 4, 16), &s16_data, &[(b"smpl", &smpl)]);
+            let snd_s16 = crate::media::audio::wav::decode_wav_sound(
+                &s16_wav,
+                None,
+                Some(&budget),
+                None,
+            )
+            .unwrap();
+            assert!(snd_s16.loop_points.is_some());
+
+            let s24_data: Vec<u8> = (0..120).flat_map(|i| [0u8, (i as u8), 0x40]).collect();
+            let s24_wav = make_wav(&pcm_fmt(1, 1, 48000, 3, 24), &s24_data, &[]);
+            let snd_s24 = crate::media::audio::wav::decode_wav_sound(&s24_wav, None, Some(&budget), None).unwrap();
+            assert_eq!(snd_s24.frames, 120);
+
+            let s32_data: Vec<u8> = (0..120i32).flat_map(|i| (i * 1_000_000).to_le_bytes()).collect();
+            let s32_wav = make_wav(&pcm_fmt(1, 1, 48000, 4, 32), &s32_data, &[]);
+            let snd_s32 = crate::media::audio::wav::decode_wav_sound(&s32_wav, None, Some(&budget), None).unwrap();
+            assert_eq!(snd_s32.frames, 120);
+
+            let f32_data: Vec<u8> = (0..160)
+                .flat_map(|i| {
+                    let v = ((i as f32) / 160.0) - 0.5;
+                    let b = v.to_le_bytes();
+                    [b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3]]
+                })
+                .collect();
+            let f32_wav = make_wav(&pcm_fmt(3, 2, 24000, 8, 32), &f32_data, &[]);
+            let snd_f32 = crate::media::audio::wav::decode_wav_sound(&f32_wav, None, Some(&budget), None).unwrap();
+            assert_eq!(snd_f32.frames, 320);
+
+            let alaw_data = [0xD5u8, 0x2A, 0x55].repeat(40);
+            let alaw_wav = make_wav(&pcm_fmt(6, 1, 8000, 1, 8), &alaw_data, &[]);
+            let snd_alaw = crate::media::audio::wav::decode_wav_sound(&alaw_wav, None, Some(&budget), None).unwrap();
+            assert!(snd_alaw.frames > 500);
+
+            let mulaw_data = [0xFFu8, 0x7F, 0x80].repeat(40);
+            let mulaw_wav = make_wav(&pcm_fmt(7, 1, 8000, 1, 8), &mulaw_data, &[]);
+            let snd_mulaw = crate::media::audio::wav::decode_wav_sound(&mulaw_wav, None, Some(&budget), None).unwrap();
+            assert!(snd_mulaw.frames > 500);
+
+            // IMA ADPCM mono (tag=0x11, block_align=36, bits=4, cbSize=2, samples_per_block=65)
+            let mut ima_fmt = pcm_fmt(0x0011, 1, 22050, 36, 4);
+            ima_fmt.extend_from_slice(&2u16.to_le_bytes()); // cbSize
+            ima_fmt.extend_from_slice(&65u16.to_le_bytes()); // samplesPerBlock
+            let mut ima_blk = vec![0u8; 36 * 2];
+            // Block 0 & Block 1: header [predictor_i16le=500, step_idx=10, reserved=0]
+            for blk_i in 0..2 {
+                let off = blk_i * 36;
+                ima_blk[off..off + 2].copy_from_slice(&500i16.to_le_bytes());
+                ima_blk[off + 2] = 10;
+                ima_blk[off + 3] = 0;
+                for j in 4..36 {
+                    ima_blk[off + j] = ((j * 13) & 0xFF) as u8;
+                }
+            }
+            let ima_wav = make_wav(&ima_fmt, &ima_blk, &[]);
+            let snd_ima = crate::media::audio::wav::decode_wav_sound(&ima_wav, None, Some(&budget), None).unwrap();
+            assert!(snd_ima.frames > 200);
+        }
+        assert_eq!(budget.used_bytes(), 0);
+
+        // 2) Stage 4 Askane sandboxed offline synth + from_samples + render_offline + deterministic SHA-256 + VFS ZIP asset
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "askane_stage4_offline_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        // Write test WAV + ZIP bundle for assets.load_sound
+        let sample_wav = crate::media::audio::wav::encode_wav_s16le(&vec![0.25f32; 4800 * 2], 48_000);
+        std::fs::write(tmp_dir.join("tone_file.wav"), &sample_wav).unwrap();
+
+        let script = r#"
+import audio;
+import assets;
+import archive;
+import buffer;
+import hash;
+import json;
+import test;
+
+let t_sin = audio.tone(440.0, 120, #{ waveform: "sine", volume: 0.6, pan: -0.25, attack_ms: 5, release_ms: 10 });
+let t_sq = audio.tone(220.0, 60, #{ waveform: "square", volume: 0.4 });
+let t_tri = audio.tone(330.0, 60, #{ waveform: "triangle" });
+let t_saw = audio.tone(550.0, 60, #{ waveform: "saw" });
+test.assert_eq(type_of(t_sin), "sound");
+test.assert_eq(t_sin.sample_rate(), 48000);
+test.assert_eq(t_sin.channels(), 2);
+test.assert_eq(t_sin.duration_ms(), 120);
+test.assert_eq(t_sin.frames(), 5760);
+test.assert(t_sq.frames() == 2880 && t_tri.frames() == 2880 && t_saw.frames() == 2880);
+test.assert_err(|| json.stringify(t_sin));
+
+let n_w = audio.noise(50, #{ color: "white", seed: 12345 });
+let n_p = audio.noise(50, #{ color: "pink", seed: 12345 });
+test.assert_ne(n_w.digest(), n_p.digest());
+
+let from_l = audio.from_samples([0.0, 0.5, -0.5, 0.25], 24000, 1);
+test.assert_eq(from_l.frames(), 8);
+
+let buf = buffer.new("f32", 480);
+buffer.fill(buf, 0.2);
+let from_b = audio.from_samples(buf, #{ sample_rate: 48000, channels: 1 });
+test.assert_eq(from_b.frames(), 480);
+
+let rendered_a = audio.render_offline(t_sin, #{ volume: 0.8, pan: 0.2, pitch: 1.25, "loop": true, loop_start: 100, loop_end: 2000, duration_ms: 150 });
+let rendered_n = audio.render_offline(n_p, #{ volume: 0.5 });
+test.assert(len(rendered_a) > 44);
+let decoded_back = audio.load(rendered_a);
+test.assert_eq(decoded_back.duration_ms(), 150);
+
+let disk_s = audio.load("tone_file.wav");
+test.assert_eq(disk_s.duration_ms(), 100);
+let zip_b = archive.pack(#{ "sfx/ping.wav": rendered_a });
+let mid = assets.mount_bytes(zip_b, "pack");
+let vfs_s = assets.load_sound("pack/sfx/ping.wav");
+test.assert_eq(vfs_s.duration_ms(), 150);
+assets.unmount(mid);
+
+let _ = with audio.tone(440.0, 20) as scoped_s {
+    test.assert_eq(scoped_s.frames(), 960);
+};
+
+[hash.sha256(rendered_a), hash.sha256(rendered_n)]
+"#;
+
+        let run_det = |dir: &std::path::Path| -> (String, String) {
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_permissions(Permissions::sandboxed()); // Strict default sandbox (NO --allow-audio!)
+            vm.set_deterministic(true);
+            vm.set_current_dir(dir.to_path_buf());
+            vm.set_sandbox_root(dir.to_path_buf());
+            let res = vm.run(compile_source(script).unwrap()).unwrap();
+            let value::Value::List(items) = res else {
+                panic!("expected hash list");
+            };
+            let bor = items.borrow();
+            (
+                bor[0].as_str().unwrap().to_string(),
+                bor[1].as_str().unwrap().to_string(),
+            )
+        };
+
+        let (h1_a, h1_n) = run_det(&tmp_dir);
+        let (h2_a, h2_n) = run_det(&tmp_dir);
+        assert_eq!(h1_a, h2_a, "offline tone render must be bit-identical");
+        assert_eq!(h1_n, h2_n, "offline pink noise render must be bit-identical");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        modules::reset_runtime_state();
+    }
+
+    #[test]
+    fn test_v020_stage4_audio_backends_timeout_caps_and_fuzz() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        modules::reset_runtime_state();
+
+        // 1) Capabilities matrix: sandbox blocks new device APIs (E_CAP_AUDIO / E0509),
+        //    allows legacy play(path)/stop() under sandbox read, and sandbox { audio: false } attenuates.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "askane_stage4_caps_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let wav_path = tmp_dir.join("legacy.wav");
+        let wav_bytes = crate::media::audio::wav::encode_wav_s16le(&vec![0.1f32; 4800 * 2], 48_000);
+        std::fs::write(&wav_path, &wav_bytes).unwrap();
+
+        // Check `askane permissions` metadata mentions `[legacy]` for audio
+        let perm_probe = tmp_dir.join("probe_audio.ask");
+        std::fs::write(&perm_probe, "import audio;\n").unwrap();
+        let mut visited_perms = std::collections::HashSet::new();
+        let mut caps = Vec::new();
+        inspect_permissions_file(&perm_probe, &mut visited_perms, &mut caps, 0).unwrap();
+        assert!(
+            caps.iter().any(|c| c.contains("--allow-audio") && c.contains("legacy")),
+            "expected [legacy] note in capabilities: {:?}",
+            caps
+        );
+
+        let sandbox_gate_script = r#"
+import audio;
+import test;
+
+let snd = audio.tone(440.0, 80);
+test.assert_err(|| audio.init(#{ sink: "virtual" }));
+test.assert_err(|| audio.bus("sfx"));
+test.assert_err(|| audio.play(snd));
+test.assert_err(|| audio.play_at(snd, [1.0, 0.0, 0.0]));
+test.assert_err(|| audio.tick(10));
+test.assert_err(|| sandbox(audio: true) { 1 });
+
+// Legacy play(path) + stop() work inside read sandbox without --allow-audio
+let legacy_v = audio.play("legacy.wav");
+audio.stop();
+type_of(legacy_v)
+"#;
+        {
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_permissions(Permissions::sandboxed());
+            vm.set_current_dir(tmp_dir.clone());
+            vm.set_sandbox_root(tmp_dir.clone());
+            let r = vm.run(compile_source(sandbox_gate_script).unwrap()).unwrap();
+            assert_eq!(r.as_str(), Some("AudioVoice"));
+        }
+        modules::reset_runtime_state();
+
+        // `needs audio` fails in sandbox, succeeds with `--allow-audio`, and `sandbox { audio: false }` blocks
+        let needs_err = {
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_permissions(Permissions::sandboxed());
+            vm.run(compile_source("needs audio;\n1").unwrap())
+                .unwrap_err()
+        };
+        assert!(needs_err.contains("E_CAP_AUDIO"), "got {}", needs_err);
+
+        let atten_script = r#"
+needs audio;
+import audio;
+import test;
+test.assert_err(|| sandbox(audio: false) {
+    audio.init(#{ sink: "virtual" });
+});
+true
+"#;
+        {
+            let mut perms = Permissions::sandboxed();
+            perms.allow_audio = true;
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_permissions(perms);
+            let r = vm.run(compile_source(atten_script).unwrap()).unwrap();
+            assert!(r.equals(&value::Value::Bool(true)));
+        }
+        modules::reset_runtime_state();
+
+        // 2) Virtual mixer, buses, fades, 3D listener, pause invariance, backpressure, streaming & seek
+        let engine_script = r#"
+import audio;
+import test;
+
+let st0 = audio.init(#{ sink: "virtual", max_voices: 4 });
+test.assert(st0["initialized"]);
+test.assert_eq(st0["backend"], "virtual");
+test.assert_eq(audio.sink_name(), "virtual");
+
+let b = audio.bus_new("sfx", #{ volume: 0.75, lowpass: 1800 });
+test.assert_eq(b.name(), "sfx");
+test.assert(!b.muted());
+b.set_mute(true);
+test.assert(b.muted());
+b.set_mute(false);
+audio.bus_set_effect(b, #{ type: "lowpass", cutoff_hz: 2400 });
+
+let snd = audio.tone(440.0, 200);
+let v1 = audio.play(snd, #{ bus: b, volume: 0.8, pan: -0.3, pitch: 1.0, fade_in_ms: 10 });
+test.assert(v1.is_playing());
+let t1 = audio.tick(50);
+test.assert_eq(t1, 50);
+test.assert_eq(audio.clock_ms(), 50);
+let p_before_pause = v1.position_ms();
+test.assert(p_before_pause > 0);
+
+audio.pause_all();
+audio.tick(60);
+test.assert_eq(v1.position_ms(), p_before_pause);
+audio.resume_all();
+audio.tick(20);
+test.assert(v1.position_ms() > p_before_pause);
+
+v1.fade_to(0.0, 20, true);
+audio.tick(30);
+test.assert(!v1.is_playing());
+
+audio.set_listener(#{ pos: [0.0, 0.0, 0.0], forward: [0.0, 0.0, -1.0], rolloff: 1.0, max_dist: 40.0 });
+let v3 = audio.play_at(snd, [4.0, 0.0, -2.0], #{ "loop": true });
+v3.set_pos3([1.0, 1.0, -1.0]);
+test.assert(v3.is_playing());
+v3.stop();
+audio.tick(10);
+test.assert(!v3.is_playing());
+
+// Overflow DropOldest on 4-voice cap + overflow Error
+let a = audio.play(snd);
+let c = audio.play(snd);
+let d = audio.play(snd);
+let e = audio.play(snd);
+test.assert_err(|| audio.play(snd, #{ on_full: "error" }));
+let stolen = audio.play(snd, #{ on_full: "drop_oldest", priority: 10 });
+test.assert(stolen.is_playing());
+audio.stop_all();
+audio.tick(5);
+
+// Stream WAV + seek + pause + close + unsupported OGG/FLAC/MP3 rejection
+let big_wav = audio.render_offline(audio.tone(330.0, 300));
+let stream_m = audio.stream(big_wav, #{ volume: 0.8 });
+with stream_m as m {
+    test.assert_eq(m.duration_ms(), 300);
+    let _mv = audio.play(m);
+    audio.tick(40);
+    test.assert_eq(m.state(), "playing");
+    m.seek(120);
+    m.pause();
+    test.assert_eq(m.state(), "paused");
+    m.resume();
+    test.assert_eq(m.state(), "playing");
+    m.stop();
+    test.assert_eq(m.state(), "idle");
+}
+
+test.assert_err(|| audio.stream(b"OggS\x00\x02"));
+test.assert_err(|| audio.stream(b"fLaC\x00\x00"));
+test.assert_err(|| audio.stream(b"ID3\x03\x00"));
+
+// Null sink under --deterministic auto selection works cleanly
+let st_null = audio.init(#{ sink: "null" });
+test.assert_eq(st_null["backend"], "null");
+let _errs = audio.poll_errors();
+audio.shutdown();
+true
+"#;
+        {
+            let mut perms = Permissions::sandboxed();
+            perms.allow_audio = true;
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_permissions(perms);
+            let r = vm.run(compile_source(engine_script).unwrap()).unwrap();
+            assert!(r.equals(&value::Value::Bool(true)));
+        }
+        modules::reset_runtime_state();
+
+        // 3) Nondeterministic realtime sink check under --deterministic
+        let mut rt_opts = crate::audio_backend::InitOpts::default();
+        rt_opts.sink = Some("waveout".to_string());
+        let rt_err = crate::audio_backend::init_engine(&rt_opts, true, None, None).unwrap_err();
+        assert!(rt_err.contains("E_AUDIO_NONDET"), "expected E_AUDIO_NONDET, got {}", rt_err);
+        modules::reset_runtime_state();
+
+        // Command queue backpressure (CMD_QUEUE_CAP = 256)
+        {
+            let mut v_opts = crate::audio_backend::InitOpts::default();
+            v_opts.sink = Some("virtual".to_string());
+            crate::audio_backend::init_engine(&v_opts, false, None, None).unwrap();
+            let mut hit_bp = false;
+            for _ in 0..300 {
+                if let Err(e) = crate::audio_backend::send_command(
+                    crate::media::audio::mixer::MixerCommand::SetBusVolume {
+                        bus_id: 0,
+                        volume: 1.0,
+                    },
+                ) {
+                    assert!(e.contains("E_AUDIO_BACKPRESSURE"), "got {}", e);
+                    hit_bp = true;
+                    break;
+                }
+            }
+            assert!(hit_bp, "expected command queue backpressure on >256 unqueued cmds");
+            modules::reset_runtime_state();
+        }
+
+        // 4) --timeout=200ms on throttled chunk_delay_ms decoder thread: clean abort + fast join <= 300ms
+        {
+            let mut perms = Permissions::sandboxed();
+            perms.allow_audio = true;
+            perms.max_duration_ms = Some(200);
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_permissions(perms);
+            let slow_script = r#"
+import audio;
+audio.init(#{ sink: "virtual" });
+let w = audio.render_offline(audio.tone(440.0, 200));
+let m = audio.stream(w, #{ chunk_delay_ms: 80 });
+audio.play(m);
+sleep(260);
+"#;
+            let t0 = Instant::now();
+            let res = vm.run(compile_source(slow_script).unwrap());
+            assert!(res.is_err(), "expected timeout error");
+            drop(vm);
+            modules::reset_runtime_state();
+            let elapsed_ms = t0.elapsed().as_millis();
+            assert!(
+                elapsed_ms < 800,
+                "slow stream cleanup took too long: {} ms",
+                elapsed_ms
+            );
+            assert_eq!(crate::audio_backend::get_state().leaked_threads, 0);
+        }
+
+        // 5) Malformed WAV / ADPCM / bomb rejection + 160-case fuzz loop with 0 budget leaks + idempotent reset
+        let fuzz_budget = Arc::new(budget::BudgetCore::new(
+            Some(4 * 1024 * 1024),
+            Some(8 * 1024 * 1024),
+        ));
+        let bad_inputs: Vec<Vec<u8>> = vec![
+            vec![],
+            b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00".to_vec(), // sr=0
+            b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\xff\xff\x80\xbb\x00\x00\x00\x00\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00".to_vec(), // ch=65535
+            b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\xbb\x00\x00\x00\x00\x00\x00\x02\x00\x0c\x00data\x00\x00\x00\x00".to_vec(), // bits=12
+            b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\xbb\x00\x00\x00\x00\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff".to_vec(), // data bomb
+            b"RIFF\x28\x00\x00\x00WAVEfmt \x14\x00\x00\x00\x11\x00\x01\x00\x22\x56\x00\x00\x00\x00\x00\x00\x02\x00\x04\x00\x02\x00\x41\x00data\x04\x00\x00\x00\x00\x00\x00\x00".to_vec(), // IMA block_align=2
+        ];
+        for b in &bad_inputs {
+            assert!(
+                crate::media::audio::wav::decode_wav_sound(b, None, Some(&fuzz_budget), None).is_err()
+            );
+            assert_eq!(fuzz_budget.used_bytes(), 0);
+        }
+
+        // IMA ADPCM predictor_index = 127 (out of 0..=88): must clamp cleanly, zero panic!
+        let ima_hi_idx: Vec<u8> = b"RIFF\x40\x00\x00\x00WAVEfmt \x14\x00\x00\x00\x11\x00\x01\x00\x22\x56\x00\x00\x11\x2b\x00\x00\x08\x00\x04\x00\x02\x00\x09\x00data\x08\x00\x00\x00\x00\x00\x7f\x00\x12\x34\x56\x78".to_vec();
+        let _ = crate::media::audio::wav::decode_wav_sound(&ima_hi_idx, None, Some(&fuzz_budget), None);
+        assert_eq!(fuzz_budget.used_bytes(), 0);
+
+        let mut rng: u64 = 0x5EED_4444_8888_1111;
+        let next_u64 = |st: &mut u64| -> u64 {
+            *st = st.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *st;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut seeds = bad_inputs;
+        seeds.push(wav_bytes.clone());
+        seeds.push(ima_hi_idx);
+        for case_idx in 0..160usize {
+            let mut sample = seeds[case_idx % seeds.len()].to_vec();
+            let op = (next_u64(&mut rng) % 4) as usize;
+            if !sample.is_empty() {
+                match op {
+                    0 => {
+                        let new_len = (next_u64(&mut rng) as usize) % (sample.len() + 1);
+                        sample.truncate(new_len);
+                    }
+                    1 => {
+                        let idx = (next_u64(&mut rng) as usize) % sample.len();
+                        sample[idx] ^= ((next_u64(&mut rng) & 0xFF) as u8).max(1);
+                    }
+                    2 => {
+                        for _ in 0..3 {
+                            let idx = (next_u64(&mut rng) as usize) % sample.len();
+                            sample[idx] = (next_u64(&mut rng) & 0xFF) as u8;
+                        }
+                    }
+                    _ => {
+                        let extra = (next_u64(&mut rng) as usize) % 24;
+                        for _ in 0..extra {
+                            sample.push((next_u64(&mut rng) & 0xFF) as u8);
+                        }
+                    }
+                }
+            }
+            let _ = crate::media::audio::wav::decode_wav_sound(&sample, None, Some(&fuzz_budget), None);
+            let _ = crate::media::audio::wav::WavStreamDecoder::from_bytes(sample, Some(&fuzz_budget));
+            assert_eq!(
+                fuzz_budget.used_bytes(),
+                0,
+                "audio fuzz budget leak at case {}",
+                case_idx
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        modules::reset_runtime_state();
+        modules::reset_runtime_state();
+        assert!(!crate::audio_backend::is_initialized());
+        assert_eq!(crate::audio_backend::get_state().voices, 0);
     }
 }

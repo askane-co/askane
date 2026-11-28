@@ -1,7 +1,7 @@
 pub(crate) mod archive;
 mod assets;
-mod audio;
-mod base64;
+pub(crate) mod audio;
+pub(crate) mod base64;
 mod binary;
 mod buffer;
 mod bytes;
@@ -19,12 +19,12 @@ pub(crate) mod gfx;
 mod glob;
 pub(crate) mod hash;
 mod hex;
-mod html;
+pub(crate) mod html;
 mod http;
 mod image;
 mod ini;
 mod input;
-mod json;
+pub(crate) mod json;
 mod kv;
 pub(crate) mod log;
 mod geom;
@@ -51,6 +51,16 @@ mod url;
 mod uuid;
 mod ws;
 mod xml;
+mod cubemap;
+mod lighting;
+mod mesh;
+mod nav;
+mod particles;
+mod postfx;
+mod scene;
+mod scene_util;
+mod terrain;
+mod tiled;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -89,12 +99,23 @@ pub fn build_module(
 pub fn reset_runtime_state() {
     fs::reset_state();
     gfx::reset_state();
+    crate::audio_backend::reset_audio_state();
     crate::media::reset_media_state();
     input::reset_state();
     ui::reset_state();
     kv::reset_state();
     net::reset_state();
     ws::reset_state();
+    procgen::reset_state();
+    mesh::reset_state();
+    tiled::reset_state();
+    terrain::reset_state();
+    nav::reset_state();
+    lighting::reset_state();
+    postfx::reset_state();
+    particles::reset_state();
+    cubemap::reset_state();
+    scene::reset_state();
 }
 
 pub const BUILTIN_MODULE_NAMES: &[&str] = &[
@@ -152,6 +173,15 @@ pub const BUILTIN_MODULE_NAMES: &[&str] = &[
     "signal",
     "task",
     "channel",
+    "mesh",
+    "tiled",
+    "terrain",
+    "nav",
+    "lighting",
+    "postfx",
+    "particles",
+    "cubemap",
+    "scene",
 ];
 
 pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
@@ -268,7 +298,11 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
             "windows",
             "Windows clipboard text read/write (requires --allow-clipboard)",
         ),
-        "audio" => ("media", "windows", "Sandboxed WAV playback via WinMM"),
+        "audio" => (
+            "media",
+            "all",
+            "Multi-channel audio mixer, streaming music, synth & offline render (--allow-audio; legacy play(path)/stop() under read sandbox)",
+        ),
         "url" => (
             "data",
             "all",
@@ -370,6 +404,15 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
         ),
         "channel" => ("runtime", "all", "Bounded channels with deadlock detection"),
         "geom" => ("math", "all", "2D/3D vectors, matrices, quaternions, rays, AABBs and frustums"),
+        "mesh" => ("scene", "all", "OBJ/glTF/GLB 3D model loading, stats, verification & ASKAS cache"),
+        "tiled" => ("scene", "all", "Tiled .tmj/.tmx map loading, solid collision grids & terrain alignment"),
+        "terrain" => ("scene", "all", "Heightmaps (.r16/PNG), normals, slopes, Mode7 & splatmaps"),
+        "nav" => ("scene", "all", "Deterministic A* grid pathfinding, string-pulling & flow fields"),
+        "lighting" => ("scene", "all", "2D/3D/spot lightmaps with shadow DDA & HDR compositing"),
+        "postfx" => ("scene", "all", "Bloom, 3D LUT color grading, vignette, scanlines & BMP snapshots"),
+        "particles" => ("scene", "all", "Deterministic PCG32 particle pools, emitters & rendering"),
+        "cubemap" => ("scene", "all", "6-face square PoT cubemaps and directional sampling"),
+        "scene" => ("scene", "all", "Unified scene assembly, terrain snapping & depth-tested drawing"),
         _ => ("other", "all", ""),
     }
 }
@@ -377,6 +420,15 @@ pub fn module_info(name: &str) -> (&'static str, &'static str, &'static str) {
 pub fn get_builtin_module(name: &str) -> Option<Value> {
     match name {
         "geom" => Some(geom::module()),
+        "mesh" => Some(mesh::module()),
+        "tiled" => Some(tiled::module()),
+        "terrain" => Some(terrain::module()),
+        "nav" => Some(nav::module()),
+        "lighting" => Some(lighting::module()),
+        "postfx" => Some(postfx::module()),
+        "particles" => Some(particles::module()),
+        "cubemap" => Some(cubemap::module()),
+        "scene" => Some(scene::module()),
         "math" => Some(math::module()),
         "fs" => Some(fs::module()),
         "sys" => Some(sys::module()),
