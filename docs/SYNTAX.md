@@ -1,4 +1,4 @@
-# Askane Language Specification (v0.14.1)
+# Askane Language Specification (v0.20.0)
 
 ## 1. Types
 - `int`: 64-bit signed integer (`42`, `-7`)
@@ -70,8 +70,14 @@ let forty_two = || 42;
 ```
 Functions capture outer lexical variables by upvalue (closures).
 
-## 7. Modules & Imports
-- Built-in modules (`import math;`, `import fs as f;`): `math`, `fs`, `sys`, `json`, `strings`, `path`, `time`, `random`, `base64`, `csv`, `log`, `test`, `hash`, `ini`, `datetime`, `clipboard`, `audio`, `url`, `hex`, `uuid`, `term`, `glob`, `regex`, `dialog`, `process`, `http`, `gfx`, `mem`.
+## 7. Modules, Keywords & Imports
+<!-- askane:syntax-keywords:begin -->
+- Reserved keywords (24): `let`, `fn`, `struct`, `if`, `else`, `match`, `while`, `loop`, `for`, `in`, `import`, `from`, `pub`, `as`, `return`, `break`, `continue`, `try`, `catch`, `throw`, `recover`, `true`, `false`, `unit`
+- Contextual keywords (9): `needs`, `defer`, `every`, `on`, `change`, `spec`, `sandbox`, `with`, `after`
+<!-- askane:syntax-keywords:end -->
+<!-- askane:syntax-modules:begin -->
+- Built-in modules (63, via `import <name>;` or `import <name> as alias;`): `archive`, `assets`, `audio`, `base64`, `binary`, `buffer`, `bytes`, `channel`, `cli`, `clipboard`, `collections`, `compress`, `crypto`, `csv`, `cubemap`, `datetime`, `dialog`, `diff`, `fs`, `geom`, `gfx`, `glob`, `hash`, `hex`, `html`, `http`, `image`, `ini`, `input`, `json`, `kv`, `lighting`, `log`, `math`, `mem`, `mesh`, `nav`, `net`, `os`, `particles`, `path`, `postfx`, `pprint`, `process`, `procgen`, `random`, `regex`, `scene`, `signal`, `strings`, `sys`, `task`, `term`, `terrain`, `test`, `tiled`, `time`, `toml`, `ui`, `url`, `uuid`, `ws`, `xml`.
+<!-- askane:syntax-modules:end -->
 - File imports: `import "./helper.ask" as helper;`. Imported modules inherit the caller VM's permissions without privilege escalation.
 
 ## 8. Security & Resource Policy

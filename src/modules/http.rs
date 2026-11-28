@@ -279,7 +279,7 @@ mod winhttp {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn format_headers_dict(val: &Value, fn_name: &str) -> Result<String, String> {
     match val {
         Value::Dict(d) => {
@@ -311,7 +311,37 @@ fn format_headers_dict(val: &Value, fn_name: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
+fn dispatch_http_request(
+    vm: &VM,
+    method: &str,
+    url: &str,
+    extra_headers: Option<&str>,
+    body: Option<&[u8]>,
+) -> Result<Value, String> {
+    #[cfg(windows)]
+    {
+        let _ = vm;
+        winhttp::request(method, url, extra_headers, body)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use crate::value::new_dict_with_capacity;
+        let (status, resp_body) = crate::platform::linux_tls::linux_https::request(
+            method,
+            url,
+            extra_headers,
+            body,
+            |next_url| vm.check_net(next_url),
+        )?;
+        let mut map = new_dict_with_capacity(2);
+        map.insert("status".to_string(), Value::Int(status as i64));
+        map.insert("body".to_string(), Value::from_str(resp_body));
+        Ok(Value::dict(map))
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 fn http_get(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err("http.get() expects (url) or (url, headers_dict)".to_string());
@@ -335,10 +365,10 @@ fn http_get(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     } else {
         None
     };
-    winhttp::request("GET", url, headers.as_deref(), None)
+    dispatch_http_request(vm, "GET", url, headers.as_deref(), None)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn http_post(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err(
@@ -388,15 +418,15 @@ fn http_post(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     } else {
         "Content-Type: application/json\r\n".to_string()
     };
-    winhttp::request("POST", url, Some(&header), Some(body))
+    dispatch_http_request(vm, "POST", url, Some(&header), Some(body))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn http_get(_vm: &mut VM, _args: &[Value]) -> Result<Value, String> {
-    Err("http module is currently only supported on Windows".to_string())
+    Err("E_BACKEND_UNAVAILABLE: http module is not supported on this platform".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn http_post(_vm: &mut VM, _args: &[Value]) -> Result<Value, String> {
-    Err("http module is currently only supported on Windows".to_string())
+    Err("E_BACKEND_UNAVAILABLE: http module is not supported on this platform".to_string())
 }

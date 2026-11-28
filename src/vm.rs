@@ -372,6 +372,9 @@ pub struct VM {
     execute_depth: usize,
     scheduler: GreenScheduler,
     use_bytecode_cache: bool,
+    pak_mounts: Vec<Rc<crate::bundle::PakArchive>>,
+    bundle_mode: crate::bundle::BundleMode,
+    bundle_miss_log: RefCell<Vec<String>>,
 }
 
 fn clean_display_path(p: &std::path::Path) -> String {
@@ -448,6 +451,9 @@ impl VM {
             execute_depth: 0,
             scheduler: GreenScheduler::new(),
             use_bytecode_cache: false,
+            pak_mounts: Vec::new(),
+            bundle_mode: crate::bundle::BundleMode::Hermetic,
+            bundle_miss_log: RefCell::new(Vec::new()),
         };
         vm.register_natives();
         vm
@@ -471,6 +477,102 @@ impl VM {
 
     pub fn is_sandboxed(&self) -> bool {
         self.sandboxed
+    }
+
+    pub fn mount_pak(&mut self, pak: crate::bundle::PakArchive) {
+        self.pak_mounts.push(Rc::new(pak));
+    }
+
+    pub fn set_bundle_mode(&mut self, mode: crate::bundle::BundleMode) {
+        self.bundle_mode = mode;
+    }
+
+    pub fn bundle_mode(&self) -> crate::bundle::BundleMode {
+        self.bundle_mode
+    }
+
+    pub fn has_mounted_pak(&self) -> bool {
+        !self.pak_mounts.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub fn bundle_miss_log(&self) -> Vec<String> {
+        self.bundle_miss_log.borrow().clone()
+    }
+
+    pub fn read_pak_bytes(&self, raw_rel: &str) -> Result<Option<Vec<u8>>, String> {
+        let Ok(norm) = crate::bundle::logical_normalize_rel(raw_rel) else {
+            return Ok(None);
+        };
+        for pak in self.pak_mounts.iter().rev() {
+            if let Some(bytes) = pak.read_logical(&norm)? {
+                return Ok(Some(bytes));
+            }
+        }
+        self.bundle_miss_log.borrow_mut().push(norm);
+        Ok(None)
+    }
+
+    pub fn pak_exists(&self, raw_rel: &str) -> bool {
+        let Ok(norm) = crate::bundle::logical_normalize_rel(raw_rel) else {
+            return false;
+        };
+        self.pak_mounts.iter().rev().any(|p| p.has_logical(&norm))
+    }
+
+    pub fn pak_is_dir(&self, raw_rel: &str) -> bool {
+        let clean = raw_rel.trim();
+        let norm_dir = if clean.is_empty() || clean == "." || clean == "./" {
+            String::new()
+        } else {
+            match crate::bundle::logical_normalize_rel(clean) {
+                Ok(n) => n,
+                Err(_) => return false,
+            }
+        };
+        self.pak_mounts.iter().rev().any(|p| p.is_dir(&norm_dir))
+    }
+
+    pub fn pak_list_dir(&self, raw_rel: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for p in &self.pak_mounts {
+            for item in p.list_dir(raw_rel) {
+                if !out.iter().any(|x: &String| x.eq_ignore_ascii_case(&item)) {
+                    out.push(item);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    pub fn vfs_read_bytes(&mut self, raw: &str) -> Result<crate::bundle::VfsRead, String> {
+        if self.pak_mounts.is_empty() {
+            return Ok(crate::bundle::VfsRead::DiskPath(self.resolve_read_path(raw)?));
+        }
+        match self.bundle_mode {
+            crate::bundle::BundleMode::Overlay => {
+                if let Ok(p) = self.resolve_read_path(raw) {
+                    if p.is_file() {
+                        return Ok(crate::bundle::VfsRead::DiskPath(p));
+                    }
+                }
+                if let Some(bytes) = self.read_pak_bytes(raw)? {
+                    return Ok(crate::bundle::VfsRead::PakBytes(bytes));
+                }
+                Ok(crate::bundle::VfsRead::DiskPath(self.resolve_read_path(raw)?))
+            }
+            crate::bundle::BundleMode::Hermetic => {
+                if let Some(bytes) = self.read_pak_bytes(raw)? {
+                    Ok(crate::bundle::VfsRead::PakBytes(bytes))
+                } else {
+                    Err(format!(
+                        "Bundle hermetic mode: '{}' not found in mounted bundle",
+                        raw
+                    ))
+                }
+            }
+        }
     }
 
     pub fn spec_results(&self) -> &[(String, Result<(), String>)] {
@@ -776,6 +878,7 @@ impl VM {
             || err.contains("Sandbox memory budget exceeded")
             || err.contains("Sandbox I/O budget exceeded")
             || err.contains("Execution timeout (")
+            || err.contains("E_BUNDLE_CORRUPT")
     }
 
     pub fn sleep_bounded(&mut self, ms: u64) -> Result<(), String> {
@@ -5101,6 +5204,131 @@ impl VM {
                     .unwrap_or_else(|| f.closure.proto.name.clone())
             })
             .unwrap_or_else(|| "<script>".to_string());
+
+        if !self.pak_mounts.is_empty() {
+            let rel_base = import_base
+                .strip_prefix(&self.sandbox_root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .replace('\\', "/");
+            let joined_raw = if rel_base.is_empty() {
+                source.to_string()
+            } else {
+                format!("{}/{}", rel_base.trim_matches('/'), source)
+            };
+            let mut candidates: Vec<(String, bool)> = Vec::new();
+            if let Ok(norm) = crate::bundle::logical_normalize_rel(&joined_raw) {
+                if Path::new(source).extension().is_none() {
+                    candidates.push((format!("{}/mod.askc", norm), true));
+                    candidates.push((format!("{}/mod.ask", norm), false));
+                    candidates.push((format!("{}.askc", norm), true));
+                    candidates.push((format!("{}.ask", norm), false));
+                } else if source.ends_with(".ask") {
+                    candidates.push((format!("{}c", norm), true));
+                    candidates.push((norm, false));
+                } else if source.ends_with(".askc") {
+                    candidates.push((norm, true));
+                } else {
+                    candidates.push((norm, false));
+                }
+            }
+            let try_disk_first = self.bundle_mode == crate::bundle::BundleMode::Overlay;
+            let disk_has_mod = try_disk_first && {
+                let rp = PathBuf::from(source);
+                if rp.extension().is_none() {
+                    let mod_c = rp.join("mod.ask");
+                    self.resolve_read_path_from(&import_base, &mod_c.to_string_lossy())
+                        .is_ok_and(|p| p.is_file())
+                        || self
+                            .resolve_read_path_from(&import_base, &format!("{}.ask", source))
+                            .is_ok_and(|p| p.is_file())
+                } else {
+                    self.resolve_read_path_from(&import_base, source)
+                        .is_ok_and(|p| p.is_file())
+                }
+            };
+
+            if !disk_has_mod {
+                for (cand_rel, is_bc) in candidates {
+                    if let Some(bytes) = self.read_pak_bytes(&cand_rel)? {
+                        let cache_key = format!("pak://{}", cand_rel.to_lowercase());
+                        if let Some(cached) = self.module_cache.get(&cache_key) {
+                            return Ok(cached.clone());
+                        }
+                        if !self.loading_modules.insert(cache_key.clone()) {
+                            return Err(format!(
+                                "Circular import detected for '{}' in bundle",
+                                cand_rel
+                            ));
+                        }
+                        let mname = Path::new(&cand_rel)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(source)
+                            .to_string();
+                        let proto = if is_bc {
+                            Rc::new(
+                                crate::bytecode::decode_cached_proto(
+                                    &bytes,
+                                    &crate::bundle::PACKED_ASKC_HASH,
+                                    true,
+                                    false,
+                                )
+                                .map_err(|e| {
+                                    self.loading_modules.remove(&cache_key);
+                                    format!(
+                                        "E_BUNDLE_CORRUPT: invalid bytecode '{}': {}",
+                                        cand_rel, e
+                                    )
+                                })?,
+                            )
+                        } else {
+                            let src = String::from_utf8(bytes).map_err(|_| {
+                                self.loading_modules.remove(&cache_key);
+                                format!("E_BUNDLE_CORRUPT: module '{}' is not valid UTF-8", cand_rel)
+                            })?;
+                            let compiled = (|| {
+                                let mut lexer = Lexer::new(&src);
+                                let tokens = lexer.tokenize()?;
+                                let mut parser = Parser::new(tokens);
+                                let program = parser.parse_program()?;
+                                Compiler::compile_module(&program, &mname)
+                            })();
+                            match compiled {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    self.loading_modules.remove(&cache_key);
+                                    return Err(format!(
+                                        "{} (in '{}') (imported from '{}')",
+                                        e, cand_rel, parent_name
+                                    ));
+                                }
+                            }
+                        };
+                        let pak_dir = Path::new(&cand_rel)
+                            .parent()
+                            .map(|p| self.sandbox_root.join(p));
+                        let prev_dir = self.current_dir.clone();
+                        if let Some(ref d) = pak_dir {
+                            self.current_dir = d.clone();
+                        }
+                        let res = self.run_with_source(proto, pak_dir, Some(cand_rel.clone()));
+                        self.current_dir = prev_dir;
+                        self.loading_modules.remove(&cache_key);
+                        let module_val = res?;
+                        self.module_cache.insert(cache_key, module_val.clone());
+                        return Ok(module_val);
+                    }
+                }
+                if self.bundle_mode == crate::bundle::BundleMode::Hermetic {
+                    return Err(format!(
+                        "Bundle hermetic mode: could not find module '{}' in bundle (imported from '{}')",
+                        source, parent_name
+                    ));
+                }
+            }
+        }
 
         let file_path = if raw_path.extension().is_none() {
             let mod_candidate = raw_path.join("mod.ask");

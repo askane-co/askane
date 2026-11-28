@@ -206,10 +206,16 @@ fn assets_exists(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err(err_bad_opt("assets.exists() expects (path)"));
     }
     let path = expect_str(&args[0], "assets.exists()")?;
+    if vm.has_mounted_pak() && vm.pak_exists(path) {
+        return Ok(Value::Bool(true));
+    }
     if let Ok(norm) = crate::media::cache::normalize_vpath(path) {
         if bundle_list_entries().iter().any(|e| e == &norm) {
             return Ok(Value::Bool(true));
         }
+    }
+    if vm.has_mounted_pak() && vm.bundle_mode() == crate::bundle::BundleMode::Hermetic {
+        return Ok(Value::Bool(false));
     }
     let Ok(resolved) = vm.resolve_read_path(path) else {
         return Ok(Value::Bool(false));

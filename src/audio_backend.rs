@@ -341,17 +341,11 @@ mod linux_alsa {
     use std::ffi::{c_char, c_int, c_uint, c_void};
     use std::ptr::null_mut;
 
-    const RTLD_NOW: c_int = 2;
+    use crate::platform::dl::DynLib;
+
     const SND_PCM_STREAM_PLAYBACK: c_int = 0;
     const SND_PCM_FORMAT_S16_LE: c_int = 2;
     const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
-
-    #[cfg_attr(target_env = "gnu", link(name = "dl"))]
-    unsafe extern "C" {
-        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
-        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-        fn dlclose(handle: *mut c_void) -> c_int;
-    }
 
     type FnOpen = unsafe extern "C" fn(*mut *mut c_void, *const c_char, c_int, c_int) -> c_int;
     type FnSetParams =
@@ -362,7 +356,7 @@ mod linux_alsa {
     type FnClose = unsafe extern "C" fn(*mut c_void) -> c_int;
 
     pub struct AlsaDevice {
-        lib: *mut c_void,
+        _lib: DynLib,
         pcm: *mut c_void,
         writei: FnWritei,
         recover: FnRecover,
@@ -374,29 +368,14 @@ mod linux_alsa {
 
     impl AlsaDevice {
         pub fn open(sample_rate: u32, buffer_ms: u32) -> Result<Self, String> {
-            let lib = unsafe { dlopen(b"libasound.so.2\0".as_ptr() as *const c_char, RTLD_NOW) };
-            if lib.is_null() {
-                return Err("libasound.so.2 not available".to_string());
-            }
+            let lib = DynLib::open(&["libasound.so.2"])?;
 
-            let load_sym = |name: &[u8]| -> Option<*mut c_void> {
-                let p = unsafe { dlsym(lib, name.as_ptr() as *const c_char) };
-                if p.is_null() { None } else { Some(p) }
-            };
-
-            let (Some(p_open), Some(p_set), Some(p_writei), Some(p_rec), Some(p_drop), Some(p_close)) = (
-                load_sym(b"snd_pcm_open\0"),
-                load_sym(b"snd_pcm_set_params\0"),
-                load_sym(b"snd_pcm_writei\0"),
-                load_sym(b"snd_pcm_recover\0"),
-                load_sym(b"snd_pcm_drop\0"),
-                load_sym(b"snd_pcm_close\0"),
-            ) else {
-                unsafe {
-                    dlclose(lib);
-                }
-                return Err("incomplete libasound.so.2 symbols".to_string());
-            };
+            let p_open = lib.sym("snd_pcm_open")?;
+            let p_set = lib.sym("snd_pcm_set_params")?;
+            let p_writei = lib.sym("snd_pcm_writei")?;
+            let p_rec = lib.sym("snd_pcm_recover")?;
+            let p_drop = lib.sym("snd_pcm_drop")?;
+            let p_close = lib.sym("snd_pcm_close")?;
 
             let open_fn: FnOpen = unsafe { std::mem::transmute(p_open) };
             let set_fn: FnSetParams = unsafe { std::mem::transmute(p_set) };
@@ -415,10 +394,7 @@ mod linux_alsa {
                 )
             };
             if rc < 0 || pcm.is_null() {
-                unsafe {
-                    dlclose(lib);
-                }
-                return Err(format!("snd_pcm_open failed with code {}", rc));
+                return Err(format!("E_BACKEND_UNAVAILABLE: snd_pcm_open failed with code {}", rc));
             }
 
             let latency_us = buffer_ms.clamp(15, 250).saturating_mul(1000);
@@ -436,13 +412,15 @@ mod linux_alsa {
             if prc < 0 {
                 unsafe {
                     close_fn(pcm);
-                    dlclose(lib);
                 }
-                return Err(format!("snd_pcm_set_params failed with code {}", prc));
+                return Err(format!(
+                    "E_BACKEND_UNAVAILABLE: snd_pcm_set_params failed with code {}",
+                    prc
+                ));
             }
 
             Ok(Self {
-                lib,
+                _lib: lib,
                 pcm,
                 writei,
                 recover,
@@ -477,7 +455,6 @@ mod linux_alsa {
             unsafe {
                 (self.drop_fn)(self.pcm);
                 (self.close_fn)(self.pcm);
-                dlclose(self.lib);
             }
         }
     }

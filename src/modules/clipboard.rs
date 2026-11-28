@@ -115,9 +115,16 @@ fn clip_get_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     {
         Ok(Value::from_str(win32_clip::get_text()?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        Err("clipboard module is currently supported on Windows only".to_string())
+        Ok(Value::from_str(crate::platform::macos_clip::get_text()?))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err(
+            "E_BACKEND_UNAVAILABLE: clipboard is not supported without a desktop clipboard backend"
+                .to_string(),
+        )
     }
 }
 
@@ -140,9 +147,17 @@ fn clip_set_text(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         win32_clip::set_text(text)?;
         Ok(Value::Unit)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos_clip::set_text(text)?;
+        Ok(Value::Unit)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = text;
-        Err("clipboard module is currently supported on Windows only".to_string())
+        Err(
+            "E_BACKEND_UNAVAILABLE: clipboard is not supported without a desktop clipboard backend"
+                .to_string(),
+        )
     }
 }

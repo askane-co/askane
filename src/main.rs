@@ -1,5 +1,7 @@
 #[forbid(unsafe_code)]
 mod ast;
+#[forbid(unsafe_code)]
+mod asset_audit;
 mod audio_backend;
 #[forbid(unsafe_code)]
 mod budget;
@@ -9,6 +11,8 @@ mod buffer;
 mod bytecode;
 #[forbid(unsafe_code)]
 mod camera;
+#[forbid(unsafe_code)]
+mod bundle;
 #[forbid(unsafe_code)]
 mod compiler;
 #[forbid(unsafe_code)]
@@ -28,10 +32,15 @@ mod layers;
 #[forbid(unsafe_code)]
 mod lexer;
 #[forbid(unsafe_code)]
+mod lsp;
+#[forbid(unsafe_code)]
 mod media;
 mod modules;
 #[forbid(unsafe_code)]
 mod parser;
+mod platform;
+#[forbid(unsafe_code)]
+mod registry;
 #[forbid(unsafe_code)]
 mod scene;
 mod setup;
@@ -53,7 +62,7 @@ use parser::Parser;
 use value::Value;
 use vm::{Permissions, VM};
 
-const VERSION: &str = "0.20.0-prerelease";
+const VERSION: &str = "0.20.0";
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_text_limited(path: &std::path::Path, limit: usize) -> Result<String, String> {
@@ -205,7 +214,7 @@ fn run_file_with_script_args(
     no_color: bool,
     no_cache: bool,
 ) -> Result<(), String> {
-    run_file_core_full(
+    run_file_core_full_with_bundle(
         path,
         dump_bytecode,
         profile,
@@ -217,6 +226,7 @@ fn run_file_with_script_args(
         script_args,
         no_color,
         no_cache,
+        None,
         None,
     )
 }
@@ -235,6 +245,39 @@ fn run_file_core_full(
     no_color: bool,
     no_cache: bool,
     spec_filter: Option<&str>,
+) -> Result<(), String> {
+    run_file_core_full_with_bundle(
+        path,
+        dump_bytecode,
+        profile,
+        include_specs,
+        permissions,
+        sandbox_root_override,
+        deterministic,
+        update_snapshots,
+        script_args,
+        no_color,
+        no_cache,
+        spec_filter,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_file_core_full_with_bundle(
+    path: &str,
+    dump_bytecode: bool,
+    profile: bool,
+    include_specs: bool,
+    permissions: Permissions,
+    sandbox_root_override: Option<&std::path::Path>,
+    deterministic: bool,
+    update_snapshots: bool,
+    script_args: Option<&[String]>,
+    no_color: bool,
+    no_cache: bool,
+    spec_filter: Option<&str>,
+    mounted_pak: Option<(bundle::PakArchive, bundle::BundleMode)>,
 ) -> Result<(), String> {
     let color = use_cli_color(no_color);
     let source = read_text_limited(std::path::Path::new(path), MAX_SOURCE_BYTES)
@@ -281,6 +324,10 @@ fn run_file_core_full(
     vm.set_update_snapshots(update_snapshots);
     if let Some(sargs) = script_args {
         vm.set_script_args(sargs.to_vec());
+    }
+    if let Some((pak, mode)) = mounted_pak {
+        vm.set_bundle_mode(mode);
+        vm.mount_pak(pak);
     }
     let entry_parent = match std::path::Path::new(path).parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
@@ -403,7 +450,10 @@ fn check_file_report(path: &str, json_out: bool, color: bool) -> CheckFileReport
         .map(|e| diag::classify_error(e, Some(path)))
         .collect();
 
-    let warnings = diag::analyze_warnings(&program, Some(path));
+    let mut warnings = diag::analyze_warnings(&program, Some(path));
+    let asset_rep = asset_audit::audit_program(&program, Some(std::path::Path::new(path)));
+    diags.extend(asset_rep.errors);
+    warnings.extend(asset_rep.warnings);
     if diags.is_empty() {
         if let Err(comp_err) = Compiler::compile_with_specs(&program) {
             diags.push(diag::classify_error(&comp_err, Some(path)));
@@ -989,6 +1039,19 @@ fn inspect_permissions_file(
     }
     *capabilities = ctx.needs;
     let imports = ctx.imports;
+    let asset_rep = asset_audit::audit_program(&program, Some(path));
+    for asset in &asset_rep.static_assets {
+        push_unique(capabilities, format!("asset: {}", asset));
+    }
+    if asset_rep.dynamic_calls > 0 {
+        push_unique(
+            capabilities,
+            format!(
+                "asset: {} dynamic path call(s) (unverified at compile time)",
+                asset_rep.dynamic_calls
+            ),
+        );
+    }
 
     for source in imports {
         match source {
@@ -1859,10 +1922,14 @@ fn print_help() {
     println!("  askane --explain <CODE>             Explain an error/warning code (e.g. E0401)");
     println!("  askane permissions <file>           Inspect imported capabilities (transitive)");
     println!("  askane fmt [--check|--diff] [opts]  Format Askane files or stdin (--stdin)");
-    println!("  askane init [--name <name>] [dir]   Create a starter Askane project");
+    println!("  askane init [--name <n>] [--template app|game] [dir]  Create a starter project");
+    println!("  askane bundle <dir> [opts]          Package project into ASKANE-PAK (--out, --embed, --pack-askc)");
+    println!("  askane bundle verify|list <pak>     Verify SHA-256 integrity or list ASKANE-PAK contents");
+    println!("  askane --bundle <pak> [opts]        Run an ASKANE-PAK archive (--bundle-mode=hermetic|overlay)");
     println!("  askane info                         Show Askane version, host & project info");
-    println!("  askane doctor                       Diagnose installation, PATH & environment");
-    println!("  askane modules [--json]             List all built-in modules & platforms");
+    println!("  askane doctor                       Diagnose installation, PATH, & native backends");
+    println!("  askane modules [--json|--markdown [--check]]  List stdlib modules or verify docs");
+    println!("  askane lsp                          Start JSON-RPC 2.0 Language Server on stdio");
     println!(
         "  askane clean [opts] [dir]           Remove temporary/cache files (--dry-run, --snapshots)"
     );
@@ -1910,8 +1977,9 @@ fn run_explain(code: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Unknown diagnostic code '{}'. Known codes: E0101, E0201, E0202, E0301, E0302, E0401, E0402, E0403, E0404, E0405, W0101, W0102",
-            code
+            "Unknown diagnostic code '{}'. Known codes: {}",
+            code,
+            diag::ALL_CODES.join(", ")
         ))
     }
 }
@@ -2015,6 +2083,15 @@ fn run_doctor() -> Result<(), String> {
         }
     }
 
+    let rep = platform::probe_backends();
+    for p in &rep.probes {
+        let tag = match p.status {
+            platform::BackendStatus::Ready => "ok",
+            platform::BackendStatus::Unavailable => "info",
+        };
+        println!("[{}] {:<10}: {} ({})", tag, p.subsystem, p.backend, p.detail);
+    }
+
     if issues > 0 {
         Err(format!("doctor found {} issue(s)", issues))
     } else {
@@ -2022,7 +2099,22 @@ fn run_doctor() -> Result<(), String> {
     }
 }
 
-fn run_modules_cmd(json_out: bool) {
+fn run_modules_cmd(json_out: bool, markdown_out: bool, check_sync: bool) -> Result<(), String> {
+    if check_sync {
+        let cwd = env::current_dir().map_err(|e| e.to_string())?;
+        let update = env::var("ASKANE_UPDATE_DOCS").is_ok_and(|v| v == "1");
+        let changed = registry::sync_docs_at(&cwd, update)?;
+        if changed.is_empty() {
+            println!("[ok] Docs & registry are in sync ({} modules, {} symbols)", registry::REGISTRY.len(), registry::FN_DOCS.len());
+        } else {
+            println!("[ok] Updated synced docs: {}", changed.join(", "));
+        }
+        return Ok(());
+    }
+    if markdown_out {
+        print!("{}", registry::render_modules_markdown());
+        return Ok(());
+    }
     if json_out {
         let items: Vec<String> = modules::BUILTIN_MODULE_NAMES
             .iter()
@@ -2052,6 +2144,229 @@ fn run_modules_cmd(json_out: bool) {
             println!("  {:<12} [{:<7} | {:<7}] {}", name, cat, plat, desc);
         }
     }
+    Ok(())
+}
+
+fn png_chunk_bytes(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + data.len());
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(tag);
+    out.extend_from_slice(data);
+    let crc = modules::compress::crc32_bytes(&out[4..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out
+}
+
+fn build_tiny_rgba_png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x89PNG\r\n\x1A\n");
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    out.extend_from_slice(&png_chunk_bytes(b"IHDR", &ihdr));
+
+    let stride = (w as usize) * 4;
+    let mut scanlines = Vec::with_capacity((stride + 1) * (h as usize));
+    for y in 0..h as usize {
+        scanlines.push(0);
+        scanlines.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
+    }
+    let def = modules::compress::deflate_raw(&scanlines);
+    let adler = modules::compress::adler32_bytes(&scanlines);
+    let mut zlib = Vec::with_capacity(2 + def.len() + 4);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    zlib.extend_from_slice(&def);
+    zlib.extend_from_slice(&adler.to_be_bytes());
+    out.extend_from_slice(&png_chunk_bytes(b"IDAT", &zlib));
+    out.extend_from_slice(&png_chunk_bytes(b"IEND", &[]));
+    out
+}
+
+fn build_starter_sprite_png() -> Vec<u8> {
+    let mut rgba = vec![0u8; 8 * 8 * 4];
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let idx = (y * 8 + x) * 4;
+            let border = x == 0 || y == 0 || x == 7 || y == 7;
+            let eye = y == 3 && (x == 2 || x == 5);
+            let (r, g, b, a) = if eye {
+                (20, 24, 34, 255)
+            } else if border {
+                (250, 198, 72, 255)
+            } else {
+                (56, 189, 248, 255)
+            };
+            rgba[idx] = r;
+            rgba[idx + 1] = g;
+            rgba[idx + 2] = b;
+            rgba[idx + 3] = a;
+        }
+    }
+    build_tiny_rgba_png(8, 8, &rgba)
+}
+
+fn validate_init_pkg_name(name: &str) -> Result<String, String> {
+    let safe = name.trim().replace(['"', '\\', '\r', '\n'], "");
+    if safe.is_empty()
+        || safe.len() > 128
+        || safe.contains('\0')
+        || safe
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control())
+    {
+        return Err(format!("Invalid package name {:?}", name));
+    }
+    let stem = safe.split('.').next().unwrap_or(&safe);
+    if bundle::is_windows_reserved_stem(stem) || safe.ends_with('.') || safe.ends_with(' ') {
+        return Err(format!(
+            "Package name {:?} is reserved or invalid on Windows/POSIX",
+            name
+        ));
+    }
+    Ok(safe)
+}
+
+fn write_init_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(bytes)
+                .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+            println!("Created {}", path.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            println!("Skipped existing {}", path.display());
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to create {}: {}", path.display(), e)),
+    }
+}
+
+fn run_init_cli(args: &[String]) -> Result<(), String> {
+    let mut dir_arg: Option<String> = None;
+    let mut pkg_name: Option<String> = None;
+    let mut template = "app".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--name" {
+            i += 1;
+            pkg_name = Some(
+                args.get(i)
+                    .ok_or("Missing package name after --name")?
+                    .clone(),
+            );
+        } else if let Some(val) = a.strip_prefix("--name=") {
+            pkg_name = Some(val.to_string());
+        } else if a == "--template" {
+            i += 1;
+            template = args
+                .get(i)
+                .ok_or("Missing template name after --template (expected app|game)")?
+                .clone();
+        } else if let Some(val) = a.strip_prefix("--template=") {
+            template = val.to_string();
+        } else if a.starts_with('-') {
+            return Err("Usage: askane init [--name <name>] [--template app|game] [dir]".to_string());
+        } else if dir_arg.is_none() {
+            dir_arg = Some(a.clone());
+        } else {
+            return Err("Usage: askane init [--name <name>] [--template app|game] [dir]".to_string());
+        }
+        i += 1;
+    }
+
+    let tpl_lower = template.trim().to_ascii_lowercase();
+    if tpl_lower != "app" && tpl_lower != "game" {
+        return Err(format!(
+            "Unknown template '{}' (expected 'app' or 'game')",
+            template
+        ));
+    }
+
+    let dir = dir_arg.as_deref().unwrap_or(".");
+    let root = std::path::Path::new(dir);
+    let chosen_name = pkg_name.unwrap_or_else(|| {
+        root.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty() && s != ".")
+            .unwrap_or_else(|| "my-askane-app".to_string())
+    });
+    let safe_name = validate_init_pkg_name(&chosen_name)?;
+
+    fs::create_dir_all(root.join("tests"))
+        .map_err(|e| format!("Failed to create tests dir: {}", e))?;
+
+    if tpl_lower == "game" {
+        fs::create_dir_all(root.join("assets"))
+            .map_err(|e| format!("Failed to create assets dir: {}", e))?;
+        let manifest_content = format!(
+            "entry = \"main.ask\"\ntests = \"tests\"\n\n[package]\nname = \"{}\"\nversion = \"0.1.0\"\n\n[limits]\nmax_steps = 20000000\n",
+            safe_name
+        );
+        let main_ask = r#"import gfx;
+import assets;
+import tiled;
+
+gfx.headless(true);
+gfx.window("Askane Game", 320, 240);
+let sprite = assets.load_image("assets/player.png");
+let map = tiled.load("assets/map.tmj");
+let info = tiled.info(map);
+gfx.clear(18, 22, 34);
+gfx.draw_image(sprite, 24, 24);
+gfx.present();
+println("Askane game ready:", info.width, "x", info.height);
+tiled.close(map);
+gfx.close();
+"#;
+        let basic_test = r#"import test;
+import assets;
+import image;
+import tiled;
+
+spec "starter game assets" {
+    test.assert(assets.exists("assets/player.png"));
+    let img = assets.load_image("assets/player.png");
+    test.assert_eq(image.width(img), 8);
+    test.assert_eq(image.height(img), 8);
+    let map = tiled.load("assets/map.tmj");
+    let info = tiled.info(map);
+    test.assert_eq(info.width, 4);
+    test.assert_eq(info.height, 4);
+    tiled.close(map);
+}
+"#;
+        let starter_tmj = r#"{"width":4,"height":4,"tilewidth":16,"tileheight":16,"orientation":"orthogonal","renderorder":"right-down","layers":[{"id":1,"name":"ground","type":"tilelayer","width":4,"height":4,"visible":true,"opacity":1,"data":[1,1,1,1,1,0,0,1,1,0,0,1,1,1,1,1]}],"tilesets":[{"firstgid":1,"name":"starter","tilewidth":16,"tileheight":16,"tilecount":1,"columns":1}]}"#;
+        let png_bytes = build_starter_sprite_png();
+
+        write_init_file(&root.join("askane.toml"), manifest_content.as_bytes())?;
+        write_init_file(&root.join("assets").join("player.png"), &png_bytes)?;
+        write_init_file(&root.join("assets").join("map.tmj"), starter_tmj.as_bytes())?;
+        write_init_file(&root.join("main.ask"), main_ask.as_bytes())?;
+        write_init_file(&root.join("tests").join("basic_test.ask"), basic_test.as_bytes())?;
+    } else {
+        let manifest_content = format!(
+            "entry = \"main.ask\"\ntests = \"tests\"\n\n[package]\nname = \"{}\"\nversion = \"0.1.0\"\n",
+            safe_name
+        );
+        write_init_file(&root.join("askane.toml"), manifest_content.as_bytes())?;
+        write_init_file(
+            &root.join("main.ask"),
+            b"println(\"Hello from Askane!\");\n",
+        )?;
+        write_init_file(
+            &root.join("tests").join("basic_test.ask"),
+            b"import test;\n\nspec \"basic\" {\n    test.assert_eq(1 + 1, 2);\n}\n",
+        )?;
+    }
+    Ok(())
 }
 
 fn clean_dir_walk(
@@ -2677,7 +2992,7 @@ fn format_askane_source(src: &str) -> String {
     format_askane_source_with_indent(src, 4)
 }
 
-fn format_askane_source_with_indent(src: &str, indent_spaces: usize) -> String {
+pub(crate) fn format_askane_source_with_indent(src: &str, indent_spaces: usize) -> String {
     let indent_unit = " ".repeat(indent_spaces.clamp(1, 8));
     let mut out: Vec<String> = Vec::new();
     let mut indent: usize = 0;
@@ -3060,6 +3375,9 @@ enum CliParseOutcome {
         script_path: Option<String>,
         script_args: Option<Vec<String>>,
         explicit_limits: ExplicitLimits,
+        bundle_path: Option<String>,
+        bundle_mode: bundle::BundleMode,
+        verify_mode: bundle::VerifyMode,
     },
 }
 
@@ -3078,6 +3396,9 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
     let mut explicit_timeout: Option<u64> = None;
     let mut script_path: Option<String> = None;
     let mut script_args: Option<Vec<String>> = None;
+    let mut bundle_path: Option<String> = None;
+    let mut bundle_mode = bundle::BundleMode::Hermetic;
+    let mut verify_mode = bundle::VerifyMode::Full;
 
     let mut i = 0;
     while i < args.len() {
@@ -3184,6 +3505,30 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
                 }
                 Err(_) => return Err(format!("Invalid --timeout value: {}", val)),
             }
+        } else if arg == "--bundle" {
+            i += 1;
+            let Some(val) = args.get(i) else {
+                return Err("Missing file path after --bundle".to_string());
+            };
+            bundle_path = Some(val.clone());
+        } else if let Some(val) = arg.strip_prefix("--bundle=") {
+            bundle_path = Some(val.to_string());
+        } else if arg == "--bundle-mode" {
+            i += 1;
+            let Some(val) = args.get(i) else {
+                return Err("Missing mode after --bundle-mode (expected hermetic|overlay)".to_string());
+            };
+            bundle_mode = parse_bundle_mode(val)?;
+        } else if let Some(val) = arg.strip_prefix("--bundle-mode=") {
+            bundle_mode = parse_bundle_mode(val)?;
+        } else if arg == "--verify" {
+            i += 1;
+            let Some(val) = args.get(i) else {
+                return Err("Missing mode after --verify (expected full|lazy)".to_string());
+            };
+            verify_mode = parse_verify_mode(val)?;
+        } else if let Some(val) = arg.strip_prefix("--verify=") {
+            verify_mode = parse_verify_mode(val)?;
         } else if arg.starts_with('-') {
             return Err(format!(
                 "Unknown option '{}'. Run 'askane --help' for usage.",
@@ -3217,10 +3562,382 @@ fn parse_run_args(args: &[String]) -> Result<CliParseOutcome, String> {
             max_mem: explicit_max_mem.is_some(),
             timeout: explicit_timeout.is_some(),
         },
+        bundle_path,
+        bundle_mode,
+        verify_mode,
     })
 }
 
+fn parse_bundle_mode(val: &str) -> Result<bundle::BundleMode, String> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "hermetic" => Ok(bundle::BundleMode::Hermetic),
+        "overlay" => Ok(bundle::BundleMode::Overlay),
+        other => Err(format!(
+            "Unknown --bundle-mode '{}' (expected 'hermetic' or 'overlay')",
+            other
+        )),
+    }
+}
+
+fn parse_verify_mode(val: &str) -> Result<bundle::VerifyMode, String> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "full" => Ok(bundle::VerifyMode::Full),
+        "lazy" => Ok(bundle::VerifyMode::Lazy),
+        other => Err(format!(
+            "Unknown --verify '{}' (expected 'full' or 'lazy')",
+            other
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pak_archive(
+    pak: bundle::PakArchive,
+    entry_override: Option<&str>,
+    bundle_mode: bundle::BundleMode,
+    dump_bytecode: bool,
+    profile: bool,
+    deterministic: bool,
+    mut permissions: Permissions,
+    script_args: Option<&[String]>,
+    no_color: bool,
+) -> Result<(), String> {
+    let color = use_cli_color(no_color);
+    let mut entry_rel = if let Some(ov) = entry_override {
+        bundle::logical_normalize_rel(ov)?
+    } else if let Some(ref e) = pak.entry_script {
+        e.clone()
+    } else if pak.has_logical("main.askc") {
+        "main.askc".to_string()
+    } else {
+        "main.ask".to_string()
+    };
+
+    if entry_rel.ends_with(".ask") {
+        let askc_candidate = format!("{}c", entry_rel);
+        if pak.has_logical(&askc_candidate) {
+            entry_rel = askc_candidate;
+        }
+    }
+
+    if let Some(toml_bytes) = pak.read_logical("askane.toml")? {
+        if let Ok(toml_src) = std::str::from_utf8(&toml_bytes) {
+            let m = parse_askane_manifest(toml_src)?;
+            let expl = ExplicitLimits {
+                max_steps: permissions.max_instructions.is_some(),
+                max_mem: permissions.max_memory_bytes.is_some(),
+                timeout: permissions.max_duration_ms.is_some(),
+            };
+            apply_manifest_limits(&mut permissions, &m, expl);
+        }
+    }
+
+    let entry_bytes = pak.read_logical(&entry_rel)?.ok_or_else(|| {
+        format!(
+            "Bundle entrypoint '{}' not found in mounted ASKANE-PAK",
+            entry_rel
+        )
+    })?;
+
+    let (proto, source_text) = if entry_rel.ends_with(".askc") {
+        let p = std::rc::Rc::new(
+            bytecode::decode_cached_proto(
+                &entry_bytes,
+                &bundle::PACKED_ASKC_HASH,
+                false,
+                false,
+            )
+            .map_err(|e| format!("E_BUNDLE_CORRUPT: invalid bytecode '{}': {}", entry_rel, e))?,
+        );
+        (p, String::new())
+    } else {
+        let src = String::from_utf8(entry_bytes)
+            .map_err(|_| format!("E_BUNDLE_CORRUPT: '{}' is not valid UTF-8", entry_rel))?;
+        let p = compile_source(&src)
+            .map_err(|e| format_error_with_opts(Some(&entry_rel), &src, &e, color))?;
+        (p, src)
+    };
+
+    if dump_bytecode {
+        print!("{}", proto.chunk.disassemble(&proto.name));
+        return Ok(());
+    }
+
+    let mut vm = VM::new_with_sandbox(!permissions.allow_all);
+    vm.set_permissions(permissions);
+    vm.set_bundle_mode(bundle_mode);
+    vm.mount_pak(pak);
+    vm.set_script_file(&entry_rel);
+    vm.set_profile(profile);
+    vm.set_deterministic(deterministic);
+    if let Some(sargs) = script_args {
+        vm.set_script_args(sargs.to_vec());
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let root = fs::canonicalize(&cwd).unwrap_or(cwd);
+    vm.set_current_dir(root.clone());
+    vm.set_sandbox_root(root.clone());
+
+    let base_dir = std::path::Path::new(&entry_rel)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| root.join(p));
+    let res = if base_dir.is_some() {
+        vm.run_with_base_dir(proto, base_dir)
+    } else {
+        vm.run(proto)
+    };
+    res.map_err(|e| format_error_with_opts(Some(&entry_rel), &source_text, &e, color))?;
+    if profile {
+        print_profile_report(&vm);
+    }
+    Ok(())
+}
+
+fn run_bundle_cli(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Usage: askane bundle <dir|verify|list> [options]".to_string());
+    }
+    if args[0] == "verify" {
+        let mut target: Option<String> = None;
+        let mut verify_mode = bundle::VerifyMode::Full;
+        let mut max_entry_bytes = bundle::DEFAULT_MAX_ENTRY_BYTES;
+        let mut i = 1;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--verify" {
+                i += 1;
+                verify_mode = parse_verify_mode(
+                    args.get(i).ok_or("Missing value after --verify")?,
+                )?;
+            } else if let Some(v) = a.strip_prefix("--verify=") {
+                verify_mode = parse_verify_mode(v)?;
+            } else if let Some(v) = a.strip_prefix("--max-entry-mb=") {
+                let mb: usize = v.parse().map_err(|_| format!("Invalid --max-entry-mb '{}'", v))?;
+                max_entry_bytes = mb.saturating_mul(1024 * 1024).max(1024);
+            } else if a.starts_with('-') {
+                return Err(format!("Unknown option '{}' in `askane bundle verify`", a));
+            } else if target.is_none() {
+                target = Some(a.clone());
+            } else {
+                return Err(format!("Unexpected argument '{}' in `askane bundle verify`", a));
+            }
+            i += 1;
+        }
+        let path_str = target.ok_or("Usage: askane bundle verify <file.pak|exe>")?;
+        let pak = bundle::parse_from_file(std::path::Path::new(&path_str), verify_mode, max_entry_bytes)?;
+        println!(
+            "[ok] Verified {} ({} entries, entry={})",
+            path_str,
+            pak.entries.len(),
+            pak.entry_script.as_deref().unwrap_or("<none>")
+        );
+        return Ok(());
+    }
+    if args[0] == "list" {
+        let mut target: Option<String> = None;
+        let mut json_out = false;
+        for a in &args[1..] {
+            if a == "--json" {
+                json_out = true;
+            } else if a.starts_with('-') {
+                return Err(format!("Unknown option '{}' in `askane bundle list`", a));
+            } else if target.is_none() {
+                target = Some(a.clone());
+            } else {
+                return Err(format!("Unexpected argument '{}' in `askane bundle list`", a));
+            }
+        }
+        let path_str = target.ok_or("Usage: askane bundle list <file.pak|exe> [--json]")?;
+        let pak = bundle::parse_from_file(
+            std::path::Path::new(&path_str),
+            bundle::VerifyMode::Lazy,
+            bundle::DEFAULT_MAX_ENTRY_BYTES,
+        )?;
+        if json_out {
+            let items: Vec<String> = pak
+                .entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{{\"name\":{},\"kind\":{},\"method\":{},\"compressed\":{},\"size\":{}}}",
+                        json_escape(&e.name),
+                        json_escape(e.kind.name()),
+                        json_escape(e.method.name()),
+                        e.compressed_size,
+                        e.uncompressed_size
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"file\":{},\"entry\":{},\"count\":{},\"entries\":[{}]}}",
+                json_escape(&path_str),
+                pak.entry_script
+                    .as_deref()
+                    .map(json_escape)
+                    .unwrap_or_else(|| "null".to_string()),
+                pak.entries.len(),
+                items.join(",")
+            );
+        } else {
+            println!(
+                "ASKANE-PAK '{}' ({} entries, entry={}):",
+                path_str,
+                pak.entries.len(),
+                pak.entry_script.as_deref().unwrap_or("<none>")
+            );
+            for e in &pak.entries {
+                println!(
+                    "  {:<36} [{:<7} | {:<7}] {:>10} -> {} B",
+                    e.name,
+                    e.kind.name(),
+                    e.method.name(),
+                    e.uncompressed_size,
+                    e.compressed_size
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let mut target: Option<String> = None;
+    let mut out_pak: Option<String> = None;
+    let mut embed_exe: Option<String> = None;
+    let mut opts = bundle::BuildPakOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--out" {
+            i += 1;
+            out_pak = Some(args.get(i).ok_or("Missing path after --out")?.clone());
+        } else if let Some(v) = a.strip_prefix("--out=") {
+            out_pak = Some(v.to_string());
+        } else if a == "--embed" {
+            i += 1;
+            embed_exe = Some(args.get(i).ok_or("Missing output binary path after --embed")?.clone());
+        } else if let Some(v) = a.strip_prefix("--embed=") {
+            embed_exe = Some(v.to_string());
+        } else if a == "--entry" {
+            i += 1;
+            opts.entry_override = Some(args.get(i).ok_or("Missing path after --entry")?.clone());
+        } else if let Some(v) = a.strip_prefix("--entry=") {
+            opts.entry_override = Some(v.to_string());
+        } else if a == "--pack-askc" {
+            opts.pack_askc = true;
+        } else if a == "--no-compress" {
+            opts.compress = false;
+        } else if let Some(v) = a.strip_prefix("--max-entry-mb=") {
+            let mb: usize = v.parse().map_err(|_| format!("Invalid --max-entry-mb '{}'", v))?;
+            opts.max_entry_bytes = mb.saturating_mul(1024 * 1024).max(1024);
+        } else if a == "--max-entry-mb" {
+            i += 1;
+            let v = args.get(i).ok_or("Missing MB value after --max-entry-mb")?;
+            let mb: usize = v.parse().map_err(|_| format!("Invalid --max-entry-mb '{}'", v))?;
+            opts.max_entry_bytes = mb.saturating_mul(1024 * 1024).max(1024);
+        } else if a.starts_with('-') {
+            return Err(format!("Unknown option '{}' in `askane bundle`", a));
+        } else if target.is_none() {
+            target = Some(a.clone());
+        } else {
+            return Err(format!("Unexpected argument '{}' in `askane bundle`", a));
+        }
+        i += 1;
+    }
+
+    let target_str = target.ok_or("Usage: askane bundle <dir|file> [--out file.pak] [--embed out.exe] [--pack-askc]")?;
+    let target_path = std::path::Path::new(&target_str);
+    let (pak_bytes, metas) = bundle::build_pak_from_target(target_path, &opts)?;
+
+    if let Some(ref exe_path) = embed_exe {
+        bundle::embed_pak_into_executable(std::path::Path::new(exe_path), &pak_bytes)?;
+        println!(
+            "Built embedded Askane binary '{}' ({} entries, {} pak bytes)",
+            exe_path,
+            metas.len(),
+            pak_bytes.len()
+        );
+    }
+    let write_pak_path = match (&out_pak, &embed_exe) {
+        (Some(p), _) => Some(p.clone()),
+        (None, None) => {
+            let stem = target_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty() && *s != ".")
+                .unwrap_or("bundle");
+            Some(format!("{}.pak", stem))
+        }
+        (None, Some(_)) => None,
+    };
+    if let Some(pak_out) = write_pak_path {
+        fs::write(&pak_out, &pak_bytes)
+            .map_err(|e| format!("Failed to write '{}': {}", pak_out, e))?;
+        println!(
+            "Built ASKANE-PAK '{}' ({} entries, {} bytes)",
+            pak_out,
+            metas.len(),
+            pak_bytes.len()
+        );
+    }
+    Ok(())
+}
+
 fn main() {
+    match bundle::try_load_embedded_from_current_exe(bundle::VerifyMode::Full) {
+        Ok(Some(pak)) => {
+            let raw_args: Vec<String> = env::args().skip(1).collect();
+            let mut mode = bundle::BundleMode::Hermetic;
+            let mut script_args: Vec<String> = Vec::new();
+            let mut after_dash = false;
+            for a in raw_args {
+                if !after_dash && a == "--" {
+                    after_dash = true;
+                    continue;
+                }
+                if !after_dash {
+                    if let Some(m) = a.strip_prefix("--bundle-mode=") {
+                        match parse_bundle_mode(m) {
+                            Ok(bm) => {
+                                mode = bm;
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                process::exit(1);
+                            }
+                        }
+                    }
+                }
+                script_args.push(a);
+            }
+            let sargs = if script_args.is_empty() {
+                None
+            } else {
+                Some(script_args.as_slice())
+            };
+            if let Err(e) = run_pak_archive(
+                pak,
+                None,
+                mode,
+                false,
+                false,
+                false,
+                Permissions::sandboxed(),
+                sargs,
+                false,
+            ) {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    }
+
     let args: Vec<String> = env::args().collect();
     if args.len() == 1 {
         run_repl();
@@ -3269,17 +3986,41 @@ fn main() {
         return;
     }
 
+    if args[1] == "lsp" {
+        if args.len() > 2 {
+            eprintln!("Usage: askane lsp");
+            process::exit(1);
+        }
+        if let Err(e) = lsp::run_lsp_stdio() {
+            eprintln!("LSP error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
     if args[1] == "modules" {
         let mut json_out = false;
+        let mut md_out = false;
+        let mut check_sync = false;
         for a in &args[2..] {
             if a == "--json" {
                 json_out = true;
+            } else if a == "--markdown" {
+                md_out = true;
+            } else if a == "--check" {
+                check_sync = true;
             } else {
-                eprintln!("Unknown option '{}'. Usage: askane modules [--json]", a);
+                eprintln!(
+                    "Unknown option '{}'. Usage: askane modules [--json | --markdown [--check]]",
+                    a
+                );
                 process::exit(1);
             }
         }
-        run_modules_cmd(json_out);
+        if let Err(e) = run_modules_cmd(json_out, md_out, check_sync) {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
         return;
     }
 
@@ -3383,81 +4124,17 @@ fn main() {
     }
 
     if args[1] == "init" {
-        let mut dir_arg: Option<String> = None;
-        let mut pkg_name: Option<String> = None;
-        let mut i = 2;
-        while i < args.len() {
-            let a = &args[i];
-            if a == "--name" {
-                i += 1;
-                let Some(val) = args.get(i) else {
-                    eprintln!("Missing package name after --name");
-                    process::exit(1);
-                };
-                pkg_name = Some(val.clone());
-            } else if let Some(val) = a.strip_prefix("--name=") {
-                pkg_name = Some(val.to_string());
-            } else if a.starts_with('-') {
-                eprintln!("Usage: askane init [--name <name>] [dir]");
-                process::exit(1);
-            } else if dir_arg.is_none() {
-                dir_arg = Some(a.clone());
-            } else {
-                eprintln!("Usage: askane init [--name <name>] [dir]");
-                process::exit(1);
-            }
-            i += 1;
-        }
-        let dir = dir_arg.as_deref().unwrap_or(".");
-        let root = std::path::Path::new(dir);
-        let chosen_name = pkg_name.unwrap_or_else(|| {
-            root.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .filter(|s| !s.is_empty() && s != ".")
-                .unwrap_or_else(|| "my-askane-app".to_string())
-        });
-        let safe_name = chosen_name.replace(['"', '\\', '\r', '\n'], "");
-        if let Err(e) = fs::create_dir_all(root.join("tests")) {
+        if let Err(e) = run_init_cli(&args[2..]) {
             eprintln!("init failed: {}", e);
             process::exit(1);
         }
-        let manifest_content = format!(
-            "entry = \"main.ask\"\ntests = \"tests\"\n\n[package]\nname = \"{}\"\nversion = \"0.1.0\"\n",
-            safe_name
-        );
-        let files = [
-            (root.join("askane.toml"), manifest_content),
-            (
-                root.join("main.ask"),
-                "println(\"Hello from Askane!\");\n".to_string(),
-            ),
-            (
-                root.join("tests").join("basic_test.ask"),
-                "import test;\n\nspec \"basic\" {\n    test.assert_eq(1 + 1, 2);\n}\n".to_string(),
-            ),
-        ];
-        for (path, content) in files {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    if let Err(e) = f.write_all(content.as_bytes()) {
-                        eprintln!("Failed to write {}: {}", path.display(), e);
-                        process::exit(1);
-                    }
-                    println!("Created {}", path.display());
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    println!("Skipped existing {}", path.display());
-                }
-                Err(e) => {
-                    eprintln!("Failed to create {}: {}", path.display(), e);
-                    process::exit(1);
-                }
-            }
+        return;
+    }
+
+    if args[1] == "bundle" {
+        if let Err(e) = run_bundle_cli(&args[2..]) {
+            eprintln!("Bundle error: {}", e);
+            process::exit(1);
         }
         return;
     }
@@ -3509,6 +4186,9 @@ fn main() {
         script_path,
         script_args,
         explicit_limits,
+        bundle_path,
+        bundle_mode,
+        verify_mode,
     ) = match parse_run_args(&args[slice_start..]) {
         Ok(CliParseOutcome::ExitZero) => return,
         Ok(CliParseOutcome::Run {
@@ -3524,6 +4204,9 @@ fn main() {
             script_path,
             script_args,
             explicit_limits,
+            bundle_path,
+            bundle_mode,
+            verify_mode,
         }) => (
             dump_bytecode,
             profile,
@@ -3537,12 +4220,65 @@ fn main() {
             script_path,
             script_args,
             explicit_limits,
+            bundle_path,
+            bundle_mode,
+            verify_mode,
         ),
         Err(e) => {
             eprintln!("{}", e);
             process::exit(1);
         }
     };
+
+    if let Some(ref pak_file) = bundle_path {
+        let pak = match bundle::parse_from_file(
+            std::path::Path::new(pak_file),
+            verify_mode,
+            bundle::DEFAULT_MAX_ENTRY_BYTES,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        };
+        if bundle_mode == bundle::BundleMode::Hermetic || script_path.is_none() {
+            if let Err(e) = run_pak_archive(
+                pak,
+                script_path.as_deref(),
+                bundle_mode,
+                dump_bytecode,
+                profile,
+                deterministic,
+                perms,
+                script_args.as_deref(),
+                no_color,
+            ) {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        } else if let Some(ref sp) = script_path {
+            if let Err(e) = run_file_core_full_with_bundle(
+                sp,
+                dump_bytecode,
+                profile,
+                false,
+                perms,
+                None,
+                deterministic,
+                update_snapshots,
+                script_args.as_deref(),
+                no_color,
+                no_cache,
+                None,
+                Some((pak, bundle_mode)),
+            ) {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
 
     if !is_test_cmd && test_filter.is_some() {
         eprintln!("Option '--filter' is only valid with 'askane test'");
@@ -8770,7 +9506,20 @@ gfx.present();
         }
         let main_src = std::fs::read_to_string(manifest_dir.join("src").join("main.rs")).unwrap();
         for core_mod in [
-            "ast", "budget", "buffer", "bytecode", "compiler", "diag", "lexer", "parser", "value",
+            "ast",
+            "asset_audit",
+            "budget",
+            "buffer",
+            "bundle",
+            "bytecode",
+            "compiler",
+            "diag",
+            "lexer",
+            "lsp",
+            "parser",
+            "registry",
+            "scene",
+            "value",
             "vm",
         ] {
             let expected = format!("#[forbid(unsafe_code)]\nmod {};", core_mod);
@@ -8779,14 +9528,17 @@ gfx.present();
                 "Missing #[forbid(unsafe_code)] on mod {}",
                 core_mod
             );
-            let mod_src = std::fs::read_to_string(
-                manifest_dir.join("src").join(format!("{}.rs", core_mod)),
-            )
-            .unwrap();
+            let direct = manifest_dir.join("src").join(format!("{}.rs", core_mod));
+            let path = if direct.is_file() {
+                direct
+            } else {
+                manifest_dir.join("src").join(core_mod).join("mod.rs")
+            };
+            let mod_src = std::fs::read_to_string(&path).unwrap();
             assert!(
                 !mod_src.contains("unsafe {") && !mod_src.contains("unsafe fn"),
-                "Unexpected unsafe code in src/{}.rs",
-                core_mod
+                "Unexpected unsafe code in {}",
+                path.display()
             );
         }
 
@@ -11009,5 +11761,566 @@ sleep(260);
         modules::reset_runtime_state();
         assert!(!crate::audio_backend::is_initialized());
         assert_eq!(crate::audio_backend::get_state().voices, 0);
+    }
+
+    #[test]
+    fn test_v020_stage6_platform_hal_and_bundle_security() {
+        // 1. Platform backend probe & DynLib error semantics
+        let rep = platform::probe_backends();
+        assert_eq!(rep.os, std::env::consts::OS);
+        assert!(rep.probes.iter().any(|p| p.subsystem == "gfx"));
+        assert!(rep.probes.iter().any(|p| p.subsystem == "audio"));
+        assert!(rep.probes.iter().any(|p| p.subsystem == "http"));
+        assert!(rep.probes.iter().any(|p| p.subsystem == "clipboard"));
+
+        let missing_lib = platform::dl::DynLib::open(&["__askane_missing_lib_xyz_999__.so"])
+            .err()
+            .unwrap();
+        assert!(missing_lib.contains("E_BACKEND_UNAVAILABLE"), "got {}", missing_lib);
+
+        // 2. X11 wire protocol, Xauthority & keysyms
+        use platform::linux_x11::*;
+        assert_eq!(
+            parse_display(":0").unwrap(),
+            (
+                X11Target::UnixSocket {
+                    path: "/tmp/.X11-unix/X0".to_string(),
+                    screen: 0
+                },
+                "0".to_string()
+            )
+        );
+        assert_eq!(
+            parse_display(":4.2").unwrap(),
+            (
+                X11Target::UnixSocket {
+                    path: "/tmp/.X11-unix/X4".to_string(),
+                    screen: 2
+                },
+                "4".to_string()
+            )
+        );
+        assert!(parse_display("").unwrap_err().contains("E_BACKEND_UNAVAILABLE"));
+        assert!(parse_display("192.168.1.50:0").unwrap_err().contains("E_BACKEND_UNAVAILABLE"));
+
+        // .Xauthority BE parser
+        let mut xauth = Vec::new();
+        xauth.extend_from_slice(&0x0100u16.to_be_bytes()); // FamilyLocal
+        xauth.extend_from_slice(&4u16.to_be_bytes());
+        xauth.extend_from_slice(b"host");
+        xauth.extend_from_slice(&1u16.to_be_bytes());
+        xauth.extend_from_slice(b"7");
+        xauth.extend_from_slice(&18u16.to_be_bytes());
+        xauth.extend_from_slice(b"MIT-MAGIC-COOKIE-1");
+        xauth.extend_from_slice(&16u16.to_be_bytes());
+        xauth.extend_from_slice(&[0xABu8; 16]);
+        let found_auth = parse_xauthority(&xauth, "7").unwrap();
+        assert_eq!(found_auth.0, "MIT-MAGIC-COOKIE-1");
+        assert_eq!(found_auth.1, vec![0xABu8; 16]);
+        assert!(parse_xauthority(&xauth, "0").is_none());
+
+        let setup_req = encode_setup_request("MIT-MAGIC-COOKIE-1", &[1, 2, 3, 4]);
+        assert_eq!(setup_req[0], b'l');
+        assert_eq!(u16::from_le_bytes([setup_req[2], setup_req[3]]), 11);
+        assert_eq!(setup_req.len() % 4, 0);
+
+        // X11 setup reply body parse with 1 TrueColor screen at depth 24
+        let mut sbody = vec![0u8; 32];
+        sbody[4..8].copy_from_slice(&0x0020_0000u32.to_le_bytes()); // rid_base
+        sbody[8..12].copy_from_slice(&0x001F_FFFFu32.to_le_bytes()); // rid_mask
+        sbody[16..18].copy_from_slice(&4u16.to_le_bytes()); // vendor len = 4
+        sbody[18..20].copy_from_slice(&0x4000u16.to_le_bytes()); // max_req_quads
+        sbody[20] = 1; // 1 screen
+        sbody[21] = 1; // 1 pixmap format
+        sbody.extend_from_slice(b"XORG"); // vendor
+        sbody.extend_from_slice(&[24, 32, 32, 0, 0, 0, 0, 0]); // pixmap format (depth 24, bpp 32)
+        // Screen (40 bytes):
+        let mut scr = vec![0u8; 40];
+        scr[0..4].copy_from_slice(&0x0000_0099u32.to_le_bytes()); // root win
+        scr[12..16].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes()); // white
+        scr[16..20].copy_from_slice(&0x0000_0000u32.to_le_bytes()); // black
+        scr[32..36].copy_from_slice(&0x21u32.to_le_bytes()); // root visual
+        scr[38] = 24; // root depth
+        scr[39] = 1; // 1 allowed depth
+        sbody.extend_from_slice(&scr);
+        // Depth record: depth=24, nvisuals=1 (8 bytes)
+        sbody.extend_from_slice(&[24, 0, 1, 0, 0, 0, 0, 0]);
+        // VisualType (24 bytes): visualid=0x21, class=4 (TrueColor)
+        let mut vis = vec![0u8; 24];
+        vis[0..4].copy_from_slice(&0x21u32.to_le_bytes());
+        vis[4] = 4; // TrueColor
+        sbody.extend_from_slice(&vis);
+        let parsed_vis = parse_setup_reply_body(&sbody, 0).unwrap();
+        assert_eq!(parsed_vis.root_window, 0x99);
+        assert_eq!(parsed_vis.root_depth, 24);
+        assert_eq!(parsed_vis.bits_per_pixel, 32);
+
+        let put_pkt = encode_put_image_rows(10, 20, 2, 1, 3, 24, &[0xFF010203, 0xFF040506]);
+        assert_eq!(put_pkt[0], 72);
+        assert_eq!(put_pkt[1], 2);
+        assert_eq!(put_pkt.len() % 4, 0);
+
+        let mut del_ev = [0u8; 32];
+        del_ev[0] = 33;
+        del_ev[12..16].copy_from_slice(&42u32.to_le_bytes());
+        assert_eq!(decode_x11_event(&del_ev, 42), X11Event::ClientDelete);
+        assert_eq!(keysym_to_vk(b'z' as u32), Some(b'Z' as i32));
+        assert_eq!(x11_keycode_to_vk(65), Some(0x20));
+
+        // 3. HTTPS URL / HTTP1 / Chunked parser
+        use platform::linux_tls::*;
+        let pu = parse_https_url("https://api.askane.dev:8443/v1/item?x=1#top").unwrap();
+        assert_eq!(pu.host, "api.askane.dev");
+        assert_eq!(pu.port, 8443);
+        assert_eq!(pu.path, "/v1/item?x=1");
+        assert!(parse_https_url("http://insecure.local/").is_err());
+        let hreq = build_http1_request("POST", "api.askane.dev", 443, "/v1", None, Some(b"ab"));
+        let htext = String::from_utf8(hreq).unwrap();
+        assert!(htext.starts_with("POST /v1 HTTP/1.1\r\nHost: api.askane.dev\r\n"));
+        assert!(htext.contains("Content-Length: 2\r\n"));
+        assert_eq!(
+            decode_chunked_body(b"2\r\nhi\r\n3\r\n!!!\r\n0\r\n\r\n", 128).unwrap(),
+            b"hi!!!"
+        );
+
+        // sys.backends() callable from VM
+        {
+            let mut vm = VM::new();
+            let v = vm
+                .run(compile_source("import sys; sys.backends()").unwrap())
+                .unwrap();
+            let value::Value::Dict(d) = v else {
+                panic!("sys.backends() did not return dict");
+            };
+            assert!(d.borrow().contains_key("gfx"));
+            assert!(d.borrow().contains_key("audio"));
+        }
+
+        // 4. ASKANE-PAK NFC, T1-T6 negative attacks, packing, VFS hermetic/overlay, --pack-askc, --embed, bit-flip unrecoverability
+        assert_eq!(bundle::normalize_nfc("e\u{0301}"), "\u{00E9}");
+        assert_eq!(bundle::normalize_nfc("\u{0438}\u{0306}"), "\u{0439}");
+        assert_eq!(bundle::normalize_nfc("\u{0415}\u{0308}"), "\u{0401}");
+
+        for bad in [
+            "a\0b",
+            "../evil.txt",
+            "a/../../b",
+            "a//b",
+            "a\\b",
+            "/etc/passwd",
+            "C:/boot.ini",
+            "CON",
+            "assets/nul.png",
+            "COM1.txt",
+            "LPT9",
+            "sprite.png ",
+            "sprite.png.",
+            "bad:name.png",
+        ] {
+            assert!(
+                bundle::validate_pak_entry_name(bad).is_err(),
+                "Expected bad pak entry '{}' to fail validation",
+                bad
+            );
+        }
+
+        let collision = bundle::build_pak_from_memory_entries(
+            &[
+                ("assets/Hero.png", bundle::PakEntryKind::Asset, b"one"),
+                ("assets/hero.png", bundle::PakEntryKind::Asset, b"two"),
+            ],
+            &bundle::BuildPakOptions::default(),
+        );
+        assert!(collision.unwrap_err().contains("E_BUNDLE_CORRUPT"));
+
+        let tmp = std::env::temp_dir().join(format!("askane_stage6_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::create_dir_all(tmp.join("assets")).unwrap();
+        std::fs::write(
+            tmp.join("askane.toml"),
+            "entry = \"main.ask\"\n[package]\nname = \"pak_test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("sub").join("helper.ask"), "pub fn tag() { \"FROM_PAK\" }\n")
+            .unwrap();
+        std::fs::write(tmp.join("assets").join("info.txt"), "PAK_PAYLOAD_1234567890_PADDING")
+            .unwrap();
+        std::fs::write(
+            tmp.join("main.ask"),
+            r#"import "./sub/helper.ask" as h;
+import assets;
+import fs;
+#{ mod_tag: h.tag(), asset_txt: assets.read_text("assets/info.txt"), fs_txt: fs.read("assets/info.txt"), fs_ex: fs.exists("assets/info.txt"), dir_list: fs.list_dir("assets") }
+"#,
+        )
+        .unwrap();
+
+        let (pak_raw_bytes, metas) =
+            bundle::build_pak_from_target(&tmp, &bundle::BuildPakOptions::default()).unwrap();
+        assert!(metas.len() >= 4);
+        let pak_path = tmp.join("game.pak");
+        std::fs::write(&pak_path, &pak_raw_bytes).unwrap();
+        let parsed = bundle::parse_from_file(
+            &pak_path,
+            bundle::VerifyMode::Full,
+            bundle::DEFAULT_MAX_ENTRY_BYTES,
+        )
+        .unwrap();
+        assert_eq!(parsed.entry_script.as_deref(), Some("main.ask"));
+        assert!(parsed.flags & 1 != 0);
+
+        // Test --pack-askc bytecode build & verify
+        let (askc_bytes, askc_metas) = bundle::build_pak_from_target(
+            &tmp,
+            &bundle::BuildPakOptions {
+                pack_askc: true,
+                ..bundle::BuildPakOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(askc_metas.iter().any(|m| m.name == "main.askc"));
+        assert!(askc_metas.iter().any(|m| m.name == "sub/helper.askc"));
+        let askc_pak = bundle::parse_pak_bytes(
+            &askc_bytes,
+            bundle::VerifyMode::Full,
+            bundle::DEFAULT_MAX_ENTRY_BYTES,
+        )
+        .unwrap();
+        assert_eq!(askc_pak.entry_script.as_deref(), Some("main.askc"));
+
+        // Overwrite disk files with poison values + add host-only secret file
+        std::fs::write(tmp.join("assets").join("info.txt"), "DISK_OVERRIDE").unwrap();
+        std::fs::write(tmp.join("host_secret.txt"), "HOST_SECRET").unwrap();
+
+        // In Hermetic mode: disk override is IGNORED and host_secret.txt is UNREADABLE
+        {
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_bundle_mode(bundle::BundleMode::Hermetic);
+            vm.mount_pak(parsed.clone());
+            vm.set_current_dir(tmp.clone());
+            vm.set_sandbox_root(tmp.clone());
+
+            let entry_bytes = parsed.read_logical("main.ask").unwrap().unwrap();
+            let proto = compile_source(&String::from_utf8(entry_bytes).unwrap()).unwrap();
+            let res = vm.run(proto).unwrap();
+            let value::Value::Dict(d) = res else {
+                panic!("expected dict from bundled run");
+            };
+            let b = d.borrow();
+            assert_eq!(format!("{}", b["mod_tag"]), "FROM_PAK");
+            assert_eq!(
+                format!("{}", b["asset_txt"]),
+                "PAK_PAYLOAD_1234567890_PADDING"
+            );
+            assert_eq!(format!("{}", b["fs_txt"]), "PAK_PAYLOAD_1234567890_PADDING");
+
+            let secret_res = vm.run(
+                compile_source("import fs; fs.read(\"host_secret.txt\")").unwrap(),
+            );
+            assert!(secret_res.is_err());
+        }
+
+        // In Overlay mode: disk file overrides pak, missing disk falls back cleanly to pak!
+        {
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_bundle_mode(bundle::BundleMode::Overlay);
+            vm.mount_pak(parsed.clone());
+            vm.set_current_dir(tmp.clone());
+            vm.set_sandbox_root(tmp.clone());
+            let ov = vm
+                .run(compile_source("import assets; assets.read_text(\"assets/info.txt\")").unwrap())
+                .unwrap();
+            assert_eq!(format!("{}", ov), "DISK_OVERRIDE");
+        }
+
+        // Test --pack-askc bytecode direct execution
+        run_pak_archive(
+            askc_pak,
+            None,
+            bundle::BundleMode::Hermetic,
+            false,
+            false,
+            false,
+            Permissions::sandboxed(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        // Bit-flip integrity & try/catch unrecoverability
+        let mut flipped = pak_raw_bytes.clone();
+        flipped[bundle::PAK_HEADER_SIZE + 5] ^= 0x55;
+        let flip_err = bundle::parse_pak_bytes(
+            &flipped,
+            bundle::VerifyMode::Full,
+            bundle::DEFAULT_MAX_ENTRY_BYTES,
+        )
+        .unwrap_err();
+        assert!(flip_err.contains("E_BUNDLE_CORRUPT"), "got {}", flip_err);
+
+        // Even inside lazy pak with corrupted entry payload bytes, try/catch CANNOT catch E_BUNDLE_CORRUPT!
+        let mut corrupt_pak = parsed.clone();
+        let target_off = corrupt_pak
+            .find("assets/info.txt")
+            .unwrap()
+            .data_offset as usize;
+        let mut mut_buf = (*corrupt_pak.data).clone();
+        mut_buf[target_off] ^= 0x01;
+        corrupt_pak.data = std::rc::Rc::new(mut_buf);
+        {
+            let mut vm = VM::new_with_sandbox(true);
+            vm.set_bundle_mode(bundle::BundleMode::Hermetic);
+            vm.mount_pak(corrupt_pak);
+            let try_res = vm
+                .run(
+                    compile_source(
+                        "import assets;\ntry { assets.read_text(\"assets/info.txt\") } catch e { \"SWALLOWED\" }",
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err();
+            assert!(try_res.contains("E_BUNDLE_CORRUPT"), "got {}", try_res);
+        }
+
+        // Embed roundtrip check
+        let embedded_bin = tmp.join("game_embedded.exe");
+        bundle::embed_pak_into_executable(&embedded_bin, &pak_raw_bytes).unwrap();
+        let reparsed_emb = bundle::parse_from_file(
+            &embedded_bin,
+            bundle::VerifyMode::Full,
+            bundle::DEFAULT_MAX_ENTRY_BYTES,
+        )
+        .unwrap();
+        assert_eq!(reparsed_emb.entries.len(), parsed.entries.len());
+
+        // 5. Compile-time asset audit (`E0565`, `W0501`, `W0502`, alias tracking)
+        let audit_bad = tmp.join("audit_bad.ask");
+        std::fs::write(&audit_bad, "import assets as a;\na.load_image(\"../escape.png\");\n").unwrap();
+        let r_bad = check_file_report(&audit_bad.to_string_lossy(), true, false);
+        assert!(!r_bad.ok);
+        assert!(r_bad.file_json.contains("E0565"));
+
+        let audit_con = tmp.join("audit_con.ask");
+        std::fs::write(&audit_con, "from mesh import load as ml;\nml(\"CON\");\n").unwrap();
+        let r_con = check_file_report(&audit_con.to_string_lossy(), true, false);
+        assert!(!r_con.ok);
+        assert!(r_con.file_json.contains("E0565"));
+
+        let audit_warn = tmp.join("audit_warn.ask");
+        std::fs::write(
+            &audit_warn,
+            "import assets;\nassets.load_image(\"assets/missing.png\");\nlet dyn_p = \"a\" + \".png\";\nassets.load_texture(dyn_p);\n",
+        )
+        .unwrap();
+        let r_warn = check_file_report(&audit_warn.to_string_lossy(), true, false);
+        assert!(r_warn.ok);
+        assert!(r_warn.file_json.contains("W0502"));
+        assert!(r_warn.file_json.contains("W0501"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_v020_stage7_registry_docs_init_and_lsp() {
+        // 1. Registry 1-to-1 completeness & docs_sync verification
+        registry::check_registry_integrity().unwrap();
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let update_docs = std::env::var("ASKANE_UPDATE_DOCS").is_ok_and(|v| v == "1");
+        registry::sync_docs_at(manifest_dir, update_docs).unwrap();
+        let md = registry::render_modules_markdown();
+        assert!(md.contains("`gfx`") && md.contains("`scene`") && md.contains("`audio`"));
+
+        // 2. askane init --template game & reserved name rejection
+        assert!(validate_init_pkg_name("CON").is_err());
+        assert!(validate_init_pkg_name("nul.txt").is_err());
+        assert!(validate_init_pkg_name("hero_game").is_ok());
+
+        let tmp = std::env::temp_dir().join(format!("askane_stage7_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let game_dir = tmp.join("starter_game");
+        run_init_cli(&[
+            "--template".to_string(),
+            "game".to_string(),
+            "--name".to_string(),
+            "starter_game".to_string(),
+            game_dir.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+
+        let png_bytes = std::fs::read(game_dir.join("assets").join("player.png")).unwrap();
+        assert!(png_bytes.len() < 1024);
+        let (pw, ph, _px) = crate::media::formats::png::decode_png_argb(&png_bytes).unwrap();
+        assert_eq!(pw, 8);
+        assert_eq!(ph, 8);
+        assert!(game_dir.join("assets").join("map.tmj").is_file());
+
+        let (chk_ok, chk_json) = check_dir_json_report(&game_dir.to_string_lossy(), false);
+        assert!(chk_ok, "starter game check failed: {}", chk_json);
+        assert!(!chk_json.contains("E0565"));
+        assert!(!chk_json.contains("W0502"));
+        run_tests_cmd_with_opts(
+            &game_dir.join("tests").to_string_lossy(),
+            Permissions::sandboxed(),
+            Some(&game_dir),
+            false,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // 3. LSP UTF-16 conversion + JSON-RPC stdio golden frames
+        let line_with_emoji = "let s = \"🚀\"; bad";
+        assert_eq!(lsp::utf16_col_for_char_index(line_with_emoji, 14), 15);
+        assert_eq!(lsp::char_index_for_utf16_col(line_with_emoji, 15), 14);
+
+        let mut req_stream = Vec::new();
+        let push_frame = |buf: &mut Vec<u8>, json: &str| {
+            lsp::write_lsp_frame(buf, json).unwrap();
+        };
+
+        let sample_src = "import math as m;\nimport assets;\nlet msg = \"\u{1F680}\"; assets.load_image(\"../evil.png\");\nfn helper(a, b) { m.sqrt(a + b) }\n";
+        let open_doc = lsp::JsonVal::Obj(vec![
+            ("jsonrpc".to_string(), lsp::JsonVal::Str("2.0".to_string())),
+            (
+                "method".to_string(),
+                lsp::JsonVal::Str("textDocument/didOpen".to_string()),
+            ),
+            (
+                "params".to_string(),
+                lsp::JsonVal::Obj(vec![(
+                    "textDocument".to_string(),
+                    lsp::JsonVal::Obj(vec![
+                        (
+                            "uri".to_string(),
+                            lsp::JsonVal::Str("file:///test_lsp.ask".to_string()),
+                        ),
+                        (
+                            "languageId".to_string(),
+                            lsp::JsonVal::Str("askane".to_string()),
+                        ),
+                        ("version".to_string(), lsp::JsonVal::Num("1".to_string())),
+                        ("text".to_string(), lsp::JsonVal::Str(sample_src.to_string())),
+                    ]),
+                )]),
+            ),
+        ])
+        .to_json();
+
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}"#,
+        );
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        );
+        push_frame(&mut req_stream, &open_doc);
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///test_lsp.ask"}}}"#,
+        );
+        // Hover over `m.sqrt` on line 3 col 20 (`m.sqrt` starts at index 18 -> char 20)
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test_lsp.ask"},"position":{"line":3,"character":20}}}"#,
+        );
+        // Completion after `m.` -> at line 3 char 20 (`m.` prefix!)
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///test_lsp.ask"},"position":{"line":3,"character":20}}}"#,
+        );
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///test_lsp.ask"}}}"#,
+        );
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","id":6,"method":"shutdown","params":null}"#,
+        );
+        push_frame(
+            &mut req_stream,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        );
+
+        let mut out_bytes = Vec::new();
+        lsp::serve_lsp_io(std::io::Cursor::new(&req_stream), &mut out_bytes).unwrap();
+
+        let mut reader = std::io::Cursor::new(&out_bytes);
+        let mut responses = Vec::new();
+        while let Some(frame) = lsp::read_lsp_frame(&mut reader).unwrap() {
+            responses.push(lsp::parse_json(&frame).unwrap());
+        }
+        assert!(responses.len() >= 5, "too few LSP frames: {}", responses.len());
+
+        // Check initialize response id=1
+        let init_resp = responses
+            .iter()
+            .find(|v| v.obj_get("id").and_then(|i| i.as_i64()) == Some(1))
+            .unwrap();
+        assert!(
+            init_resp
+                .obj_get("result")
+                .and_then(|r| r.obj_get("capabilities"))
+                .and_then(|c| c.obj_get("hoverProvider"))
+                == Some(&lsp::JsonVal::Bool(true))
+        );
+
+        // Check documentSymbol includes `helper`
+        let sym_resp = responses
+            .iter()
+            .find(|v| v.obj_get("id").and_then(|i| i.as_i64()) == Some(2))
+            .unwrap();
+        assert!(sym_resp.to_json().contains("\"helper\""));
+
+        // Check hover includes `math.sqrt`
+        let hover_resp = responses
+            .iter()
+            .find(|v| v.obj_get("id").and_then(|i| i.as_i64()) == Some(3))
+            .unwrap();
+        assert!(hover_resp.to_json().contains("math.sqrt"));
+
+        // Check completion includes `sqrt`, `cos`, `pi`
+        let comp_resp = responses
+            .iter()
+            .find(|v| v.obj_get("id").and_then(|i| i.as_i64()) == Some(4))
+            .unwrap();
+        let comp_s = comp_resp.to_json();
+        assert!(comp_s.contains("\"sqrt\"") && comp_s.contains("\"pi\""));
+
+        // Check shutdown response id=6
+        assert!(responses
+            .iter()
+            .any(|v| v.obj_get("id").and_then(|i| i.as_i64()) == Some(6)));
+
+        // Check publishDiagnostics notification caught E0565 with UTF-16 shifted column (let msg = "🚀"; assets.load_image("../evil.png"))
+        let diag_notifs: Vec<_> = responses
+            .iter()
+            .filter(|v| {
+                v.obj_get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+        assert!(!diag_notifs.is_empty());
+        assert!(diag_notifs.iter().any(|n| n.to_json().contains("E0565")));
+
+        // Verify didClose emits empty diagnostics array
+        let mut close_req = Vec::new();
+        push_frame(
+            &mut close_req,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///test_lsp.ask"}}}"#,
+        );
+        push_frame(
+            &mut close_req,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        );
+        let mut close_out = Vec::new();
+        lsp::serve_lsp_io(std::io::Cursor::new(&close_req), &mut close_out).unwrap();
+        let close_frame = lsp::read_lsp_frame(&mut std::io::Cursor::new(&close_out))
+            .unwrap()
+            .unwrap();
+        assert!(close_frame.contains("\"diagnostics\":[]"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

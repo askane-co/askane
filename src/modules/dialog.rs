@@ -149,7 +149,7 @@ fn dlg_info(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     #[cfg(not(windows))]
     {
-        Err("dialog module is currently supported on Windows only".to_string())
+        Err("E_BACKEND_UNAVAILABLE: dialog module requires a Windows desktop backend".to_string())
     }
 }
 
@@ -168,7 +168,7 @@ fn dlg_confirm(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     #[cfg(not(windows))]
     {
-        Err("dialog module is currently supported on Windows only".to_string())
+        Err("E_BACKEND_UNAVAILABLE: dialog module requires a Windows desktop backend".to_string())
     }
 }
 
@@ -189,7 +189,7 @@ fn dlg_open_file(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     #[cfg(not(windows))]
     {
-        Err("dialog module is currently supported on Windows only".to_string())
+        Err("E_BACKEND_UNAVAILABLE: dialog module requires a Windows desktop backend".to_string())
     }
 }
 
@@ -210,6 +210,6 @@ fn dlg_save_file(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     }
     #[cfg(not(windows))]
     {
-        Err("dialog module is currently supported on Windows only".to_string())
+        Err("E_BACKEND_UNAVAILABLE: dialog module requires a Windows desktop backend".to_string())
     }
 }

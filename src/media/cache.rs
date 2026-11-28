@@ -380,12 +380,51 @@ fn read_asset_bytes_inner(
     path: &str,
     permanent_alloc: bool,
 ) -> Result<(Vec<u8>, Option<AssetManifestHint>, String), String> {
+    let has_pak = vm.has_mounted_pak();
+    let is_overlay = !has_pak || vm.bundle_mode() == crate::bundle::BundleMode::Overlay;
+
+    if has_pak && is_overlay {
+        if let Ok(resolved) = vm.resolve_read_path(path) {
+            if resolved.is_file() {
+                let canon = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+                let source_key = format!("file:{}", canon.to_string_lossy());
+                let bytes = read_limited_disk_file(vm, &resolved, path, permanent_alloc)?;
+                return Ok((bytes, None, source_key));
+            }
+        }
+    }
+
     if let Ok(vpath) = normalize_vpath(path) {
         if let Some((zip_rc, meta, hint, source_key)) = find_in_bundles(&vpath) {
             let bytes = read_zip_entry_bytes(vm, &zip_rc, &meta, MAX_SOURCE_BYTES)?;
             return Ok((bytes, hint, source_key));
         }
     }
+
+    if has_pak {
+        if let Some(bytes) = vm.read_pak_bytes(path)? {
+            let len = bytes.len();
+            if len > MAX_SOURCE_BYTES {
+                return Err(err_limit(format!(
+                    "assets: '{}' ({} bytes) exceeds {} byte limit",
+                    path, len, MAX_SOURCE_BYTES
+                )));
+            }
+            vm.charge_io(len)?;
+            if permanent_alloc {
+                vm.charge_alloc(len)?;
+            }
+            let norm = crate::bundle::logical_normalize_rel(path).unwrap_or_else(|_| path.to_string());
+            return Ok((bytes, None, format!("pak:{}", norm)));
+        }
+        if vm.bundle_mode() == crate::bundle::BundleMode::Hermetic {
+            return Err(format!(
+                "Bundle hermetic mode: asset '{}' not found in mounted bundle",
+                path
+            ));
+        }
+    }
+
     let resolved = vm.resolve_read_path(path)?;
     let canon = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
     let source_key = format!("file:{}", canon.to_string_lossy());

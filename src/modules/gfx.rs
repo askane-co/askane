@@ -212,6 +212,8 @@ mod gfx_state {
         }
         #[cfg(windows)]
         super::win32_gfx::destroy_native_window();
+        #[cfg(target_os = "linux")]
+        super::x11_gfx::destroy_native_window();
         TARGET_STACK.with(|st| st.borrow_mut().clear());
         ROOT_CAMERA.with(|c| c.borrow_mut().reset());
         LAST_FRAME.with(|lf| *lf.borrow_mut() = None);
@@ -489,6 +491,193 @@ pub(crate) fn test_peek_pixel(x: i32, y: i32) -> Option<u32> {
 #[cfg(test)]
 pub(crate) fn test_text_count() -> usize {
     gfx_state::text_count()
+}
+
+#[cfg(target_os = "linux")]
+mod x11_gfx {
+    use std::cell::RefCell;
+
+    use crate::platform::linux_x11::{X11Event, X11Session, x11_keycode_to_vk};
+
+    struct X11State {
+        session: X11Session,
+        keys: [bool; 256],
+        mouse_x: i32,
+        mouse_y: i32,
+    }
+
+    thread_local! {
+        static X11_WIN: RefCell<Option<X11State>> = const { RefCell::new(None) };
+    }
+
+    pub fn create_window(title: &str, width: i32, height: i32) -> Result<(), String> {
+        super::gfx_state::close_window(false);
+        let session = X11Session::connect(title, width as u16, height as u16)?;
+        let buffer = vec![0u32; (width * height) as usize];
+        X11_WIN.with(|w| {
+            *w.borrow_mut() = Some(X11State {
+                session,
+                keys: [false; 256],
+                mouse_x: 0,
+                mouse_y: 0,
+            });
+        });
+        super::gfx_state::FRAME.with(|f| {
+            *f.borrow_mut() = Some(super::gfx_state::FrameState {
+                width,
+                height,
+                buffer,
+                depth: None,
+                texts: Vec::new(),
+                clip: None,
+                open: true,
+                headless: false,
+            });
+        });
+        Ok(())
+    }
+
+    pub fn destroy_native_window() {
+        X11_WIN.with(|w| {
+            let _ = w.borrow_mut().take();
+        });
+    }
+
+    pub fn pump_events() -> bool {
+        let mut close_now = false;
+        X11_WIN.with(|w| {
+            let mut b = w.borrow_mut();
+            let Some(st) = b.as_mut() else {
+                close_now = true;
+                return;
+            };
+            for ev in st.session.poll_events() {
+                match ev {
+                    X11Event::ClientDelete => close_now = true,
+                    X11Event::KeyPress { keycode, x, y } => {
+                        st.mouse_x = x as i32;
+                        st.mouse_y = y as i32;
+                        if let Some(vk) = x11_keycode_to_vk(keycode) {
+                            if (0..256).contains(&vk) {
+                                st.keys[vk as usize] = true;
+                            }
+                        }
+                    }
+                    X11Event::KeyRelease { keycode, x, y } => {
+                        st.mouse_x = x as i32;
+                        st.mouse_y = y as i32;
+                        if let Some(vk) = x11_keycode_to_vk(keycode) {
+                            if (0..256).contains(&vk) {
+                                st.keys[vk as usize] = false;
+                            }
+                        }
+                    }
+                    X11Event::ButtonPress { button, x, y } => {
+                        st.mouse_x = x as i32;
+                        st.mouse_y = y as i32;
+                        let vk = match button {
+                            1 => Some(0x01usize),
+                            3 => Some(0x02usize),
+                            2 => Some(0x04usize),
+                            _ => None,
+                        };
+                        if let Some(idx) = vk {
+                            st.keys[idx] = true;
+                        }
+                    }
+                    X11Event::ButtonRelease { button, x, y } => {
+                        st.mouse_x = x as i32;
+                        st.mouse_y = y as i32;
+                        let vk = match button {
+                            1 => Some(0x01usize),
+                            3 => Some(0x02usize),
+                            2 => Some(0x04usize),
+                            _ => None,
+                        };
+                        if let Some(idx) = vk {
+                            st.keys[idx] = false;
+                        }
+                    }
+                    X11Event::Motion { x, y } => {
+                        st.mouse_x = x as i32;
+                        st.mouse_y = y as i32;
+                    }
+                    X11Event::Expose | X11Event::Configure { .. } | X11Event::None => {}
+                }
+            }
+        });
+        super::gfx_state::FRAME.with(|f| {
+            let mut b = f.borrow_mut();
+            if close_now {
+                if let Some(st) = b.as_mut() {
+                    st.open = false;
+                }
+                return false;
+            }
+            b.as_ref().is_some_and(|s| s.open)
+        })
+    }
+
+    pub fn present_native() -> Result<(), String> {
+        super::gfx_state::FRAME.with(|f| {
+            let mut borrow = f.borrow_mut();
+            let state = borrow
+                .as_mut()
+                .ok_or_else(|| "No active gfx window".to_string())?;
+            if !state.open {
+                return Ok(());
+            }
+            state.texts.clear();
+            let keys_snap = X11_WIN.with(|w| {
+                let mut b = w.borrow_mut();
+                let x11 = b
+                    .as_mut()
+                    .ok_or_else(|| "No active gfx X11 session".to_string())?;
+                x11.session.present(state.width, state.height, &state.buffer)?;
+                Ok::<[bool; 256], String>(x11.keys)
+            })?;
+            super::gfx_state::PREV_KEYS.with(|pk| *pk.borrow_mut() = keys_snap);
+            Ok(())
+        })
+    }
+
+    pub fn set_window_title(title: &str) -> Result<(), String> {
+        X11_WIN.with(|w| {
+            let mut b = w.borrow_mut();
+            let x11 = b
+                .as_mut()
+                .ok_or_else(|| "No active gfx window".to_string())?;
+            x11.session.set_title(title)
+        })
+    }
+
+    pub fn mouse_pos() -> Result<(i32, i32), String> {
+        X11_WIN.with(|w| {
+            let b = w.borrow();
+            let x11 = b
+                .as_ref()
+                .ok_or_else(|| "No active gfx window".to_string())?;
+            Ok((x11.mouse_x, x11.mouse_y))
+        })
+    }
+
+    pub fn key_down(vk: i32) -> bool {
+        if !(0..256).contains(&vk) {
+            return false;
+        }
+        X11_WIN.with(|w| {
+            w.borrow()
+                .as_ref()
+                .is_some_and(|x11| x11.keys[vk as usize])
+        })
+    }
+
+    pub fn key_pressed(vk: i32) -> bool {
+        if !(0..256).contains(&vk) {
+            return false;
+        }
+        key_down(vk) && !super::gfx_state::PREV_KEYS.with(|pk| pk.borrow()[vk as usize])
+    }
 }
 
 #[cfg(windows)]
@@ -1037,10 +1226,15 @@ fn gfx_window(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         win32_gfx::create_window(title, w as i32, h as i32)?;
         Ok(Value::Unit)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        x11_gfx::create_window(title, w as i32, h as i32)?;
+        Ok(Value::Unit)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = title;
-        Err("gfx.window() requires Windows or gfx.headless(true)".to_string())
+        Err("E_BACKEND_UNAVAILABLE: gfx.window() requires a display backend or gfx.headless(true)".to_string())
     }
 }
 
@@ -1057,7 +1251,11 @@ fn gfx_is_open(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             {
                 Ok(Value::Bool(win32_gfx::pump_events()))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Value::Bool(x11_gfx::pump_events()))
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 Ok(Value::Bool(false))
             }
@@ -1552,9 +1750,14 @@ fn gfx_present(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 win32_gfx::present_native()?;
                 Ok(Value::Unit)
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
             {
-                Err("No active gfx window".to_string())
+                x11_gfx::present_native()?;
+                Ok(Value::Unit)
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                Err("E_BACKEND_UNAVAILABLE: no active native gfx backend".to_string())
             }
         }
         None => Err("No active gfx window".to_string()),
@@ -1611,7 +1814,11 @@ fn gfx_key_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             {
                 Ok(Value::Bool(win32_gfx::key_down(vk)))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Value::Bool(x11_gfx::key_down(vk)))
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = vk;
                 Ok(Value::Bool(false))
@@ -1636,7 +1843,11 @@ fn gfx_key_pressed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             {
                 Ok(Value::Bool(win32_gfx::key_pressed(vk)))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Value::Bool(x11_gfx::key_pressed(vk)))
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = vk;
                 Ok(Value::Bool(false))
@@ -1696,7 +1907,12 @@ fn gfx_mouse_x(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 let (x, _) = win32_gfx::mouse_pos()?;
                 Ok(Value::Int(x as i64))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                let (x, _) = x11_gfx::mouse_pos()?;
+                Ok(Value::Int(x as i64))
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 Ok(Value::Int(0))
             }
@@ -1717,7 +1933,12 @@ fn gfx_mouse_y(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 let (_, y) = win32_gfx::mouse_pos()?;
                 Ok(Value::Int(y as i64))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                let (_, y) = x11_gfx::mouse_pos()?;
+                Ok(Value::Int(y as i64))
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 Ok(Value::Int(0))
             }
@@ -1762,7 +1983,11 @@ fn gfx_mouse_down(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             {
                 Ok(Value::Bool(win32_gfx::key_down(vk)))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Value::Bool(x11_gfx::key_down(vk)))
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = vk;
                 Ok(Value::Bool(false))
@@ -1790,7 +2015,11 @@ fn gfx_mouse_pressed(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             {
                 Ok(Value::Bool(win32_gfx::key_pressed(vk)))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Value::Bool(x11_gfx::key_pressed(vk)))
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = vk;
                 Ok(Value::Bool(false))
@@ -2484,10 +2713,15 @@ fn gfx_set_title(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 win32_gfx::set_window_title(title)?;
                 Ok(Value::Unit)
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                x11_gfx::set_window_title(title)?;
+                Ok(Value::Unit)
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = title;
-                Err("No active gfx window".to_string())
+                Err("E_BACKEND_UNAVAILABLE: no active native gfx backend".to_string())
             }
         }
         None => Err("No active gfx window".to_string()),
@@ -3374,7 +3608,12 @@ fn gfx_mouse_world(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
                 let (x, y) = win32_gfx::mouse_pos()?;
                 (x as f64, y as f64)
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                let (x, y) = x11_gfx::mouse_pos()?;
+                (x as f64, y as f64)
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 (0.0, 0.0)
             }

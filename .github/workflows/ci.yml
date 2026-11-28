@@ -5,14 +5,93 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ windows-latest, ubuntu-latest ]
-    runs-on: ${{ matrix.os }}
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify zero third-party crates
+        shell: pwsh
+        run: |
+          $lock = Get-Content Cargo.lock -Raw
+          $pkgs = [regex]::Matches($lock, 'name = "([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+          if ($pkgs.Count -ne 1 -or $pkgs[0] -ne "askane") {
+            throw "Unexpected external crate(s) in Cargo.lock: $($pkgs -join ', ')"
+          }
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: CLI & docs_sync smoke checks
+        shell: pwsh
+        run: |
+          $bin = "target/release/askane.exe"
+          $len = (Get-Item $bin).Length
+          if ($len -ge 12582912) { throw "Release binary oversized: $len bytes" }
+          & $bin modules --markdown --check
+          if ($LASTEXITCODE -ne 0) { throw "docs_sync check failed" }
+          & $bin doctor
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+          $tmp = Join-Path $env:RUNNER_TEMP "askane_ci_game"
+          if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+          & $bin init --template game $tmp
+          if ($LASTEXITCODE -ne 0) { throw "init failed" }
+          & $bin check $tmp
+          if ($LASTEXITCODE -ne 0) { throw "check failed" }
+          & $bin test $tmp
+          if ($LASTEXITCODE -ne 0) { throw "test failed" }
+          $pak = Join-Path $env:RUNNER_TEMP "game.pak"
+          & $bin bundle $tmp --pack-askc --out $pak
+          if ($LASTEXITCODE -ne 0) { throw "bundle failed" }
+          & $bin bundle verify $pak
+          if ($LASTEXITCODE -ne 0) { throw "bundle verify failed" }
+          & $bin --bundle $pak --bundle-mode=hermetic
+          if ($LASTEXITCODE -ne 0) { throw "bundle run failed" }
+
+  ubuntu-bare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run headless & unit tests (no desktop/X11 libs)
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Docs & headless smoke checks
+        run: |
+          ./target/release/askane modules --markdown --check
+          ./target/release/askane doctor
+          TMPD=$(mktemp -d)
+          ./target/release/askane init --template game "$TMPD"
+          ./target/release/askane check "$TMPD"
+          ./target/release/askane test "$TMPD"
+          ./target/release/askane bundle "$TMPD" --pack-askc --out "$TMPD.pak"
+          ./target/release/askane bundle verify "$TMPD.pak"
+          ./target/release/askane --bundle "$TMPD.pak" --bundle-mode=hermetic
+
+  ubuntu-backends:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Xvfb & ALSA runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth || true
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2 || true
+      - name: Run tests under Xvfb
+        run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked
+      - name: Build release & probe live X11 window
+        run: |
+          cargo build --release --locked
+          xvfb-run -a -s "-screen 0 1280x720x24" ./target/release/askane doctor
+          xvfb-run -a -s "-screen 0 1280x720x24" ./target/release/askane -e 'import gfx; gfx.window("CI X11", 64, 64); gfx.clear(10, 20, 30); gfx.present(); gfx.close(); println("x11_ok");'
+
+  macos:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -20,3 +99,11 @@ jobs:
         run: cargo test --locked
       - name: Build release
         run: cargo build --release --locked
+      - name: CLI & docs_sync smoke checks
+        run: |
+          ./target/release/askane modules --markdown --check
+          ./target/release/askane doctor
+          TMPD=$(mktemp -d)
+          ./target/release/askane init --template game "$TMPD"
+          ./target/release/askane check "$TMPD"
+          ./target/release/askane test "$TMPD"

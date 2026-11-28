@@ -19,7 +19,7 @@ Release roadmap for Askane, separated into completed milestones, immediate fixes
 | `0.17.0 - 0.17.1` | **Done** | Askane Studio v2 + Setup UI, `crypto`, `kv`, `net`, `ws`, cooperative `task`/`channel`, `--deterministic`, snapshots, reactive `signal` & `on change` |
 | `0.18.0` | **Done** | Diagnostics (`E...`/`W...`, `--explain`, `--diagnostic-format=json`, `did you mean`, recovery, lints), semantics/helpers, `gfx` alpha/`key_pressed`, CLI `info`/`doctor`/`modules`/`clean` |
 | `0.19.0` | **Done** | Bytecode cache (`.askc` / `--no-cache`), streaming & directory `fs` (`read_lines`/`open_lines`/`write_stream`/`walk`/`copy_dir`/`temp_file`), `fmt --diff`/`--stdin` + `[fmt] indent`, `test --filter`, `gfx` sprite sheets, `mouse_pressed`, normalized `delta` & cross-platform `headless` |
-| `0.20.0` | **Planned** | Expanded media & world engine (`media::image` PNG/BMP/TGA/QOI/GIF/baseline JPEG, multi-channel `audio` `Mixer`/`Voice`/`Music`/`Bus` + `WAV`/`PCM`/`ADPCM`/`render_offline`, software `Surface` + DepthBuffer + fonts, Tiled maps, `.r16` terrain, `.obj`/`.mtl`/`.gltf`/`.glb` meshes, lighting/postfx, `TypedBuffer`, VM speedup `65-75+`, cross-platform HAL, `askane bundle`, `askane lsp`) |
+| `0.20.0` | **Done** | Expanded media & world engine (`media::image` PNG/BMP/TGA/QOI/GIF/baseline JPEG, multi-channel `audio` `Mixer`/`Voice`/`Music`/`Bus` + `WAV`/`PCM`/`ADPCM`/`render_offline`, software `Surface` + DepthBuffer + fonts, Tiled maps, `.r16` terrain, `.obj`/`.mtl`/`.gltf`/`.glb` meshes, lighting/postfx, `TypedBuffer`, VM speedup `65-75+`, cross-platform HAL, `askane bundle`, `askane lsp`) |
 | `0.21.0 - 0.22.0` | **Exploratory** | Software triangle rasterizer, fuzzed TTF fonts, opt-in compressed audio (`FLAC`/`MP3`/`OGG`), fuzzing corpus, AppContainer/DNS hardening, dedicated `0.22` `gfx3d` 3D module (camera, PBR, IBL, lighting, skinning) over frozen `0.20` contracts & baseline JIT exploration |
 
 ---
@@ -112,7 +112,7 @@ This release focuses on strengthening the existing foundation before adding heav
 
 ---
 
-## Next Milestone: `0.20.0` (`Planned`)
+## `0.20.0` - Media Engine, 3D Assets, HAL, Packaging & LSP [Done]
 
 Designed around a clean `Core` + `Extension` architecture (zero external Rust crates, estimated `+410..685 KB` release binary growth to ~`4.8..5.1 MB`, `+5%` CI size gate) with 5 frozen runtime/asset contracts preparing Askane for native 3D in `0.22.0`:
 

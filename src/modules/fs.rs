@@ -101,7 +101,22 @@ fn fs_read(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.read() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "read")?;
-    let path_buf = vm.resolve_read_path(path)?;
+    let path_buf = match vm.vfs_read_bytes(path)? {
+        crate::bundle::VfsRead::PakBytes(bytes) => {
+            if bytes.len() > MAX_FS_BYTES {
+                return Err(format!(
+                    "File '{}' exceeds {} byte limit",
+                    path, MAX_FS_BYTES
+                ));
+            }
+            vm.charge_io(bytes.len())?;
+            vm.charge_alloc(bytes.len())?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("fs.read('{}'): file is not valid UTF-8", path))?;
+            return Ok(Value::from_str(text));
+        }
+        crate::bundle::VfsRead::DiskPath(p) => p,
+    };
     if let Ok(meta) = fs::metadata(&path_buf) {
         if meta.len() <= MAX_FS_BYTES as u64 {
             let size = meta.len() as usize;
@@ -162,6 +177,15 @@ fn fs_exists(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.exists() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "exists")?;
+    if vm.has_mounted_pak() {
+        if vm.bundle_mode() == crate::bundle::BundleMode::Hermetic {
+            return Ok(Value::Bool(vm.pak_exists(path) || vm.pak_is_dir(path)));
+        }
+        if vm.resolve_read_path(path).is_ok_and(|p| p.exists()) {
+            return Ok(Value::Bool(true));
+        }
+        return Ok(Value::Bool(vm.pak_exists(path) || vm.pak_is_dir(path)));
+    }
     Ok(Value::Bool(
         vm.resolve_read_path(path).is_ok_and(|p| p.exists()),
     ))
@@ -182,9 +206,56 @@ fn fs_list_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.list_dir() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "list_dir")?;
+    if vm.has_mounted_pak() && vm.bundle_mode() == crate::bundle::BundleMode::Hermetic {
+        if !vm.pak_is_dir(path) {
+            return Err(format!("fs.list_dir('{}'): directory not found in bundle", path));
+        }
+        let entries = vm.pak_list_dir(path);
+        let mut names = Vec::with_capacity(entries.len());
+        for s in entries {
+            vm.charge_alloc(s.len().saturating_add(std::mem::size_of::<Value>()))?;
+            names.push(Value::from_str(s));
+        }
+        return Ok(Value::List(Rc::new(RefCell::new(names))));
+    }
+    let mut names = Vec::new();
+    let mut seen_lower = std::collections::HashSet::new();
+    if let Ok(path_buf) = vm.resolve_read_path(path) {
+        if let Ok(entries) = fs::read_dir(&path_buf) {
+            for (i, entry) in entries.enumerate() {
+                if (i & 255) == 0 {
+                    vm.check_timeout()?;
+                    vm.charge_work(1)?;
+                }
+                if names.len() >= 100_000 {
+                    return Err("fs.list_dir() directory entry limit (100000) exceeded".to_string());
+                }
+                let entry = entry.map_err(|e| format!("fs.list_dir('{}'): {}", path, e))?;
+                let s = entry.file_name().to_string_lossy().to_string();
+                seen_lower.insert(s.to_lowercase());
+                vm.charge_alloc(s.len().saturating_add(std::mem::size_of::<Value>()))?;
+                names.push(Value::from_str(s));
+            }
+            if vm.has_mounted_pak() {
+                for s in vm.pak_list_dir(path) {
+                    if seen_lower.insert(s.to_lowercase()) {
+                        vm.charge_alloc(s.len().saturating_add(std::mem::size_of::<Value>()))?;
+                        names.push(Value::from_str(s));
+                    }
+                }
+            }
+            return Ok(Value::List(Rc::new(RefCell::new(names))));
+        }
+    }
+    if vm.has_mounted_pak() && vm.pak_is_dir(path) {
+        for s in vm.pak_list_dir(path) {
+            vm.charge_alloc(s.len().saturating_add(std::mem::size_of::<Value>()))?;
+            names.push(Value::from_str(s));
+        }
+        return Ok(Value::List(Rc::new(RefCell::new(names))));
+    }
     let path_buf = vm.resolve_read_path(path)?;
     let entries = fs::read_dir(&path_buf).map_err(|e| format!("fs.list_dir('{}'): {}", path, e))?;
-    let mut names = Vec::new();
     for (i, entry) in entries.enumerate() {
         if (i & 255) == 0 {
             vm.check_timeout()?;
@@ -216,6 +287,15 @@ fn fs_is_dir(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.is_dir() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "is_dir")?;
+    if vm.has_mounted_pak() {
+        if vm.bundle_mode() == crate::bundle::BundleMode::Hermetic {
+            return Ok(Value::Bool(vm.pak_is_dir(path)));
+        }
+        if vm.resolve_read_path(path).is_ok_and(|p| p.is_dir()) {
+            return Ok(Value::Bool(true));
+        }
+        return Ok(Value::Bool(vm.pak_is_dir(path)));
+    }
     Ok(Value::Bool(
         vm.resolve_read_path(path).is_ok_and(|p| p.is_dir()),
     ))
@@ -231,7 +311,20 @@ fn fs_read_bytes(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.read_bytes() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "read_bytes")?;
-    let path_buf = vm.resolve_read_path(path)?;
+    let path_buf = match vm.vfs_read_bytes(path)? {
+        crate::bundle::VfsRead::PakBytes(bytes) => {
+            if bytes.len() > MAX_FS_BYTES {
+                return Err(format!(
+                    "File '{}' exceeds {} byte limit",
+                    path, MAX_FS_BYTES
+                ));
+            }
+            vm.charge_io(bytes.len())?;
+            vm.charge_alloc(bytes.len())?;
+            return Ok(Value::Bytes(Rc::new(bytes)));
+        }
+        crate::bundle::VfsRead::DiskPath(p) => p,
+    };
     let file =
         fs::File::open(&path_buf).map_err(|e| format!("fs.read_bytes('{}'): {}", path, e))?;
     let meta = file
@@ -323,7 +416,12 @@ fn fs_size(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
         return Err("fs.size() expects 1 argument (path)".to_string());
     }
     let path = expect_str(&args[0], "size")?;
-    let path_buf = vm.resolve_read_path(path)?;
+    let path_buf = match vm.vfs_read_bytes(path)? {
+        crate::bundle::VfsRead::PakBytes(bytes) => {
+            return Ok(Value::Int(bytes.len() as i64));
+        }
+        crate::bundle::VfsRead::DiskPath(p) => p,
+    };
     let meta = fs::metadata(&path_buf).map_err(|e| format!("fs.size('{}'): {}", path, e))?;
     Ok(Value::Int(meta.len() as i64))
 }
@@ -544,7 +642,29 @@ fn fs_read_lines(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
     } else {
         DEFAULT_MAX_LINES
     };
-    let path_buf = vm.resolve_read_path(path)?;
+    let path_buf = match vm.vfs_read_bytes(path)? {
+        crate::bundle::VfsRead::PakBytes(bytes) => {
+            if bytes.len() > MAX_FS_BYTES {
+                return Err(format!("fs.read_lines('{}'): exceeds size limit", path));
+            }
+            vm.charge_io(bytes.len())?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("fs.read_lines('{}'): invalid UTF-8", path))?;
+            let mut lines = Vec::new();
+            for (idx, line) in text.lines().enumerate() {
+                if lines.len() >= max_lines {
+                    break;
+                }
+                if (idx & 255) == 0 {
+                    vm.check_timeout()?;
+                }
+                vm.charge_alloc(line.len().saturating_add(std::mem::size_of::<Value>()))?;
+                lines.push(Value::from_str(line));
+            }
+            return Ok(Value::List(Rc::new(RefCell::new(lines))));
+        }
+        crate::bundle::VfsRead::DiskPath(p) => p,
+    };
     let file = File::open(&path_buf).map_err(|e| format!("fs.read_lines('{}'): {}", path, e))?;
     let meta = file
         .metadata()

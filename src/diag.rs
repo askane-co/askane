@@ -8,7 +8,8 @@ pub const ALL_CODES: &[&str] = &[
     "E0101", "E0201", "E0202", "E0301", "E0302", "E0401", "E0402", "E0403", "E0404", "E0405",
     "E0501", "E0502", "E0503", "E0504", "E0505", "E0506", "E0507", "E0508", "E0509", "E0510",
     "E0511", "E0512", "E0513", "E0514", "E0515", "E0520", "E0521", "E0530", "E0531", "E0532",
-    "E0533", "E0540", "E0550", "E0551", "E0552", "W0101", "W0102",
+    "E0533", "E0540", "E0550", "E0551", "E0552", "E0560", "E0561", "E0562", "E0563", "E0564",
+    "E0565", "W0101", "W0102", "W0501", "W0502",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +157,18 @@ pub(crate) fn classify_code(msg: &str) -> &'static str {
         "E0551"
     } else if msg.contains("E_SCENE_INVALID") {
         "E0552"
+    } else if msg.contains("E_BACKEND_UNAVAILABLE") || msg.contains("backend unavailable") {
+        "E0560"
+    } else if msg.contains("E_BUNDLE_CORRUPT") {
+        "E0561"
+    } else if msg.contains("E_BUNDLE_READONLY") {
+        "E0562"
+    } else if msg.contains("E_BUNDLE_NOT_FOUND") {
+        "E0563"
+    } else if msg.contains("E_BUNDLE_UNSAFE_PATH") {
+        "E0564"
+    } else if msg.contains("E_ASSET_STATIC") {
+        "E0565"
     } else if low.contains("unterminated ")
         || low.contains("unexpected character")
         || low.contains("invalid escape")
@@ -494,6 +507,39 @@ pub fn explain_code(code: &str) -> Option<(&'static str, &'static str)> {
             "Unreachable match arm",
             "A `match` arm appears after a catch-all `_` / variable arm without a guard, or duplicates an earlier literal pattern.\nFix:\n  Reorder specific patterns before wildcard/catch-all arms or remove duplicates.",
         ),
+        "E0501" => ("Media allocation or dimension limit exceeded", "Asset dimensions, frames, or memory usage exceeded safe engine caps."),
+        "E0502" => ("Unsupported media format", "Codec or subformat (such as progressive JPEG SOF2) is unsupported in this version."),
+        "E0503" => ("Corrupt media payload", "Malformed container, CRC mismatch, or truncated image/audio stream."),
+        "E0504" => ("Invalid media option or path", "Invalid decoder option or blocked asset reference path."),
+        "E0505" => ("Non-deterministic operation in deterministic mode", "Requested timing/device operation violates --deterministic guarantees."),
+        "E0506" => ("Audio command/event queue backpressure", "Audio mixer command or event ring buffer is full."),
+        "E0507" => ("Unsupported audio stream format", "Audio format or channel layout is not supported by the PCM/ADPCM/companded WAV loader."),
+        "E0508" => ("Real-time audio sink disallowed", "Deterministic playback mode cannot run real-time audio hardware sinks."),
+        "E0509" => ("Audio device permission denied", "Audio device initialization requires --allow-audio or --unsafe."),
+        "E0510" => ("Asset JSON limit or syntax error", "JSON asset payload failed strict depth, node count, or syntax validation."),
+        "E0511" => ("Asset XML limit or syntax error", "XML asset payload failed strict depth, node count, or syntax validation."),
+        "E0512" => ("Mesh geometry limit exceeded", "3D mesh exceeded vertex, triangle, node, or polygon limits."),
+        "E0513" => ("Corrupt 3D model data", "OBJ/MTL/glTF/GLB buffer bounds, alignment, or attribute layout is invalid."),
+        "E0514" => ("3D scene node cycle", "glTF node hierarchy contains a parent-child cycle."),
+        "E0515" => ("Unsupported 3D feature", "Model uses unsupported required extension or sparse glTF accessor."),
+        "E0520" => ("Unsupported Tiled map feature", "Tiled map uses unsupported compression (e.g. zstd) or non-orthogonal orientation."),
+        "E0521" => ("Corrupt Tiled map payload", "Malformed .tmj/.tmx/.tsj/.tsx map dimensions, base64, or cell counts."),
+        "E0530" => ("Terrain limit exceeded", "Heightmap dimensions or mesh density exceeded terrain caps."),
+        "E0531" => ("Corrupt terrain payload", "Heightmap .r16/.png byte length or non-finite values are invalid."),
+        "E0532" => ("Invalid terrain option", "Invalid terrain cell_size, height_scale, or extension."),
+        "E0533" => ("Invalid splatmap", "Splatmap dimensions or pixel buffer length is invalid."),
+        "E0540" => ("Invalid cubemap", "Cubemap faces must be 6 equal square power-of-two textures."),
+        "E0550" => ("Invalid 3D LUT file", "3D LUT .cube/.lut must specify size 16 or 32 within 2 MiB and finite entries."),
+        "E0551" => ("Invalid navigation grid or coordinates", "Navigation grid dimensions, cost, or coordinates are invalid."),
+        "E0552" => ("Invalid scene assembly spec", "Scene assembly spec, transform, or placement parameter is invalid."),
+        "E0560" => ("OS backend unavailable", "Native display, audio, clipboard, or TLS shared library backend is not available on this host."),
+        "E0561" => ("Corrupt ASKANE-PAK bundle (unrecoverable)", "ASKANE-PAK header, TOC, payload SHA-256, or EOF trailer verification failed."),
+        "E0562" => ("Bundle read-only violation", "Cannot write, overwrite, delete, or rename files in hermetic bundle mode or on bundle-owned keys."),
+        "E0563" => ("Asset missing in hermetic bundle", "Requested asset path is not present in the mounted ASKANE-PAK bundle."),
+        "E0564" => ("Unsafe ASKANE-PAK entry path", "Bundle entry path contains traversal, reserved Windows names, control chars, or case collision."),
+        "E0565" => ("Static asset path escapes sandbox", "Compile-time literal asset path contains traversal, device name, NUL byte, or invalid prefix."),
+        "W0501" => ("Dynamic asset path cannot be verified statically", "Asset loader called with a non-literal path; run with explicit capabilities or inspect paths manually."),
+        "W0502" => ("Literal asset path missing on disk", "Static asset path did not exist on disk at check time (ignore if supplied by a mounted bundle at runtime)."),
         _ => return None,
     };
     Some(entry)

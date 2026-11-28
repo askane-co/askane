@@ -18,6 +18,7 @@ pub fn module() -> Value {
             ("arch", sys_arch),
             ("sleep", sys_sleep),
             ("budget", sys_budget),
+            ("backends", sys_backends),
         ],
         &[],
     )
@@ -126,4 +127,22 @@ fn sys_budget(vm: &mut VM, args: &[Value]) -> Result<Value, String> {
             .unwrap_or(Value::Unit),
     );
     Ok(Value::dict(map))
+}
+
+fn sys_backends(_vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("sys.backends() expects 0 arguments".to_string());
+    }
+    let rep = crate::platform::probe_backends();
+    let mut root = new_dict_with_capacity(rep.probes.len() + 2);
+    root.insert("os".to_string(), Value::from_str(rep.os));
+    root.insert("arch".to_string(), Value::from_str(rep.arch));
+    for p in rep.probes {
+        let mut sub = new_dict_with_capacity(3);
+        sub.insert("backend".to_string(), Value::from_str(p.backend));
+        sub.insert("status".to_string(), Value::from_str(p.status.name()));
+        sub.insert("detail".to_string(), Value::from_str(p.detail));
+        root.insert(p.subsystem.to_string(), Value::dict(sub));
+    }
+    Ok(Value::dict(root))
 }
