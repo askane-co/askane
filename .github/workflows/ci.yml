@@ -17,7 +17,7 @@ jobs:
         shell: pwsh
         run: |
           $lock = Get-Content Cargo.lock -Raw
-          $pkgs = [regex]::Matches($lock, 'name = "([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+          $pkgs = @([regex]::Matches($lock, 'name = "([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
           if ($pkgs.Count -ne 1 -or $pkgs[0] -ne "askane") {
             throw "Unexpected external crate(s) in Cargo.lock: $($pkgs -join ', ')"
           }
